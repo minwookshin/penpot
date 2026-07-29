@@ -77,6 +77,7 @@
    [frontend-tests.router-test]
    [frontend-tests.svg-fills-test]
    [frontend-tests.text-editor-paste-guard-test]
+   [frontend-tests.tokens.context-menu-test]
    [frontend-tests.tokens.copy-paste-props-test]
    [frontend-tests.tokens.import-export-test]
    [frontend-tests.tokens.logic.token-actions-test]
@@ -97,6 +98,7 @@
    [frontend-tests.ui.routes-test]
    [frontend-tests.ui.settings-password-schema-test]
    [frontend-tests.ui.settings-shortcuts-test]
+   [frontend-tests.ui.stroke-menu-test]
    [frontend-tests.util-clipboard-test]
    [frontend-tests.util-object-test]
    [frontend-tests.util-range-tree-test]
@@ -192,6 +194,7 @@
    'frontend-tests.router-test
    'frontend-tests.svg-fills-test
    'frontend-tests.tokens.copy-paste-props-test
+   'frontend-tests.tokens.context-menu-test
    'frontend-tests.tokens.import-export-test
    'frontend-tests.tokens.logic.token-actions-test
    'frontend-tests.tokens.logic.token-data-test
@@ -213,6 +216,7 @@
    'frontend-tests.text-editor-paste-guard-test
    'frontend-tests.ui.settings-password-schema-test
    'frontend-tests.ui.settings-shortcuts-test
+   'frontend-tests.ui.stroke-menu-test
    'frontend-tests.util-clipboard-test
    'frontend-tests.util-object-test
    'frontend-tests.util-range-tree-test
