@@ -262,7 +262,7 @@
     (t/is (th/ex-info? err))
     (t/is (th/ex-of-type? err :not-found))))
 
-(t/deftest create-project-ignores-client-id
+(t/deftest create-project-rejects-client-id
   (let [profile (th/create-profile* 1 {:is-active true})
         team    (th/create-team* 1 {:profile-id (:id profile)})
         sent-id (uuid/next)
@@ -271,6 +271,6 @@
                               :team-id (:id team)
                               :name "project with client id"
                               :id sent-id})]
-    (t/is (th/success? out))
-    (t/is (uuid? (:id (:result out))))
-    (t/is (not= sent-id (:id (:result out))))))
+    (t/is (th/ex-info? (:error out)))
+    (t/is (th/ex-of-type? (:error out) :validation))
+    (t/is (th/ex-of-code? (:error out) :params-validation))))

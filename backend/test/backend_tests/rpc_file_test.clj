@@ -51,8 +51,7 @@
                  ::rpc/profile-id (:id prof)
                  :project-id proj-id
                  :name "foobar"
-                 :is-shared false
-                 :components-v2 true}
+                 :is-shared false}
         out     (th/command! data)
         file-id (:id (:result out))]
 
@@ -771,8 +770,7 @@
                   ::rpc/profile-id (:id profile2)
                   :project-id (:default-project-id profile1)
                   :name "foobar"
-                  :is-shared false
-                  :components-v2 true}
+                  :is-shared false}
         out      (th/command! data)
         error    (:error out)]
 
@@ -2072,8 +2070,7 @@
                   ::rpc/profile-id (:id prof)
                   :project-id proj-id
                   :name "foobar"
-                  :is-shared false
-                  :components-v2 true}
+                  :is-shared false}
             out  (th/command! data)
             _    (t/is (nil? (:error out)))
             file-id (:id (:result out))]
@@ -2132,8 +2129,7 @@
                   ::rpc/profile-id (:id prof)
                   :project-id proj-id
                   :name "foobar"
-                  :is-shared false
-                  :components-v2 true}
+                  :is-shared false}
             out  (th/command! data)
             _    (t/is (nil? (:error out)))
             file-id (:id (:result out))]
@@ -2665,7 +2661,7 @@
         (t/is (= :not-found (:type edata)))
         (t/is (= :object-not-found (:code edata)))))))
 
-(t/deftest create-file-ignores-client-id
+(t/deftest create-file-rejects-client-id
   (let [prof    (th/create-profile* 1 {:is-active true})
         sent-id (uuid/next)
         out     (th/command! {::th/type :create-file
@@ -2673,6 +2669,6 @@
                               :project-id (:default-project-id prof)
                               :name "file with client id"
                               :id sent-id})]
-    (t/is (th/success? out))
-    (t/is (uuid? (:id (:result out))))
-    (t/is (not= sent-id (:id (:result out))))))
+    (t/is (th/ex-info? (:error out)))
+    (t/is (th/ex-of-type? (:error out) :validation))
+    (t/is (th/ex-of-code? (:error out) :params-validation))))

@@ -6,7 +6,8 @@
 - `GET`/`HEAD` RPC calls are only allowed for method names starting with `get-`. Other methods are method-not-allowed even if they are read-only internally.
 - RPC auth defaults to enabled. Public endpoints must set `::auth false` metadata explicitly.
 - The wrapper stack does auth before params validation, then auditing/rate/concurrency/metrics/retry/condition handling, with DB transaction handling inside that stack. `::db/transaction` metadata controls transaction wrapping.
-- Params with `::sm/params` are decoded/conformed through the JSON transformer and successful IObj results get `:encode/json` metadata. Legacy spec conforming only applies when no Malli params schema exists.
+- `::sm/params` validation runs on the client params extracted from `::http/request` (unqualified); internal qualified keys (`::rpc/profile-id`, `::rpc/request-at`, ...) are merged in after validation. Successful IObj results get `:encode/json` metadata. There is no legacy spec-conform path anymore.
+- Params schemas are open by default, so undeclared client keys reach the handler unless the map is `:closed true`. Creation commands (`create-file`, `create-project`, `create-team`, `create-team-with-invitations`, `upload-file-media-object`, `create-file-media-object-from-url`, `assemble-file-media-object`) use closed schemas: a client-provided `:id` fails with `:params-validation`. Their internal creation functions still accept an optional explicit `:id` for imports, duplicates and deterministic test fixtures.
 - Nil RPC bodies become HTTP 204 unless explicit status metadata is present. Stream bodies default to `application/octet-stream` when no content type is set.
 
 ## DB helpers

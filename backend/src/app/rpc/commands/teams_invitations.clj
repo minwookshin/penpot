@@ -535,7 +535,7 @@
 ;; --- Mutation: Create Team & Invite Members
 
 (def ^:private schema:create-team-with-invitations
-  [:map {:title "create-team-with-invitations"}
+  [:map {:title "create-team-with-invitations" :closed true}
    [:name [:string {:max 250}]]
    [:features {:optional true} ::cfeat/features]
    [:emails [::sm/set ::sm/email]]
@@ -543,7 +543,7 @@
 
 (sv/defmethod ::create-team-with-invitations
   {::doc/added "1.17"
-   ::doc/changes [["2.19" "Remove optional :id param, the server always generates the identifier"]]
+   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::doc/module :teams
    ::sm/params schema:create-team-with-invitations
    ::db/transaction true}

@@ -47,7 +47,7 @@
     WHERE f.id = ?")
 
 (def ^:private schema:upload-file-media-object
-  [:map {:title "upload-file-media-object"}
+  [:map {:title "upload-file-media-object" :closed true}
    [:file-id ::sm/uuid]
    [:is-local ::sm/boolean]
    [:name [:string {:max 250}]]
@@ -55,7 +55,7 @@
 
 (sv/defmethod ::upload-file-media-object
   {::doc/added "1.17"
-   ::doc/changes [["2.19" "Remove optional :id param, the server always generates the identifier"]]
+   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::sm/params schema:upload-file-media-object
    ::climit/id [[:process-image/by-profile ::rpc/profile-id]
                 [:process-image/global]]}
@@ -172,10 +172,10 @@
 
 (defn- create-file-media-object
   [{:keys [::sto/storage ::db/conn] :as cfg}
-   {:keys [file-id is-local name content from-url? from-chunks?]}]
+   {:keys [id file-id is-local name content from-url? from-chunks?]}]
 
   (let [tpoint (ct/tpoint)
-        id     (uuid/next)
+        id     (or id (uuid/next))
         origin (cond
                  from-url?
                  "url"
@@ -221,7 +221,7 @@
 (declare ^:private create-file-media-object-from-url)
 
 (def ^:private schema:create-file-media-object-from-url
-  [:map {:title "create-file-media-object-from-url"}
+  [:map {:title "create-file-media-object-from-url" :closed true}
    [:file-id ::sm/uuid]
    [:is-local ::sm/boolean]
    [:url ::sm/uri]
@@ -229,7 +229,7 @@
 
 (sv/defmethod ::create-file-media-object-from-url
   {::doc/added "1.17"
-   ::doc/changes [["2.19" "Remove optional :id param, the server always generates the identifier"]]
+   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::sm/params schema:create-file-media-object-from-url}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id file-id] :as params}]
   (files/check-edition-permissions! pool profile-id file-id)
@@ -550,7 +550,7 @@
 ;; --- Chunked Upload: Assemble all chunks into a final media object
 
 (def ^:private schema:assemble-file-media-object
-  [:map {:title "assemble-file-media-object"}
+  [:map {:title "assemble-file-media-object" :closed true}
    [:session-id ::sm/uuid]
    [:file-id    ::sm/uuid]
    [:is-local   ::sm/boolean]
@@ -559,7 +559,7 @@
 
 (sv/defmethod ::assemble-file-media-object
   {::doc/added "2.17"
-   ::doc/changes [["2.19" "Remove optional :id param, the server always generates the identifier"]]
+   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::sm/params schema:assemble-file-media-object
    ::climit/id [[:process-image/by-profile ::rpc/profile-id]
                 [:process-image/global]]}

@@ -1172,10 +1172,8 @@
       (t/is (= :not-found (:type error-data)))
       (t/is (= :object-not-found (:code error-data))))))
 
-(t/deftest upload-file-media-object-ignores-client-id
+(t/deftest upload-file-media-object-rejects-client-id
   (let [prof  (th/create-profile* 1)
-        _     (th/create-project* 1 {:profile-id (:id prof)
-                                     :team-id (:default-team-id prof)})
         file  (th/create-file* 1 {:profile-id (:id prof)
                                   :project-id (:default-project-id prof)
                                   :is-shared false})
@@ -1191,57 +1189,40 @@
                             :name "testfile"
                             :content mfile
                             :id sent-id})]
-    (t/is (th/success? out))
-    (t/is (uuid? (:id (:result out))))
-    (t/is (not= sent-id (:id (:result out))))))
+    (t/is (th/ex-info? (:error out)))
+    (t/is (th/ex-of-type? (:error out) :validation))
+    (t/is (th/ex-of-code? (:error out) :params-validation))))
 
-(t/deftest create-file-media-object-from-url-ignores-client-id
-  (with-mocks [mock {:target 'app.media/download-image
-                     :return {:path (th/tempfile "backend_tests/test_files/sample.jpg")
-                              :mtype "image/jpeg"
-                              :size 312043}}]
-    (let [prof  (th/create-profile* 1)
-          _     (th/create-project* 1 {:profile-id (:id prof)
-                                       :team-id (:default-team-id prof)})
-          file  (th/create-file* 1 {:profile-id (:id prof)
-                                    :project-id (:default-project-id prof)
-                                    :is-shared false})
-          sent-id (uuid/next)
-          out   (th/command! {::th/type :create-file-media-object-from-url
-                              ::rpc/profile-id (:id prof)
-                              :file-id (:id file)
-                              :is-local true
-                              :url "https://example.com/sample.jpg"
-                              :id sent-id})]
-      (t/is (th/success? out))
-      (t/is (uuid? (:id (:result out))))
-      (t/is (not= sent-id (:id (:result out)))))))
+(t/deftest create-file-media-object-from-url-rejects-client-id
+  (let [prof  (th/create-profile* 1)
+        file  (th/create-file* 1 {:profile-id (:id prof)
+                                  :project-id (:default-project-id prof)
+                                  :is-shared false})
+        sent-id (uuid/next)
+        out   (th/command! {::th/type :create-file-media-object-from-url
+                            ::rpc/profile-id (:id prof)
+                            :file-id (:id file)
+                            :is-local true
+                            :url "https://example.com/sample.jpg"
+                            :id sent-id})]
+    (t/is (th/ex-info? (:error out)))
+    (t/is (th/ex-of-type? (:error out) :validation))
+    (t/is (th/ex-of-code? (:error out) :params-validation))))
 
-(t/deftest assemble-file-media-object-ignores-client-id
+(t/deftest assemble-file-media-object-rejects-client-id
   (let [prof   (th/create-profile* 1)
-        _      (th/create-project* 1 {:profile-id (:id prof)
-                                      :team-id (:default-team-id prof)})
         file   (th/create-file* 1 {:profile-id (:id prof)
                                    :project-id (:default-project-id prof)
                                    :is-shared false})
-        source-path (th/tempfile "backend_tests/test_files/sample.jpg")
-        chunks      (split-file-into-chunks source-path 312043)
-        session-id  (create-session! prof 1)
-        mfile       (make-chunk-mfile (first chunks) "image/jpeg")
-        _           (th/command! {::th/type :upload-chunk
-                                  ::rpc/profile-id (:id prof)
-                                  :session-id session-id
-                                  :index 0
-                                  :content mfile})
         sent-id (uuid/next)
         out     (th/command! {::th/type :assemble-file-media-object
                               ::rpc/profile-id (:id prof)
-                              :session-id session-id
+                              :session-id (uuid/next)
                               :file-id (:id file)
                               :is-local true
                               :name "assembled-image"
                               :mtype "image/jpeg"
                               :id sent-id})]
-    (t/is (th/success? out))
-    (t/is (uuid? (:id (:result out))))
-    (t/is (not= sent-id (:id (:result out))))))
+    (t/is (th/ex-info? (:error out)))
+    (t/is (th/ex-of-type? (:error out) :validation))
+    (t/is (th/ex-of-code? (:error out) :params-validation))))

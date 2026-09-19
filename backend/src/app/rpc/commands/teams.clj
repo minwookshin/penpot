@@ -520,7 +520,7 @@
 (declare ^:private create-team-default-project)
 
 (def ^:private schema:create-team
-  [:map {:title "create-team"}
+  [:map {:title "create-team" :closed true}
    [:name types.team/schema:team-name]
    [:features {:optional true} ::cfeat/features]
    [:organization-id {:optional true} ::sm/uuid]
@@ -528,7 +528,7 @@
 
 (sv/defmethod ::create-team
   {::doc/added "1.17"
-   ::doc/changes [["2.19" "Remove optional :id param, the server always generates the identifier"]]
+   ::doc/changes [["2.19" "The optional :id param is rejected with a params-validation error; the server always generates the identifier"]]
    ::sm/params schema:create-team}
   [cfg {:keys [::rpc/profile-id organization-id] :as params}]
 
@@ -651,8 +651,8 @@
     (assoc team :default-project-id (:id project))))
 
 (defn- create-team*
-  [conn {:keys [name is-default features]}]
-  (let [id         (uuid/next)
+  [conn {:keys [id name is-default features]}]
+  (let [id         (or id (uuid/next))
         is-default (if (boolean? is-default) is-default false)
         features   (db/create-array conn "text" features)
         name       (d/normalize-string name)
