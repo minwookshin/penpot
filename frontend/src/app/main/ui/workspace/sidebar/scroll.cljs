@@ -49,13 +49,12 @@
   "Restores the scrollTop saved under [panel id] on mount and whenever
   panel or id change. Retries while the content height keeps changing so
   deep positions in lazily rendered lists are not clamped to the first
-  chunk. Missing key or node is a silent no-op."
+  chunk. A missing key restores the top; a missing node is a no-op."
   [store* panel id node-ref]
   (mf/with-effect [panel id]
     (let [raf* (volatile! nil)]
       (when-let [node (mf/ref-val node-ref)]
-        (when-let [saved (get @store* [panel id])]
-          (restore-loop! node saved -1 0 raf*)))
+        (restore-loop! node (get @store* [panel id] 0) -1 0 raf*))
       (fn []
         (when-some [raf @raf*]
           (tm/cancel-af! raf))))))

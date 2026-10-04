@@ -6,9 +6,13 @@
 
 (ns frontend-tests.ui.sidebar-scroll-test
   (:require
+   ["jsdom" :refer [JSDOM]]
+   ["react" :as react]
+   ["react-dom/client" :as react-dom]
    [app.main.ui.workspace.sidebar.scroll :as sc]
    [app.util.timers :as tm]
-   [cljs.test :as t :include-macros true]))
+   [cljs.test :as t :include-macros true]
+   [rumext.v2 :as mf]))
 
 (def ^:private restore-loop! @#'sc/restore-loop!)
 
@@ -64,3 +68,55 @@
       ((first @scheduled))
       (t/is (= 250 (.-scrollTop node)))
       (t/is (= 1 (count @scheduled)) "no further frames once settled"))))
+
+
+(defn- scroll-panel
+  [^js props]
+  (let [node-ref (mf/use-ref nil)
+        store    (.-store props)
+        panel-id (.-panelId props)]
+    (sc/use-restore-scroll store :tokens panel-id node-ref)
+    (react/createElement "div" #js {:ref node-ref
+                                    :onScroll #(sc/save-scroll! store [:tokens panel-id] %)})))
+
+(t/deftest ^:async token-sets-restore-their-own-scroll-position
+  (let [browser  (JSDOM. "<div id='root'></div>" #js {:pretendToBeVisual true})
+        window   (.-window browser)
+        document (.-document window)
+        globals  ["window" "document" "requestAnimationFrame" "cancelAnimationFrame"
+                  "IS_REACT_ACT_ENVIRONMENT"]
+        previous (mapv #(js/Object.getOwnPropertyDescriptor js/globalThis %) globals)
+        store    (atom {[:tokens :set-a] 500
+                        [:tokens :set-c] 0})
+        root*    (volatile! nil)]
+    (try
+      (set! (.-window js/globalThis) window)
+      (set! (.-document js/globalThis) document)
+      (set! (.-requestAnimationFrame js/globalThis) (.bind (.-requestAnimationFrame window) window))
+      (set! (.-cancelAnimationFrame js/globalThis) (.bind (.-cancelAnimationFrame window) window))
+      (set! (.-IS_REACT_ACT_ENVIRONMENT js/globalThis) true)
+      (let [root   (react-dom/createRoot (.getElementById document "root"))
+            render (fn [panel-id]
+                     (react/act #(.render root (react/createElement scroll-panel #js {:store store :panelId panel-id}))))]
+        (vreset! root* root)
+        (await (render :set-a))
+        (let [node (.-firstChild (.getElementById document "root"))]
+          (t/is (= 500 (.-scrollTop node)))
+          (await (render :set-b))
+          (t/is (= 0 (.-scrollTop node)) "an unvisited set starts at the top")
+          (set! (.-scrollTop node) 120)
+          (await (react/act #(.dispatchEvent node (new (.-Event window) "scroll"))))
+          (await (render :set-a))
+          (t/is (= 500 (.-scrollTop node)) "returning restores the first set")
+          (await (render :set-b))
+          (t/is (= 120 (.-scrollTop node)) "returning restores the second set")
+          (await (render :set-c))
+          (t/is (= 0 (.-scrollTop node)) "a saved zero is preserved")))
+      (finally
+        (when-let [root @root*]
+          (await (react/act #(.unmount ^js root))))
+        (.close window)
+        (doseq [[key descriptor] (map vector globals previous)]
+          (if descriptor
+            (js/Object.defineProperty js/globalThis key descriptor)
+            (js/Reflect.deleteProperty js/globalThis key)))))))
