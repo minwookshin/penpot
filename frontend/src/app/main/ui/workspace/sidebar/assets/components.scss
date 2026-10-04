@@ -68,6 +68,9 @@
 
 .component-item-list {
   display: grid;
+
+  // Reserve the thumbnail height before its deferred SVG mounts.
+  min-block-size: $sz-48;
   grid-template-columns: auto 1fr auto;
   align-items: center;
   column-gap: var(--sp-s);
