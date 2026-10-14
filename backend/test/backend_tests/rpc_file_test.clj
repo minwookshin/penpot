@@ -17,6 +17,7 @@
    [app.db.sql :as sql]
    [app.features.fdata :as fdata]
    [app.http :as http]
+   [app.loggers.audit :as-alias audit]
    [app.rpc :as-alias rpc]
    [app.rpc.commands.files :as files]
    [app.storage :as sto]
@@ -717,7 +718,7 @@
       ;; Now that objects-gc have deleted the object thumbnail lets
       ;; execute the touched-gc task
       (let [res (binding [ct/*clock* (ct/fixed-clock (ct/in-future {:hours 3}))]
-                  (th/run-task! "storage-gc-touched" {}))]
+                  (th/run-task! :storage-gc-touched {}))]
         (t/is (= 1 (:freeze res))))
 
       ;; check file media objects
@@ -810,6 +811,20 @@
     ;; (th/print-result! out)
     (t/is (th/ex-info? error))
     (t/is (th/ex-of-type? error :not-found))))
+
+(t/deftest delete-file-audit-includes-team-id
+  ;; Assert result metadata directly: wrap-audit is inactive in the
+  ;; default test flags, so mocking audit/submit would never see this.
+  (let [profile (th/create-profile* 1)
+        file    (th/create-file* 1 {:project-id (:default-project-id profile)
+                                    :profile-id (:id profile)})
+        result  (db/tx-run! th/*system*
+                            (fn [cfg]
+                              (#'files/delete-file cfg {:id (:id file)
+                                                        :profile-id (:id profile)})))
+        props   (::audit/props (meta result))]
+    (t/is (= (:default-team-id profile) (:team-id props)))
+    (t/is (= (:project-id file) (:project-id props)))))
 
 (t/deftest permissions-checks-set-file-shared
   (let [profile1 (th/create-profile* 1)
@@ -1083,7 +1098,7 @@
           out    (th/command! params)]
       (t/is (nil? (:error out))))
 
-    (th/run-pending-tasks!)
+    (th/run-pending-jobs)
 
     ;; query the list of files after soft deletion
     (let [data {::th/type :get-project-files
@@ -1373,6 +1388,73 @@
         ;; (app.common.pprint/pprint rows)
         (t/is (= 1 (count rows)))))))
 
+(t/deftest file-data-for-thumbnail-frame-on-other-page
+  (let [prof     (th/create-profile* 1 {:is-active true})
+        file     (th/create-file* 1 {:profile-id (:id prof)
+                                     :project-id (:default-project-id prof)
+                                     :is-shared false})
+        page1-id (get-in file [:data :pages 0])
+        page2-id (uuid/next)
+        rect-id  (uuid/next)
+        frame-id (uuid/next)
+
+        get-data (fn []
+                   (th/command! {::th/type :get-file-data-for-thumbnail
+                                 ::rpc/profile-id (:id prof)
+                                 :file-id (:id file)
+                                 :features cfeat/supported-features}))]
+
+    (th/update-file* {:file-id (:id file)
+                      :profile-id (:id prof)
+                      :revn 0
+                      :vern 0
+                      :changes [{:type :add-obj
+                                 :page-id page1-id
+                                 :id rect-id
+                                 :parent-id uuid/zero
+                                 :frame-id uuid/zero
+                                 :obj (cts/setup-shape
+                                       {:id rect-id
+                                        :name "rect"
+                                        :type :rect})}
+                                {:type :add-page
+                                 :id page2-id
+                                 :name "page 2"}
+                                {:type :add-obj
+                                 :page-id page2-id
+                                 :id frame-id
+                                 :parent-id uuid/zero
+                                 :frame-id uuid/zero
+                                 :obj (cts/setup-shape
+                                       {:id frame-id
+                                        :name "frame"
+                                        :type :frame})}]})
+
+    (t/testing "no marked frame falls back to the first page"
+      (let [{:keys [error result]} (get-data)]
+        (t/is (nil? error))
+        (t/is (= page1-id (get-in result [:page :id])))
+        (t/is (nil? (get-in result [:page :thumbnail-frame-id])))
+        (t/is (contains? (get-in result [:page :objects]) rect-id))))
+
+    (th/update-file* {:file-id (:id file)
+                      :profile-id (:id prof)
+                      :revn 1
+                      :vern 0
+                      :changes [{:type :mod-obj
+                                 :page-id page2-id
+                                 :id frame-id
+                                 :operations [{:type :set
+                                               :attr :use-for-thumbnail
+                                               :val true}]}]})
+
+    (t/testing "marked frame on another page is used"
+      (let [{:keys [error result]} (get-data)]
+        (t/is (nil? error))
+        (t/is (= page2-id (get-in result [:page :id])))
+        (t/is (= frame-id (get-in result [:page :thumbnail-frame-id])))
+        (t/is (contains? (get-in result [:page :objects]) frame-id))))))
+
 (t/deftest file-thumbnail-ops
   (let [prof (th/create-profile* 1 {:is-active true})
         file (th/create-file* 1 {:profile-id (:id prof)
@@ -1461,7 +1543,7 @@
       (t/is (true? (th/run-task! :file-gc {:file-id (:id file)}))))
 
     ;; The FileGC task will schedule an inner taskq
-    (th/run-pending-tasks!)
+    (th/run-pending-jobs)
 
     (let [res (binding [ct/*clock* (ct/fixed-clock (ct/in-future {:hours 3}))]
                 (th/run-task! :storage-gc-touched {}))]
@@ -2059,6 +2141,119 @@
       (t/is (= (:id file-2) (:file-id (get rows 0))))
       (t/is (nil? (:deleted-at (get rows 0)))))))
 
+(t/deftest delete-shared-library-with-storage-file-data
+  (binding [cf/config (assoc cf/config :file-data-backend "storage")]
+    ;; Keep this test focused on the storage-backed file-data fix: create
+    ;; the files without the fdata/pointer-map optimization so the data is
+    ;; stored as a single object and no separate fragments are involved.
+    (with-redefs [cfeat/get-enabled-features
+                  (fn [& _] (disj cfeat/supported-features "fdata/pointer-map"))]
+      (let [profile (th/create-profile* 1)
+            params  {:profile-id (:id profile)
+                     :project-id (:default-project-id profile)}
+            library (th/create-file* 1 (assoc params :is-shared true))
+            file    (th/create-file* 2 params)
+            c-id    (uuid/random)
+            main-id (uuid/random)
+            inst-id (uuid/random)
+            l-page  (first (get-in library [:data :pages]))
+            f-page  (first (get-in file [:data :pages]))]
+        (th/link-file-to-library* {:file-id (:id file)
+                                   :library-id (:id library)})
+
+        ;; Add a component to the library and an instance of it to the
+        ;; referencing file, so absorption has something to move.
+        (update-file!
+         :file-id (:id library)
+         :profile-id (:id profile)
+         :revn 0
+         :vern 0
+         :changes
+         [{:type :add-obj
+           :page-id l-page
+           :id main-id
+           :parent-id uuid/zero
+           :frame-id uuid/zero
+           :components-v2 true
+           :obj (cts/setup-shape
+                 {:id main-id
+                  :name "Board"
+                  :frame-id uuid/zero
+                  :parent-id uuid/zero
+                  :type :frame
+                  :main-instance true
+                  :component-root true
+                  :component-file (:id library)
+                  :component-id c-id})}
+          {:type :add-component
+           :path ""
+           :name "Board"
+           :main-instance-id main-id
+           :main-instance-page l-page
+           :id c-id
+           :anotation nil}])
+
+        (update-file!
+         :file-id (:id file)
+         :profile-id (:id profile)
+         :revn 0
+         :vern 0
+         :changes
+         [{:type :add-obj
+           :page-id f-page
+           :id inst-id
+           :parent-id uuid/zero
+           :frame-id uuid/zero
+           :components-v2 true
+           :obj (cts/setup-shape
+                 {:id inst-id
+                  :name "Board"
+                  :frame-id uuid/zero
+                  :parent-id uuid/zero
+                  :type :frame
+                  :main-instance false
+                  :component-root true
+                  :component-file (:id library)
+                  :component-id c-id})}])
+
+        ;; Ensure the test exercises storage reads for both files.
+        (let [rows (th/db-exec! ["SELECT backend, data FROM file_data WHERE type = 'main'"])]
+          (t/is (= 2 (count rows)))
+          (t/is (every? #(= "storage" (:backend %)) rows))
+          (t/is (every? (comp nil? :data) rows)))
+
+        ;; Baseline revn after adding the instance to the file.
+        (let [baseline (get-in (th/command! {::th/type :get-file
+                                             ::rpc/profile-id (:id profile)
+                                             :id (:id file)})
+                               [:result :revn])]
+          (th/run-task! :delete-object
+                        {:object :file
+                         :deleted-at (ct/now)
+                         :id (:id library)})
+
+          ;; The task swallows absorption errors, so verify the persisted result.
+          ;; Absorption runs inside the job, and the job only gets the
+          ;; components of its own cfg, so this also needs
+          ;; `:app.tasks.delete-object/job-def` to carry `::sto/storage`.
+          (let [deleted (db/get* th/*pool* :file {:id (:id library)}
+                                 {::db/remove-deleted false})
+                out     (th/command! {::th/type :get-file
+                                      ::rpc/profile-id (:id profile)
+                                      :id (:id file)})]
+            (t/is (some? (:deleted-at deleted)))
+            (t/is (false? (:is-shared deleted)))
+            (t/is (th/success? out))
+            (t/is (= (inc baseline) (get-in out [:result :revn])))
+            (t/is (= (:id file) (get-in out [:result :data :id])))
+
+            ;; The component must be absorbed into the file local library
+            ;; and the instance must point to the local copy.
+            (t/is (some? (get-in out [:result :data :components c-id])))
+            (t/is (= (:id file)
+                     (get-in out [:result :data :pages-index f-page
+                                  :objects inst-id :component-file])))))))))
+
 (t/deftest deleted-files-permanently-delete
   (let [prof    (th/create-profile* 1 {:is-active true})
         team-id (:default-team-id prof)
@@ -2200,7 +2395,7 @@
         (t/is (nil? (:error out)))
         (t/is (nil? (:result out)))
 
-        (th/run-pending-tasks!)
+        (th/run-pending-jobs)
 
         ;; get deleted files
         (let [data {::th/type :get-team-deleted-files
@@ -2672,3 +2867,130 @@
     (t/is (th/ex-info? (:error out)))
     (t/is (th/ex-of-type? (:error out) :validation))
     (t/is (th/ex-of-code? (:error out) :params-validation))))
+(t/deftest get-file-plugin-data
+  (let [profile (th/create-profile* 1 {:is-active true})
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared  false})]
+
+    ;; A file without plugin data returns an empty map
+    (let [out (th/command! {::th/type :get-file-plugin-data
+                            ::rpc/profile-id (:id profile)
+                            :id (:id file)})]
+      (t/is (nil? (:error out)))
+      (t/is (= {} (:result out))))
+
+    ;; Set file-level plugin data through a change
+    (update-file!
+     :file-id (:id file)
+     :profile-id (:id profile)
+     :revn 0
+     :vern 0
+     :changes
+     [{:type :set-plugin-data
+       :object-type :file
+       :namespace :shared/traceability
+       :key "req-id"
+       :value "REQ-123"}])
+
+    ;; The full plugin-data map is returned
+    (let [out (th/command! {::th/type :get-file-plugin-data
+                            ::rpc/profile-id (:id profile)
+                            :id (:id file)})]
+      (t/is (nil? (:error out)))
+      (t/is (= {:shared/traceability {"req-id" "REQ-123"}} (:result out))))
+
+    ;; A namespace filter narrows the result
+    (let [out (th/command! {::th/type :get-file-plugin-data
+                            ::rpc/profile-id (:id profile)
+                            :id (:id file)
+                            :namespace :shared/traceability})]
+      (t/is (nil? (:error out)))
+      (t/is (= {:shared/traceability {"req-id" "REQ-123"}} (:result out))))
+
+    ;; A filter on an absent namespace returns an empty map
+    (let [out (th/command! {::th/type :get-file-plugin-data
+                            ::rpc/profile-id (:id profile)
+                            :id (:id file)
+                            :namespace :plugin/absent})]
+      (t/is (nil? (:error out)))
+      (t/is (= {} (:result out))))))
+
+(t/deftest get-file-plugin-data-forbidden
+  (let [owner (th/create-profile* 1 {:is-active true})
+        other (th/create-profile* 2 {:is-active true})
+        file  (th/create-file* 1 {:profile-id (:id owner)
+                                  :project-id (:default-project-id owner)
+                                  :is-shared  false})
+        out   (th/command! {::th/type :get-file-plugin-data
+                            ::rpc/profile-id (:id other)
+                            :id (:id file)})]
+
+    (t/is (not (nil? (:error out))))
+    (let [edata (-> out :error ex-data)]
+      (t/is (= :not-found (:type edata))))))
+
+(t/deftest get-file-tokens-without-tokens
+  (let [profile (th/create-profile* 1 {:is-active true})
+        file    (th/create-file* 1 {:profile-id (:id profile)
+                                    :project-id (:default-project-id profile)
+                                    :is-shared  false})
+        out     (th/command! {::th/type :get-file-tokens
+                              ::rpc/profile-id (:id profile)
+                              :file-id (:id file)})]
+    (t/is (nil? (:error out)))
+    (t/is (nil? (:result out)))))
+
+(t/deftest get-file-tokens-with-tokens
+  (let [profile  (th/create-profile* 1 {:is-active true})
+        file     (th/create-file* 1 {:profile-id (:id profile)
+                                     :project-id (:default-project-id profile)
+                                     :is-shared  false})
+        set-id   (uuid/next)
+        token-id (uuid/next)]
+
+    (update-file!
+     :file-id (:id file)
+     :profile-id (:id profile)
+     :changes
+     [{:type :set-token-set
+       :id set-id
+       :attrs {:id set-id :name "brand-core"}}
+      {:type :set-token
+       :set-id set-id
+       :token-id token-id
+       :attrs {:id token-id
+               :name "color.primary-base"
+               :type :color
+               :value "#ff0000"}}])
+
+    (update-file!
+     :file-id (:id file)
+     :profile-id (:id profile)
+     :revn 1
+     :changes
+     [{:type :set-tokens-status
+       :theme-ids #{}
+       :set-ids #{set-id}}])
+
+    (let [out (th/command! {::th/type :get-file-tokens
+                            ::rpc/profile-id (:id profile)
+                            :file-id (:id file)})
+          dtcg (:result out)]
+      (t/is (nil? (:error out)))
+      (t/is (= "#ff0000" (get-in dtcg ["brand-core" "color" "primary-base" "$value"])))
+      (t/is (= "color" (get-in dtcg ["brand-core" "color" "primary-base" "$type"])))
+      (t/is (= ["brand-core"] (get-in dtcg ["$metadata" "tokenSetOrder"])))
+      (t/is (= #{"brand-core"} (set (get-in dtcg ["$metadata" "activeSets"])))))))
+
+(t/deftest get-file-tokens-forbidden
+  (let [owner (th/create-profile* 1 {:is-active true})
+        other (th/create-profile* 2 {:is-active true})
+        file  (th/create-file* 1 {:profile-id (:id owner)
+                                  :project-id (:default-project-id owner)
+                                  :is-shared  false})
+        out   (th/command! {::th/type :get-file-tokens
+                            ::rpc/profile-id (:id other)
+                            :file-id (:id file)})]
+    (t/is (th/ex-info? (:error out)))
+    (t/is (th/ex-of-type? (:error out) :not-found))))

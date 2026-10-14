@@ -305,8 +305,9 @@
 (defn write-export!
   [{:keys [::bfc/include-libraries ::bfc/embed-assets] :as cfg}]
   (when (and include-libraries embed-assets)
-    (throw (IllegalArgumentException.
-            "the `include-libraries` and `embed-assets` are mutally excluding options")))
+    (ex/raise :type :validation
+              :code :incompatible-options
+              :hint "the `include-libraries` and `embed-assets` are mutually exclusive options"))
 
   (write-export cfg))
 
@@ -454,7 +455,7 @@
 (defn- read-import-v1
   [{:keys [::db/conn ::bfc/project-id ::bfc/profile-id ::bfc/input] :as cfg}]
 
-  (bfc/disable-database-timeouts! cfg)
+  (bfc/configure-database-timeouts! cfg)
 
   (pu/with-open [input (zstd-input-stream input)
                  input (io/data-input-stream input)]
@@ -606,16 +607,26 @@
 
     (doseq [expected-storage-id ids]
       (let [id    (read-uuid! input)
-            mdata (read-obj! input)]
+            mdata (d/update-when (read-obj! input) :content-type bfc/normalize-content-type)]
 
         (when (not= id expected-storage-id)
           (ex/raise :type :validation
                     :code :inconsistent-penpot-file
                     :hint "the penpot file seems corrupt, found unexpected uuid (storage-object-id)"))
 
+        (bfc/check-storage-content-type mdata)
+
         (l/dbg :hint "readed storage object" :id (str id) ::l/sync? true)
 
         (let [[size resource] (read-stream! input)
+              [resource size] (if (bfc/svg-object? mdata)
+                                (let [raw (if (bytes? resource)
+                                            resource
+                                            (with-open [istream (jio/input-stream resource)]
+                                              (io/read istream)))
+                                      {:keys [bytes size]} (bfc/sanitize-imported-svg mdata raw)]
+                                  [bytes size])
+                                [resource size])
               hash            (sto/calculate-hash resource)
               content         (-> (sto/content resource size)
                                   (sto/wrap-with-hash hash))
