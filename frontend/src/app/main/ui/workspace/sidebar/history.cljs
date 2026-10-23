@@ -13,9 +13,9 @@
    [app.main.data.workspace.undo :as dwu]
    [app.main.refs :as refs]
    [app.main.store :as st]
-   [app.main.ui.ds.foundations.assets.icon :as i]
+   [app.main.ui.ds.buttons.icon-button :refer [icon-button*]]
+   [app.main.ui.ds.foundations.assets.icon :as i :refer [icon*]]
    [app.main.ui.ds.product.empty-state :refer [empty-state*]]
-   [app.main.ui.icons :as deprecated-icon]
    [app.util.dom :as dom]
    [app.util.i18n :refer [tr] :as i18n]
    [cuerdas.core :as str]
@@ -108,37 +108,43 @@
   [type multiple?]
   (let [arity (if multiple? "multiple" "single")
         attribute (name (or type :multiple))]
-    ;; Execution time translation strings:
-    ;;   (tr "workspace.undo.entry.multiple.circle")
-    ;;   (tr "workspace.undo.entry.multiple.color")
-    ;;   (tr "workspace.undo.entry.multiple.component")
-    ;;   (tr "workspace.undo.entry.multiple.curve")
-    ;;   (tr "workspace.undo.entry.multiple.frame")
-    ;;   (tr "workspace.undo.entry.multiple.group")
-    ;;   (tr "workspace.undo.entry.multiple.media")
-    ;;   (tr "workspace.undo.entry.multiple.multiple")
-    ;;   (tr "workspace.undo.entry.multiple.page")
-    ;;   (tr "workspace.undo.entry.multiple.path")
-    ;;   (tr "workspace.undo.entry.multiple.rect")
-    ;;   (tr "workspace.undo.entry.multiple.shape")
-    ;;   (tr "workspace.undo.entry.multiple.text")
-    ;;   (tr "workspace.undo.entry.multiple.typography")
-    ;;   (tr "workspace.undo.entry.single.circle")
-    ;;   (tr "workspace.undo.entry.single.color")
-    ;;   (tr "workspace.undo.entry.single.component")
-    ;;   (tr "workspace.undo.entry.single.curve")
-    ;;   (tr "workspace.undo.entry.single.frame")
-    ;;   (tr "workspace.undo.entry.single.group")
-    ;;   (tr "workspace.undo.entry.single.image")
-    ;;   (tr "workspace.undo.entry.single.media")
-    ;;   (tr "workspace.undo.entry.single.multiple")
-    ;;   (tr "workspace.undo.entry.single.page")
-    ;;   (tr "workspace.undo.entry.single.path")
-    ;;   (tr "workspace.undo.entry.single.rect")
-    ;;   (tr "workspace.undo.entry.single.shape")
-    ;;   (tr "workspace.undo.entry.single.text")
-    ;;   (tr "workspace.undo.entry.single.typography")
-    (tr (str/format "workspace.undo.entry.%s.%s" arity attribute))))
+    ;; Unknown attributes fall back to the raw key, as before.
+    (case arity
+      "multiple"
+      (case attribute
+        "circle" (tr "workspace.undo.entry.multiple.circle")
+        "color" (tr "workspace.undo.entry.multiple.color")
+        "component" (tr "workspace.undo.entry.multiple.component")
+        "curve" (tr "workspace.undo.entry.multiple.curve")
+        "frame" (tr "workspace.undo.entry.multiple.frame")
+        "group" (tr "workspace.undo.entry.multiple.group")
+        "media" (tr "workspace.undo.entry.multiple.media")
+        "multiple" (tr "workspace.undo.entry.multiple.multiple")
+        "page" (tr "workspace.undo.entry.multiple.page")
+        "path" (tr "workspace.undo.entry.multiple.path")
+        "rect" (tr "workspace.undo.entry.multiple.rect")
+        "shape" (tr "workspace.undo.entry.multiple.shape")
+        "text" (tr "workspace.undo.entry.multiple.text")
+        "typography" (tr "workspace.undo.entry.multiple.typography")
+        (str "workspace.undo.entry.multiple." attribute))
+      "single"
+      (case attribute
+        "circle" (tr "workspace.undo.entry.single.circle")
+        "color" (tr "workspace.undo.entry.single.color")
+        "component" (tr "workspace.undo.entry.single.component")
+        "curve" (tr "workspace.undo.entry.single.curve")
+        "frame" (tr "workspace.undo.entry.single.frame")
+        "group" (tr "workspace.undo.entry.single.group")
+        "image" (tr "workspace.undo.entry.single.image")
+        "media" (tr "workspace.undo.entry.single.media")
+        "multiple" (tr "workspace.undo.entry.single.multiple")
+        "page" (tr "workspace.undo.entry.single.page")
+        "path" (tr "workspace.undo.entry.single.path")
+        "rect" (tr "workspace.undo.entry.single.rect")
+        "shape" (tr "workspace.undo.entry.single.shape")
+        "text" (tr "workspace.undo.entry.single.text")
+        "typography" (tr "workspace.undo.entry.single.typography")
+        (str "workspace.undo.entry.single." attribute)))))
 
 (defn entry->message [entry]
   (let [value (entry-type->message (:type entry) (= :multiple (:id entry)))]
@@ -149,22 +155,23 @@
       :move (tr "workspace.undo.entry.move" value)
       (tr "workspace.undo.entry.unknown" value))))
 
-(defn entry->icon [{:keys [type]}]
+(defn- entry->icon-id
+  [{:keys [type]}]
   (case type
-    :page deprecated-icon/document
-    :shape deprecated-icon/svg
-    :rect deprecated-icon/rectangle
-    :circle deprecated-icon/ellipse
-    :text deprecated-icon/text
-    :path deprecated-icon/path
-    :frame deprecated-icon/board
-    :group deprecated-icon/group
-    :color deprecated-icon/drop-icon
-    :typography deprecated-icon/text-palette
-    :component deprecated-icon/component
-    :media deprecated-icon/img
-    :image deprecated-icon/img
-    deprecated-icon/svg))
+    :page i/document
+    :shape i/svg
+    :rect i/rectangle
+    :circle i/ellipse
+    :text i/text
+    :path i/path
+    :frame i/board
+    :group i/group
+    :color i/drop
+    :typography i/text-palette
+    :component i/component
+    :media i/img
+    :image i/img
+    i/svg))
 
 (defn is-shape? [type]
   (contains? #{:shape :rect :circle :text :path :frame :group} type))
@@ -333,7 +340,7 @@
 
      [:div {:class (stl/css :history-entry-summary)}
       [:div {:class (stl/css :history-entry-summary-icon)}
-       (entry->icon entry)]
+       [:> icon* {:icon-id (entry->icon-id entry) :size "s"}]]
       [:div {:class (stl/css :history-entry-summary-text)}
        [:div {:class (stl/css :history-entry-title)}
         (entry->message entry)]
@@ -357,11 +364,17 @@
             [:span {:class (stl/css :history-entry-author)}
              (tr "workspace.undo.entry.by" author)])])]
       (when (:detail entry)
-        [:div {:class (stl/css-case :history-entry-summary-button true
-                                    :button-opened @show-detail?)
-               :on-click toggle-show-detail
-               :data-has-entry (dm/str (not (nil? (:detail entry))))}
-         deprecated-icon/arrow])]
+        [:> icon-button* {:variant "action"
+                          :class (stl/css-case :history-entry-summary-button true
+                                               :button-opened @show-detail?)
+                          :tooltip-class (stl/css :history-entry-summary-button-wrapper)
+                          :aria-label (tr "workspace.undo.entry.show-details")
+                          :aria-expanded @show-detail?
+                          :icon i/arrow
+                          :icon-size "s"
+                          :icon-class (stl/css :history-entry-summary-arrow)
+                          :on-click toggle-show-detail
+                          :data-has-entry (dm/str (not (nil? (:detail entry))))}])]
 
      (when @show-detail?
        [:> history-entry-details* {:entry entry}])]))

@@ -125,13 +125,22 @@
         success-register
         (mf/use-fn
          (fn [data]
-           (reset! register-token (:token data))
-           (reset! current-section :register-validate)))
+           (cond
+             (:invitation-token data)
+             (st/emit! (rt/nav :auth-verify-token {:token (:invitation-token data)}))
+
+             (:is-active data)
+             (st/emit! (rt/reload true))
+
+             :else
+             (do
+               (reset! user-email (:email data))
+               (reset! current-section :register-email-sent)))))
 
         register-email-sent
         (mf/use-fn
-         (fn [email]
-           (reset! user-email email)
+         (fn [data]
+           (reset! user-email (if (string? data) data (:email data)))
            (reset! current-section :register-email-sent)))
 
         recovery-email-sent
@@ -355,7 +364,7 @@
      [:span
       (tr "labels.nitrate-not-configured.learn-more")
       " "
-      [:a {:href "https://help.penpot.app/technical-guide/getting-started/"
+      [:a {:href "https://help.penpot.app/technical-guide/getting-started/docker/#update-penpot"
            :target "_blank"
            :rel "noopener noreferrer"}
        (tr "labels.nitrate-not-configured.technical-guide")]]]]
@@ -551,21 +560,25 @@
 (mf/defc exception-section*
   {::mf/private true}
   [{:keys [data] :as props}]
-  (let [type   (get data :type)
-        cause  (get data ::errors/instance)
+  (let [type        (get data :type)
+        cause       (get data ::errors/instance)
+        environment (errors/environment-error? cause)
 
-        report (mf/with-memo [cause]
-                 (when (ex/exception? cause)
-                   (errors/generate-report cause)))
+        report      (mf/with-memo [cause]
+                      (when (ex/exception? cause)
+                        (errors/generate-report cause {:format (if environment :compact :full)})))
 
-        props  (mf/spread-props props {:report report})]
+        props       (mf/spread-props props {:report report})]
 
     (mf/with-effect [report type cause]
       (when (and (ex/exception? cause)
                  (not (contains? #{:not-found :authentication} type)))
-        (errors/submit-report :event-name "exception-page"
+        ;; Environment pages are audit-only: they use the canonical
+        ;; `handled-exception` event instead of `exception-page`.
+        (errors/submit-report :event-name (if environment "handled-exception" "exception-page")
                               :report report
-                              :hint (ex/get-hint cause))))
+                              :hint (ex/get-hint cause)
+                              :cause cause)))
 
     (case type
       :not-found
@@ -596,16 +609,37 @@
 
       [:> internal-error* props])))
 
+(defn screen-kind
+  "Classify the `screen` query param for the exception page.
+
+  The param carries the route name (`?screen=<name>&params`), so the
+  viewer is \"viewer\" and every team dashboard is \"dashboard-*\". Returns
+  `:workspace`, `:dashboard`, `:viewer`, or nil when the screen is not a
+  request-access candidate. Reads the param with `rt/get-query-param`
+  because a repeated param arrives as a vector."
+  [query-params]
+  (let [screen (rt/get-query-param query-params :screen)]
+    (cond
+      (= screen "workspace")
+      :workspace
+
+      (and (string? screen)
+           (str/starts-with? screen "dashboard"))
+      :dashboard
+
+      (= screen "viewer")
+      :viewer)))
+
 (mf/defc exception-page*
   [{:keys [data route] :as props}]
 
   (let [type        (:type data)
-        path        (:path route)
         params      (:query-params route)
 
-        workspace?  (str/includes? path "workspace")
-        dashboard?  (str/includes? path "dashboard")
-        view?       (str/includes? path "view")
+        kind        (screen-kind params)
+        workspace?  (= kind :workspace)
+        dashboard?  (= kind :dashboard)
+        view?       (= kind :viewer)
 
         ;; We store the request access info int this state
         info*       (mf/use-state nil)

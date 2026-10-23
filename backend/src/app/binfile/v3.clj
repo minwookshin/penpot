@@ -12,9 +12,11 @@
    [app.binfile.common :as bfc]
    [app.binfile.migrations :as bfm]
    [app.common.data :as d]
+   [app.common.data.macros :as dm]
    [app.common.exceptions :as ex]
    [app.common.features :as cfeat]
    [app.common.files.migrations :as-alias fmg]
+   [app.common.files.tokens :as cfo]
    [app.common.json :as json]
    [app.common.logging :as l]
    [app.common.media :as cmedia]
@@ -28,6 +30,7 @@
    [app.common.types.plugins :as ctpg]
    [app.common.types.shape :as cts]
    [app.common.types.tokens-lib :as ctob]
+   [app.common.types.tokens-status :as ctos]
    [app.common.types.typography :as cty]
    [app.common.uuid :as uuid]
    [app.config :as cf]
@@ -83,7 +86,7 @@
   [:map {:title "StorageObject"}
    [:id ::sm/uuid]
    [:size ::sm/int]
-   [:content-type :string]
+   [:content-type bfc/schema:content-type]
    [:bucket [::sm/one-of {:format :string} sto/valid-buckets]]
    [:hash {:optional true} :string]])
 
@@ -96,9 +99,11 @@
    [:media-id ::sm/uuid]])
 
 (def ^:private schema:file
-  [:merge
+  (sm/merge
    ctf/schema:file
-   [:map [:options {:optional true} ctf/schema:options]]])
+   [:map
+    [:options {:optional true} ctf/schema:options]
+    [:tokens-source {:optional true} ::sm/uuid]]))
 
 ;; --- HELPERS
 
@@ -131,6 +136,9 @@
 
 (def encode-tokens-lib
   (sm/encoder ctob/schema:tokens-lib sm/json-transformer))
+
+(def encode-tokens-status
+  (sm/encoder ctos/schema:tokens-status sm/json-transformer))
 
 (def encode-plugin-data
   (sm/encoder ctpg/schema:plugin-data sm/json-transformer))
@@ -170,6 +178,9 @@
 (def decode-tokens-lib
   (sm/decoder ctob/schema:tokens-lib sm/json-transformer))
 
+(def decode-tokens-status
+  (sm/decoder ctos/schema:tokens-status sm/json-transformer))
+
 (def decode-plugin-data
   (sm/decoder ctpg/schema:plugin-data sm/json-transformer))
 
@@ -208,6 +219,9 @@
 (def validate-tokens-lib
   (sm/check-fn ctob/schema:tokens-lib))
 
+(def validate-tokens-status
+  (sm/check-fn ctos/schema:tokens-status))
+
 (def validate-plugin-data
   (sm/check-fn ctpg/schema:plugin-data))
 
@@ -216,6 +230,32 @@
 
 (def validate-file-thumbnail
   (sm/check-fn schema:file-thumbnail))
+
+;; --- PROGRESS
+
+(defn- tap-progress
+  "Emit a progress tap of the core, with the counters of the outer scopes
+  in course when the cfg has any.
+
+  The outer counters live in `::outer-counters` of the cfg while a scope
+  is being processed (today only `:files`, tomorrow `:teams` and
+  `:projects` too), so every tap inside carries them as `:outer-counters`:
+  the stages inside do not repeat them, and whoever reads the taps (the
+  jobs adapter) builds its report from one tap alone instead of
+  remembering the last position it saw. A tap that happens outside any
+  scope carries no outer counters, which is the truth about it."
+  [cfg data]
+  (events/tap :progress
+              (cond-> data
+                (some? (::outer-counters cfg))
+                (assoc :outer-counters (::outer-counters cfg)))))
+
+(defn- with-outer-counter
+  "Return cfg with the counter of `scope` set to `position`, keeping the
+  counters of the other outer scopes already in course, so entering a
+  nested scope never wipes the ones above it."
+  [cfg scope position]
+  (assoc-in cfg [::outer-counters scope] position))
 
 ;; --- EXPORT IMPL
 
@@ -234,6 +274,7 @@
   (let [detach? (= export-type :detach-libraries)
         embed?  (= export-type :merge-libraries)]
     (db/tx-run! cfg (fn [cfg]
+                      (bfc/set-transaction-idle-timeout cfg)
                       (cond-> (bfc/get-file cfg file-id
                                             {:realize? true
                                              :include-deleted? true
@@ -245,13 +286,19 @@
                         embed?
                         (update :data #(bfc/embed-assets cfg % file-id))
 
+                        (not (or detach? embed?))
+                        (update :data #(bfc/absorb-unlinked-tokens-source
+                                        cfg % (bfc/get-libraries cfg [file-id])))
+
                         :always
                         (bfc/clean-file-features))))))
 
 (defn- export-storage-objects
   [{:keys [::output] :as cfg}]
-  (let [storage (sto/resolve cfg)]
-    (doseq [id (-> bfc/*state* deref :storage-objects not-empty)]
+  (let [storage (sto/resolve cfg)
+        ids     (-> bfc/*state* deref :storage-objects not-empty)
+        total   (count ids)]
+    (doseq [[index id] (d/enumerate ids)]
       (let [sobject (sto/get-object storage id)
             smeta   (meta sobject)
             ext     (cmedia/mtype->extension (:content-type smeta))
@@ -263,7 +310,8 @@
 
         (write-entry! output path params)
 
-        (events/tap :progress {:section :storage-object :id id})
+        (tap-progress cfg {:section :storage-object :id id
+                           :current (inc index) :total total})
 
         (with-open [input (sto/get-object-data storage sobject)]
           (.putNextEntry ^ZipOutputStream output (ZipEntry. (str "objects/" id ext)))
@@ -272,24 +320,26 @@
 
 (defn- export-file
   [{:keys [::file-id ::output] :as cfg}]
-  (let [file         (get-file cfg file-id)
+  (let [file          (get-file cfg file-id)
 
-        media        (->> (bfc/get-file-media cfg file)
-                          (map (fn [media]
-                                 (dissoc media :file-id))))
+        media         (->> (bfc/get-file-media cfg file)
+                           (map (fn [media]
+                                  (dissoc media :file-id))))
 
-        data         (:data file)
-        typographies (:typographies data)
-        components   (:components data)
-        colors       (:colors data)
-        tokens-lib   (:tokens-lib data)
+        data          (:data file)
+        typographies  (:typographies data)
+        components    (:components data)
+        colors        (:colors data)
+        tokens-lib    (:tokens-lib data)
+        tokens-status (:tokens-status data)
+        tokens-source (:tokens-source data)
 
-        pages        (:pages data)
-        pages-index  (:pages-index data)
+        pages         (:pages data)
+        pages-index   (:pages-index data)
 
-        thumbnails   (bfc/get-file-object-thumbnails cfg file-id)]
+        thumbnails    (bfc/get-file-object-thumbnails cfg file-id)]
 
-    (events/tap :progress {:section :file :id file-id :name (:name file)})
+    (tap-progress cfg {:section :file :id file-id :name (:name file)})
 
     (vswap! bfc/*state* update :files assoc file-id
             {:id file-id
@@ -298,7 +348,10 @@
 
     (let [file (cond-> (select-keys file bfc/file-attrs)
                  (:options data)
-                 (assoc :options (:options data)))
+                 (assoc :options (:options data))
+
+                 (:tokens-source data)
+                 (assoc :tokens-source (:tokens-source data)))
 
           file (-> file
                    (dissoc :data)
@@ -320,7 +373,8 @@
 
         (write-entry! output path page)
 
-        (events/tap :progress {:section :page :id page-id :name (:name page) :file-id file-id})
+        (tap-progress cfg {:section :page :id page-id :name (:name page) :file-id file-id
+                           :current (inc index) :total (count pages)})
 
         (doseq [[shape-id shape] objects]
           (let [path  (str "files/" file-id "/pages/" page-id "/" shape-id ".json")
@@ -331,30 +385,33 @@
     (vswap! bfc/*state* bfc/collect-storage-objects media)
     (vswap! bfc/*state* bfc/collect-storage-objects thumbnails)
 
-    (doseq [{:keys [id] :as media} media]
-      (let [path  (str "files/" file-id "/media/" id ".json")
-            media (encode-media media)]
+    (doseq [[index {:keys [id] :as item}] (d/enumerate media)]
+      (let [path    (str "files/" file-id "/media/" id ".json")
+            encoded (encode-media item)]
 
-        (events/tap :progress {:section :media :id id  :file-id file-id})
-        (write-entry! output path media)))
+        (tap-progress cfg {:section :media :id id :file-id file-id
+                           :current (inc index) :total (count media)})
+        (write-entry! output path encoded)))
 
-    (doseq [thumbnail thumbnails]
+    (doseq [[index thumbnail] (d/enumerate thumbnails)]
       (let [data (cth/parse-object-id (:object-id thumbnail))
             path (str "files/" file-id "/thumbnails/" (:tag data) "/" (:page-id data)
                       "/" (:frame-id data) ".json")
             data (-> data
                      (assoc :media-id (:media-id thumbnail))
                      (encode-file-thumbnail))]
-        (events/tap :progress {:section :thumbnails :id (:object-id thumbnail) :file-id file-id})
+        (tap-progress cfg {:section :thumbnails :id (:object-id thumbnail) :file-id file-id
+                           :current (inc index) :total (count thumbnails)})
         (write-entry! output path data)))
 
-    (doseq [[id component] components]
+    (doseq [[index [id component]] (d/enumerate components)]
       (let [path      (str "files/" file-id "/components/" id ".json")
             component (encode-component component)]
-        (events/tap :progress {:section :component :id id :file-id file-id})
+        (tap-progress cfg {:section :component :id id :file-id file-id
+                           :current (inc index) :total (count components)})
         (write-entry! output path component)))
 
-    (doseq [[id color] colors]
+    (doseq [[index [id color]] (d/enumerate colors)]
       (let [path  (str "files/" file-id "/colors/" id ".json")
             color (-> (encode-color color)
                       (dissoc :file-id))
@@ -362,21 +419,39 @@
                     (and (contains? color :path)
                          (str/empty? (:path color)))
                     (dissoc :path))]
-        (events/tap :progress {:section :color :id id :file-id file-id})
+        (tap-progress cfg {:section :color :id id :file-id file-id
+                           :current (inc index) :total (count colors)})
         (write-entry! output path color)))
 
-    (doseq [[id object] typographies]
+    (doseq [[index [id object]] (d/enumerate typographies)]
       (let [path       (str "files/" file-id "/typographies/" id ".json")
             typography (encode-typography object)]
-        (events/tap :progress {:section :typography :id id :file-id file-id})
+        (tap-progress cfg {:section :typography :id id :file-id file-id
+                           :current (inc index) :total (count typographies)})
         (write-entry! output path typography)))
 
     (when (and tokens-lib
                (not (ctob/empty-lib? tokens-lib)))
       (let [path           (str "files/" file-id "/tokens.json")
             encoded-tokens (encode-tokens-lib tokens-lib)]
-        (events/tap :progress {:section :tokens-lib :file-id file-id})
-        (write-entry! output path encoded-tokens)))))
+        (tap-progress cfg {:section :tokens-lib :file-id file-id})
+        (write-entry! output path encoded-tokens)))
+
+    (when tokens-status
+      (let [path                  (str "files/" file-id "/tokens-status.json")
+            library               (if (and (some? tokens-source)
+                                           (not= tokens-source (:id data)))
+                                    (get-file cfg tokens-source)
+                                    file)
+
+            effective-tokens-lib  (when library
+                                    (dm/get-in library [:data :tokens-lib]))
+
+            encoded-status        (-> (encode-tokens-status tokens-status)
+                                      (cfo/ids->names effective-tokens-lib))]
+
+        (tap-progress cfg {:section :tokens-status :file-id file-id})
+        (write-entry! output path encoded-status)))))
 
 (defn- export-files
   [{:keys [::bfc/ids ::bfc/export-type ::output] :as cfg}]
@@ -414,7 +489,8 @@
     (doseq [[index file-id] (d/enumerate ids)]
       (-> cfg
           (assoc ::file-id file-id)
-          (assoc ::file-seqn index)
+          (with-outer-counter :files {:current (inc index)
+                                      :total (count ids)})
           (export-file)))
 
     ;; Write manifest file
@@ -574,89 +650,89 @@
       (let [manifest (json/read reader :key-fn json/read-kebab-key)]
         (decode-manifest manifest)))))
 
-(defn- match-media-entry-fn
-  [file-id]
-  (let [pattern (str "^files/" file-id "/media/([^/]+).json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :id (parse-uuid id)}))))
+(def ^:private file-object-entry-categories
+  "Zip path segments that hold per-file object entries on the
+  `files/<file-id>/<category>/<object-id>.json` shape."
+  #{"media" "colors" "components" "typographies"})
 
-(defn- match-color-entry-fn
-  [file-id]
-  (let [pattern (str "^files/" file-id "/colors/([^/]+).json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :id (parse-uuid id)}))))
+(defn- index-entry-name
+  "Classify a single zip entry by the raw shape of its path and
+  accumulate it on the index.
 
-(defn- match-component-entry-fn
-  [file-id]
-  (let [pattern (str "^files/" file-id "/components/([^/]+).json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :id (parse-uuid id)}))))
+  It replaces the per-file regex matchers with a single
+  classification pass over all entries. The `.json` suffix is matched
+  literally: the previous regexes left the dot unescaped, so crafted
+  paths like `files/<file-id>/tokensXjson` or `objects/x-json` matched
+  by accident; requiring the literal suffix ignores them (legitimate
+  exports always write a literal `.json` suffix). Unknown paths are
+  ignored."
+  [index ^String name entry]
+  (if-not (and name (str/ends-with? name ".json"))
+    index
+    (let [base  (subs name 0 (- (count name) 5))
+          segs  (str/split base "/")
+          seg-n (count segs)
+          seg-1 (nth segs 0 nil)
+          seg-2 (nth segs 1 nil)
+          seg-3 (nth segs 2 nil)]
 
-(defn- match-typography-entry-fn
-  [file-id]
-  (let [pattern (str "^files/" file-id "/typographies/([^/]+).json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :id (parse-uuid id)}))))
+      (if-not (and (pos? seg-n) (every? #(pos? (count %)) segs))
+        index
+        (cond
+          ;; objects/<object-id>.json
+          (and (= seg-n 2) (= seg-1 "objects"))
+          (update index :objects bfc/conj-vec
+                  {:entry entry :id (parse-uuid seg-2)})
 
-(defn- match-tokens-lib-entry-fn
-  [file-id]
-  (let [pattern (str "^files/" file-id "/tokens.json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry}))))
+          ;; files/<file-id>/tokens.json
+          (and (= seg-n 3) (= seg-1 "files") (= seg-3 "tokens"))
+          (update-in index [:tokens seg-2] bfc/conj-vec {:entry entry})
 
-(defn- match-thumbnail-entry-fn
-  [file-id]
-  (let [pattern (str "^files/" file-id "/thumbnails/([^/]+)/([^/]+)/([^/]+).json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ tag page-id frame-id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :tag tag
-         :page-id (parse-uuid page-id)
-         :frame-id (parse-uuid frame-id)
-         :file-id file-id}))))
+          ;; files/<file-id>/tokens-status.json
+          (and (= seg-n 3) (= seg-1 "files") (= seg-3 "tokens-status"))
+          (update-in index [:tokens-status seg-2] bfc/conj-vec {:entry entry})
 
-(defn- match-page-entry-fn
-  [file-id]
-  (let [pattern (str "^files/" file-id "/pages/([^/]+).json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :id (parse-uuid id)}))))
+          ;; files/<file-id>/thumbnails/<tag>/<page-id>/<frame-id>.json
+          (and (= seg-n 6) (= seg-1 "files") (= seg-3 "thumbnails"))
+          (update-in index [:thumbnails seg-2] bfc/conj-vec
+                     {:entry entry
+                      :tag (nth segs 3)
+                      :page-id (parse-uuid (nth segs 4))
+                      :frame-id (parse-uuid (nth segs 5))
+                      :file-id seg-2})
 
-(defn- match-shape-entry-fn
-  [file-id page-id]
-  (let [pattern (str "^files/" file-id "/pages/" page-id "/([^/]+).json$")
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :page-id page-id
-         :id (parse-uuid id)}))))
+          ;; files/<file-id>/pages/<page-id>.json
+          (and (= seg-n 4) (= seg-1 "files") (= seg-3 "pages"))
+          (update-in index [:pages seg-2] bfc/conj-vec
+                     {:entry entry :id (parse-uuid (nth segs 3))})
 
-(defn- match-storage-entry-fn
-  []
-  (let [pattern "^objects/([^/]+).json$"
-        pattern (re-pattern pattern)]
-    (fn [entry]
-      (when-let [[_ id] (re-matches pattern (zip-entry-name entry))]
-        {:entry entry
-         :id (parse-uuid id)}))))
+          ;; files/<file-id>/pages/<page-id>/<shape-id>.json
+          (and (= seg-n 5) (= seg-1 "files") (= seg-3 "pages"))
+          (update-in index [:shapes seg-2 (nth segs 3)] bfc/conj-vec
+                     {:entry entry
+                      :page-id (nth segs 3)
+                      :id (parse-uuid (nth segs 4))})
+
+          ;; files/<file-id>/<category>/<object-id>.json
+          (and (= seg-n 4)
+               (= seg-1 "files")
+               (contains? file-object-entry-categories seg-3))
+          (update-in index [(keyword seg-3) seg-2] bfc/conj-vec
+                     {:entry entry :id (parse-uuid (nth segs 3))})
+
+          :else
+          index)))))
+
+(defn- index-entries
+  "Classify all the provided zip entries in a single pass and group
+  them by their path shape, so import consumers can lookup their
+  entries per file (and per page) instead of rescanning the whole
+  entry collection for every file and page."
+  [entries]
+  (reduce (fn [index entry]
+            (index-entry-name index (zip-entry-name entry) entry))
+          {}
+          entries))
 
 (defn- read-entry
   ([cfg ^ZipFile input entry]
@@ -686,8 +762,8 @@
           (validate-plugin-data)))))
 
 (defn- read-file-media
-  [{:keys [::bfc/input ::entries] :as cfg} file-id]
-  (->> (keep (match-media-entry-fn file-id) entries)
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id]
+  (->> (get-in entries-index [:media (str file-id)])
        (reduce (fn [result {:keys [id entry]}]
                  (let [object (->> (read-entry cfg input entry)
                                    (decode-media)
@@ -706,21 +782,23 @@
        (not-empty)))
 
 (defn- read-file-colors
-  [{:keys [::bfc/input ::entries] :as cfg} file-id]
-  (->> (keep (match-color-entry-fn file-id) entries)
-       (reduce (fn [result {:keys [id entry]}]
-                 (let [object (->> (read-entry cfg input entry)
-                                   (decode-color)
-                                   (validate-color))]
-                   (events/tap :progress {:section :color :id id :file-id file-id})
-                   (if (= id (:id object))
-                     (assoc result id object)
-                     result)))
-               {})
-       (not-empty)))
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id]
+  (let [entries (get-in entries-index [:colors (str file-id)])]
+    (->> (d/enumerate entries)
+         (reduce (fn [result [index {:keys [id entry]}]]
+                   (let [object (->> (read-entry cfg input entry)
+                                     (decode-color)
+                                     (validate-color))]
+                     (tap-progress cfg {:section :color :id id :file-id file-id
+                                        :current (inc index) :total (count entries)})
+                     (if (= id (:id object))
+                       (assoc result id object)
+                       result)))
+                 {})
+         (not-empty))))
 
 (defn- read-file-components
-  [{:keys [::bfc/input ::entries] :as cfg} file-id]
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id]
   (let [clean-component-post-decode
         (fn [component]
           (d/update-when component :objects
@@ -736,15 +814,18 @@
                            (reduce-kv (fn [objects id shape]
                                         (assoc objects id (bfl/clean-shape-pre-decode shape)))
                                       objects
-                                      objects))))]
+                                      objects))))
+        entries
+        (get-in entries-index [:components (str file-id)])]
 
-    (->> (keep (match-component-entry-fn file-id) entries)
-         (reduce (fn [result {:keys [id entry]}]
+    (->> (d/enumerate entries)
+         (reduce (fn [result [index {:keys [id entry]}]]
                    (let [object (->> (read-entry cfg input entry)
                                      (clean-component-pre-decode)
                                      (decode-component)
                                      (clean-component-post-decode))]
-                     (events/tap :progress {:section :component :id id :file-id file-id})
+                     (tap-progress cfg {:section :component :id id :file-id file-id
+                                        :current (inc index) :total (count entries)})
                      (if (= id (:id object))
                        (assoc result id object)
                        result)))
@@ -752,30 +833,54 @@
          (not-empty))))
 
 (defn- read-file-typographies
-  [{:keys [::bfc/input ::entries] :as cfg} file-id]
-  (->> (keep (match-typography-entry-fn file-id) entries)
-       (reduce (fn [result {:keys [id entry]}]
-                 (let [object (->> (read-entry cfg input entry)
-                                   (decode-typography)
-                                   (validate-typography))]
-                   (events/tap :progress {:section :typography :id id :file-id file-id})
-                   (if (= id (:id object))
-                     (assoc result id object)
-                     result)))
-               {})
-       (not-empty)))
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id]
+  (let [entries (get-in entries-index [:typographies (str file-id)])]
+    (->> (d/enumerate entries)
+         (reduce (fn [result [index {:keys [id entry]}]]
+                   (let [object (->> (read-entry cfg input entry)
+                                     (decode-typography)
+                                     (validate-typography))]
+                     (tap-progress cfg {:section :typography :id id :file-id file-id
+                                        :current (inc index) :total (count entries)})
+                     (if (= id (:id object))
+                       (assoc result id object)
+                       result)))
+                 {})
+         (not-empty))))
 
-(defn- read-file-tokens-lib
-  [{:keys [::bfc/input ::entries] :as cfg} file-id]
-  (when-let [entry (d/seek (match-tokens-lib-entry-fn file-id) entries)]
-    (events/tap :progress {:section :tokens-lib :file-id file-id})
+(defn- read-file-tokens-lib*
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id]
+  (when-let [{:keys [entry]} (first (get-in entries-index [:tokens (str file-id)]))]
+    (tap-progress cfg {:section :tokens-lib :file-id file-id})
     (->> (read-entry cfg input entry nil)
          (decode-tokens-lib)
          (validate-tokens-lib))))
 
+(defn- read-file-tokens-lib
+  "Read the tokens lib of a file once per import. Decoding generates new
+  set ids, so the tokens lib of a library must be the same instance when
+  it is imported and when it resolves the tokens status of a file that
+  uses it as tokens source."
+  [cfg file-id]
+  (let [cache (:tokens-libs @bfc/*state*)]
+    (if (contains? cache file-id)
+      (get cache file-id)
+      (let [tokens-lib (read-file-tokens-lib* cfg file-id)]
+        (vswap! bfc/*state* assoc-in [:tokens-libs file-id] tokens-lib)
+        tokens-lib))))
+
+(defn- read-file-tokens-status
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id tokens-lib]
+  (when-let [{:keys [entry]} (first (get-in entries-index [:tokens-status (str file-id)]))]
+    (tap-progress cfg {:section :tokens-status :file-id file-id})
+    (->> (read-entry cfg input entry nil)
+         (cfo/names->ids tokens-lib)
+         (decode-tokens-status)
+         (validate-tokens-status))))
+
 (defn- read-file-shapes
-  [{:keys [::bfc/input ::entries] :as cfg} file-id page-id]
-  (->> (keep (match-shape-entry-fn file-id page-id) entries)
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id page-id]
+  (->> (get-in entries-index [:shapes (str file-id) (str page-id)])
        (reduce (fn [result {:keys [id entry]}]
                  (let [object (->> (read-entry cfg input entry)
                                    (bfl/clean-shape-pre-decode)
@@ -788,24 +893,26 @@
        (not-empty)))
 
 (defn- read-file-pages
-  [{:keys [::bfc/input ::entries] :as cfg} file-id]
-  (->> (keep (match-page-entry-fn file-id) entries)
-       (keep (fn [{:keys [id entry]}]
-               (let [page (->> (read-entry cfg input entry)
-                               (decode-page))
-                     page (dissoc page :options)]
-                 (events/tap :progress {:section :page :id id :file-id file-id})
-                 (when (= id (:id page))
-                   (let [objects (read-file-shapes cfg file-id id)]
-                     (assoc page :objects objects))))))
-       (sort-by :index)
-       (reduce (fn [result {:keys [id] :as page}]
-                 (assoc result id (dissoc page :index)))
-               (d/ordered-map))))
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id]
+  (let [entries (get-in entries-index [:pages (str file-id)])]
+    (->> (d/enumerate entries)
+         (keep (fn [[index {:keys [id entry]}]]
+                 (let [page (->> (read-entry cfg input entry)
+                                 (decode-page))
+                       page (dissoc page :options)]
+                   (tap-progress cfg {:section :page :id id :file-id file-id
+                                      :current (inc index) :total (count entries)})
+                   (when (= id (:id page))
+                     (let [objects (read-file-shapes cfg file-id id)]
+                       (assoc page :objects objects))))))
+         (sort-by :index)
+         (reduce (fn [result {:keys [id] :as page}]
+                   (assoc result id (dissoc page :index)))
+                 (d/ordered-map)))))
 
 (defn- read-file-thumbnails
-  [{:keys [::bfc/input ::entries] :as cfg} file-id]
-  (->> (keep (match-thumbnail-entry-fn file-id) entries)
+  [{:keys [::bfc/input ::entries-index] :as cfg} file-id]
+  (->> (get-in entries-index [:thumbnails (str file-id)])
        (reduce (fn [result {:keys [page-id frame-id tag entry]}]
                  (let [object (->> (read-entry cfg input entry)
                                    (decode-file-thumbnail)
@@ -820,24 +927,33 @@
        (not-empty)))
 
 (defn- read-file-data
-  [cfg file-id]
-  (let [colors       (read-file-colors cfg file-id)
-        typographies (read-file-typographies cfg file-id)
-        tokens-lib   (read-file-tokens-lib cfg file-id)
-        components   (read-file-components cfg file-id)
-        plugin-data  (read-file-plugin-data cfg file-id)
-        pages        (read-file-pages cfg file-id)]
+  [cfg file-id tokens-source]
+  (let [colors               (read-file-colors cfg file-id)
+        typographies         (read-file-typographies cfg file-id)
+        tokens-lib           (read-file-tokens-lib cfg file-id)
+        effective-tokens-lib (if (and (some? tokens-source)
+                                      (not= tokens-source file-id))
+                               (read-file-tokens-lib cfg tokens-source)
+                               tokens-lib)
+        tokens-status        (read-file-tokens-status cfg file-id effective-tokens-lib)
+        components           (read-file-components cfg file-id)
+        plugin-data          (read-file-plugin-data cfg file-id)
+        pages                (read-file-pages cfg file-id)]
     {:pages (-> pages keys vec)
      :pages-index (into {} pages)
      :colors colors
      :typographies typographies
      :tokens-lib tokens-lib
+     :tokens-status tokens-status
      :components components
      :plugin-data plugin-data}))
 
 (defn- import-file
-  [{:keys [::db/conn ::bfc/project-id ::manifest] :as cfg} {file-id :id file-name :name}]
-  (let [file-id'   (bfc/lookup-index file-id)
+  [{:keys [::db/conn ::bfc/project-id ::manifest] :as cfg}
+   {file-id :id file-name :name}
+   position]
+  (let [cfg        (with-outer-counter cfg :files position)
+        file-id'   (bfc/lookup-index file-id)
         file       (read-file cfg file-id)
         media      (read-file-media cfg file-id)
         thumbnails (read-file-thumbnails cfg file-id)]
@@ -849,16 +965,19 @@
            :version (:version file)
            ::l/sync? true)
 
+    (tap-progress cfg {:section :file :file-id file-id})
+
     (vswap! bfc/*state* update :index bfc/update-index media :id)
 
-    (doseq [item media]
+    (doseq [[index item] (d/enumerate media)]
       (let [params (-> item
                        (update :id bfc/lookup-index)
                        (assoc :file-id file-id')
                        (d/update-when :media-id bfc/lookup-index)
                        (d/update-when :thumbnail-id bfc/lookup-index))]
 
-        (events/tap :progress {:section :media :id (:id params) :file-id file-id})
+        (tap-progress cfg {:section :media :id (:id params) :file-id file-id
+                           :current (inc index) :total (count media)})
 
         (l/dbg :hint "inserting media object"
                :file-id (str file-id')
@@ -871,7 +990,7 @@
         (db/insert! conn :file-media-object params
                     ::db/on-conflict-do-nothing? (::bfc/overwrite cfg))))
 
-    (doseq [item thumbnails]
+    (doseq [[index item] (d/enumerate thumbnails)]
       (let [media-id  (bfc/lookup-index (:media-id item))
             object-id (-> (assoc item :file-id file-id')
                           (cth/fmt-object-id))
@@ -885,18 +1004,19 @@
                :media-id (str media-id)
                ::l/sync? true)
 
-        (events/tap :progress {:section :thumbnail :file-id file-id :object-id object-id})
+        (tap-progress cfg {:section :thumbnail :file-id file-id :object-id object-id
+                           :current (inc index) :total (count thumbnails)})
 
         (db/insert! conn :file-tagged-object-thumbnail params
                     ::db/on-conflict-do-nothing? true)))
 
-    (events/tap :progress {:section :file :file-id file-id})
-
-    (let [data (-> (read-file-data cfg file-id)
+    (let [data (-> (read-file-data cfg file-id (:tokens-source file))
                    (d/without-nils)
                    (assoc :id file-id')
                    (cond-> (:options file)
-                     (assoc :options (:options file))))
+                     (assoc :options (:options file)))
+                   (cond-> (:tokens-source file)
+                     (assoc :tokens-source (bfc/lookup-index (:tokens-source file)))))
 
           file (-> (select-keys file bfc/file-attrs)
                    (assoc :id file-id')
@@ -906,7 +1026,8 @@
                    (assoc :metadata (d/without-nils
                                      {:generated-by (get manifest :generated-by)
                                       :referer (or (get manifest :referer) (get manifest :refer))}))
-                   (dissoc :options))
+                   (dissoc :options)
+                   (dissoc :tokens-source))
           file  (bfc/process-file cfg file)
           file  (ctf/check-file file)]
 
@@ -917,26 +1038,26 @@
 
 (defn- import-file-relations
   [{:keys [::db/conn ::manifest ::bfc/timestamp] :as cfg}]
-  (events/tap :progress {:section :relations})
-  (doseq [[file-id libr-id] (:relations manifest)]
+  (let [relations (:relations manifest)]
+    (doseq [[index [file-id libr-id]] (d/enumerate relations)]
+      (tap-progress cfg {:section :relations
+                         :current (inc index) :total (count relations)})
 
-    (let [file-id (bfc/lookup-index file-id)
-          libr-id (bfc/lookup-index libr-id)]
+      (let [file-id (bfc/lookup-index file-id)
+            libr-id (bfc/lookup-index libr-id)]
 
-      (when (and file-id libr-id)
-        (l/dbg :hint "create file library link"
-               :file-id (str file-id)
-               :lib-id (str libr-id)
-               ::l/sync? true)
-        (let [rel-params {:file-id file-id
-                          :library-file-id libr-id}]
-          (db/insert! conn :file-library-rel rel-params)
-          (bfc/upsert-file-library-sync! conn (assoc rel-params :synced-at timestamp)))))))
+        (when (and file-id libr-id)
+          (l/dbg :hint "create file library link"
+                 :file-id (str file-id)
+                 :lib-id (str libr-id)
+                 ::l/sync? true)
+          (let [rel-params {:file-id file-id
+                            :library-file-id libr-id}]
+            (db/insert! conn :file-library-rel rel-params)
+            (bfc/upsert-file-library-sync! conn (assoc rel-params :synced-at timestamp))))))))
 
 (defn- import-storage-objects
-  [{:keys [::bfc/input ::entries ::bfc/timestamp] :as cfg}]
-  (events/tap :progress {:section :storage-objects})
-
+  [{:keys [::bfc/input ::entries-index ::bfc/timestamp] :as cfg}]
   ;; IMPORTANT: we strongly do not reuse the main connection that can
   ;; run inside a transaction because the storage upload process can
   ;; fail in the middle of uploading and leave garbage on the underlying
@@ -945,11 +1066,15 @@
   ;; what the storage subsystem registers in other parallel
   ;; transaction
   (let [storage (sto/resolve cfg)
-        entries (keep (match-storage-entry-fn) entries)]
+        entries (:objects entries-index)
+        total   (count entries)]
 
-    (doseq [{:keys [id entry]} entries]
+    (doseq [[index {:keys [id entry]}] (d/enumerate entries)]
+      (tap-progress cfg {:section :storage-objects
+                         :current (inc index) :total total})
       (let [object  (-> (read-entry cfg input entry)
                         (decode-storage-object)
+                        (d/update-when :content-type bfc/normalize-content-type)
                         (update :bucket d/nilv sto/default-bucket)
                         (validate-storage-object))
 
@@ -985,7 +1110,17 @@
                       :expected-hash (:hash object)
                       :found-hash (sto/get-hash content))))
 
-        (let [params  (-> object
+        (let [clean   (when (bfc/svg-object? object)
+                        (let [limit (::max-binary-entry-size cfg)
+                              raw   (with-open [istream (cond-> (zip-entry-stream input (get-zip-entry input path))
+                                                          limit (size-limiting-stream limit (atom 0) path))]
+                                      (io/read istream))]
+                          (bfc/sanitize-imported-svg object raw)))
+              content (if-let [{:keys [bytes hash]} clean]
+                        (-> (sto/content bytes)
+                            (sto/wrap-with-hash hash))
+                        content)
+              params  (-> object
                           (dissoc :id :size)
                           (assoc ::sto/content content)
                           (assoc ::sto/deduplicate? true)
@@ -1100,7 +1235,7 @@
 
 (defn- import-files*
   [{:keys [::manifest] :as cfg}]
-  (bfc/disable-database-timeouts! cfg)
+  (bfc/configure-import-transaction cfg)
 
   (vswap! bfc/*state* update :index bfc/update-index (:files manifest) :id)
 
@@ -1118,12 +1253,15 @@
       (vswap! bfc/*state* update :index assoc old-lib-id library-id)))
 
   (let [files    (get manifest :files)
-        file-ids (reduce (fn [result file]
+        total    (count files)
+        file-ids (reduce (fn [result [index file]]
                            (let [name' (get file :name)
-                                 file (assoc file :name name')]
-                             (conj result (import-file cfg file))))
+                                 file  (assoc file :name name')]
+                             (conj result (import-file cfg file
+                                                       {:current (inc index)
+                                                        :total total}))))
                          []
-                         files)
+                         (d/enumerate files))
         ;; Build map of file-id to file-name for resolution
         files-info (into {} (map (fn [file-id manifest-file]
                                    [file-id (:name manifest-file)])
@@ -1168,7 +1306,7 @@
               :hint "unable to perform in-place update with binfile containing more than 1 file"
               :manifest manifest))
 
-  (bfc/disable-database-timeouts! cfg)
+  (bfc/configure-import-transaction cfg)
 
   (let [ref-file (bfc/get-minimal-file cfg file-id ::db/for-update true)
         file     (first (get manifest :files))
@@ -1180,7 +1318,7 @@
               bfc/*reference-file* ref-file]
 
       (import-storage-objects cfg)
-      (import-file cfg file)
+      (import-file cfg file {:current 1 :total 1})
 
       (invalidate-thumbnails cfg file-id)
       (bfm/apply-pending-migrations! cfg)
@@ -1212,7 +1350,7 @@
                              :found (count entries)))
 
         cfg      (-> cfg
-                     (assoc ::entries entries)
+                     (assoc ::entries-index (index-entries entries))
                      (assoc ::manifest manifest)
                      (assoc ::bfc/timestamp timestamp))]
 
@@ -1235,7 +1373,7 @@
 
         (cfeat/check-supported-features! features)))
 
-    (events/tap :progress {:section :manifest})
+    (tap-progress cfg {:section :manifest})
 
     (binding [bfc/*state* (volatile! {:media [] :index {}})]
       (if (::bfc/file-id cfg)
@@ -1249,7 +1387,8 @@
   format. There are some options available for customize the output:
 
   `::bfc/export-type`: determines how linked libraries are handled.
-  Valid values: `:include-libraries` (include linked libraries),
+  Valid values:
+  `:include-libraries` (include linked libraries),
   `:merge-libraries` (embed library assets in the file),
   `:detach-libraries` (treat assets as basic objects),
   `:link-later` (preserve component metadata for relinking on import)."
@@ -1287,6 +1426,11 @@
         ;; Do nothing, EOF means client closes connection abruptly
         (vreset! ab true)
         nil)
+
+      (catch clojure.lang.ExceptionInfo cause
+        (if (= :interrupt (:type (ex-data cause)))
+          (vreset! ab true)
+          (throw cause)))
 
       (catch Throwable cause
         (vreset! cs cause)

@@ -50,18 +50,28 @@
   (ptk/reify ::initialize
     ptk/WatchEvent
     (watch [_ state stream]
-      (let [stopper    (rx/filter (ptk/type? ::finalize) stream)
-            profile-id (:profile-id state)]
+      (let [stopper         (rx/filter (ptk/type? ::finalize) stream)
+            profile-id      (:profile-id state)
+            organization-id (dm/get-in state [:teams team-id :organization :id])
+            initmsg         {:type :subscribe-team :team-id team-id}]
 
         (->> (rx/merge
               (rx/of (fetch-projects team-id)
-                     (df/fetch-fonts team-id))
+                     (df/fetch-fonts team-id)
+                     (dws/send initmsg))
+              ;; On reconnect, send again the subscription message
+              (->> stream
+                   (rx/filter (ptk/type? ::dws/opened))
+                   (rx/map #(dws/send initmsg)))
               (->> stream
                    (rx/filter (ptk/type? ::dws/message))
                    (rx/map deref)
                    (rx/filter (fn [{:keys [topic] :as msg}]
                                 (or (= topic uuid/zero)
-                                    (= topic profile-id))))
+                                    (= topic profile-id)
+                                    (= topic team-id)
+                                    (when (some? organization-id)
+                                      (= topic organization-id)))))
                    (rx/map process-message)))
 
              (rx/take-until stopper))))))
@@ -272,6 +282,13 @@
 
 ;; --- EVENT: duplicate-project
 
+(defn project-with-file-count
+  "Loads the file count missing from a duplicated project's RPC response."
+  [{:keys [id] :as project}]
+  (->> (rp/cmd! :get-project-files {:project-id id})
+       (rx/map (fn [files]
+                 (assoc project :count (count files) :is-pinned false)))))
+
 (defn project-duplicated
   [{:keys [id] :as project}]
   (ptk/reify ::project-duplicated
@@ -302,6 +319,7 @@
                                       (str " " copy-count))))
             new-name (cfh/generate-unique-name name unames :suffix-fn suffix-fn)]
         (->> (rp/cmd! :duplicate-project {:project-id id :name new-name})
+             (rx/mapcat project-with-file-count)
              (rx/tap on-success)
              (rx/map project-duplicated)
              (rx/catch on-error))))))
@@ -655,6 +673,11 @@
              (modal/hide)))))
 
 (defn- handle-user-organization-change
+  "Handle :user-organization-change websocket messages.
+  `organization-id`, `organization-name` and `notification` come from the
+  server-published message (see backend app.rpc.notifications/
+  notify-user-organization-change); `notification` is a translation key
+  resolved here, dynamic by design."
   [{:keys [organization-id organization-name notification]}]
   (ptk/reify ::handle-user-organization-change
     ptk/WatchEvent
@@ -662,6 +685,10 @@
       (when (and notification (contains? cf/flags :admin-console))
         (let [team-id (:current-team-id state)
               team    (dm/get-in state [:teams team-id])]
+          ;; Execution time translation strings (keys sent by the backend):
+          ;;   (tr "dashboard.user-no-longer-belong-organization")
+          ;; notification is a server-provided key, dynamic by design
+          #_{:clj-kondo/ignore [:penpot/tr-dynamic]}
           (rx/of (ntf/show {:content (tr notification organization-name)
                             :type :toast
                             :level :info

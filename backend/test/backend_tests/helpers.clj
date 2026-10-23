@@ -20,12 +20,15 @@
    [app.common.uuid :as uuid]
    [app.config :as cf]
    [app.db :as db]
+   [app.jobs :as jobs]
    [app.main :as main]
    [app.media]
    [app.media :as-alias mtx]
+   [app.metrics :as-alias metrics]
    [app.migrations]
    [app.msgbus :as-alias mbus]
    [app.rpc :as-alias rpc]
+   [app.rpc.climit :as-alias climit]
    [app.rpc.commands.auth :as cmd.auth]
    [app.rpc.commands.files :as files]
    [app.rpc.commands.files-create :as files.create]
@@ -35,7 +38,6 @@
    [app.rpc.helpers :as rph]
    [app.util.blob :as blob]
    [app.util.services :as sv]
-   [app.worker :as wrk]
    [app.worker.runner]
    [clojure.java.io :as io]
    [clojure.spec.alpha :as s]
@@ -60,6 +62,13 @@
 (def ^:dynamic *system* nil)
 (def ^:dynamic *pool* nil)
 
+;; Fallback values used when no PENPOT_TEST_* env vars are set (e.g. CI sets
+;; them explicitly, see .github/workflows/tests-backend.yml). Inside the
+;; devenv each wsN container receives per-instance values via
+;; manage.sh (PENPOT_TEST_DATABASE_URI=postgresql://postgres/penpot_test_wsN,
+;; PENPOT_TEST_REDIS_URI=redis://valkey/<6+N>), so parallel test runs on
+;; different workspaces never share a database. cf/read-config picks the env
+;; vars up through the "penpot-test" prefix.
 (def default
   {:database-uri "postgresql://postgres/penpot_test"
    :redis-uri "redis://valkey/1"
@@ -95,6 +104,22 @@
        (fs/create-dir "/tmp/penpot")
        (next)))))
 
+(defn- remove-job-runners
+  "Drops every `[<profile> :app.worker/runner]` from the system.
+
+  The tests drive the runner loop by hand (`wdisp/run-batch` plus
+  `run-worker-loop` over a system they build themselves), so a live runner
+  of any queue races them: it takes the job the test just dispatched and
+  completes it behind the test's back. Matching the key by shape, instead
+  of listing the known queues by hand, keeps a new queue from silently
+  bringing that race back (which is what happened to the `binfile` runner
+  this key list was missing)."
+  [system]
+  (apply dissoc system
+         (filter #(and (vector? %)
+                       (= :app.worker/runner (second %)))
+                 (keys system))))
+
 (defn init-system
   [next]
   (let [templates [{:id "test"
@@ -124,10 +149,10 @@
                            :app.notifications/handler
                            :app.loggers.mattermost/reporter
                            :app.loggers.database/reporter
+                           :app.loggers.metrics/reporter
                            :app.worker/cron
-                           :app.worker/dispatcher
-                           [:app.main/default :app.worker/runner]
-                           [:app.main/webhook :app.worker/runner]))
+                           :app.worker/dispatcher)
+                   (remove-job-runners))
         _      (ig/load-namespaces system)
         system (-> (ig/expand system) (ig/init))]
     (try
@@ -228,11 +253,37 @@
                                                      :features features}
                                                     params)))))))
 
+(defn create-job*
+  "A job row in the state a worker finds it: running, in the `binfile` queue,
+  owned by `profile-id` and holding `resource-id` when it consumes one.
+  `job-name` is the kind of the job (a keyword like the `::jobs/name` a caller
+  would pass, or the text the row holds) and it is what resolves the job-def
+  of the row when its result is read or checked."
+  [job-name {:keys [profile-id resource-id]}]
+  (let [id (uuid/next)]
+    (db/insert! *pool* :job {:id           id
+                             :name         (name job-name)
+                             :tenant       (cf/get :tenant)
+                             :queue        "binfile"
+                             :params       (db/json {})
+                             :priority     100
+                             :max-retries  0
+                             :retry-num    0
+                             :status       "running"
+                             :profile-id   profile-id
+                             :resource-id  resource-id
+                             :scheduled-at (ct/now)
+                             :created-at   (ct/now)
+                             :modified-at  (ct/now)})
+    id))
+
 (defn mark-file-deleted*
   ([params]
    (mark-file-deleted* *system* params))
-  ([conn {:keys [id] :as params}]
-   (#'files/mark-file-deleted conn {} id)))
+  ([system {:keys [id] :as params}]
+   (db/tx-run! system
+               (fn [cfg]
+                 (#'files/mark-file-deleted cfg {} id)))))
 
 (defn create-team*
   ([i params] (create-team* *system* i params))
@@ -299,9 +350,7 @@
   ([params] (create-project-role* *system* params))
   ([system {:keys [project-id profile-id role] :or {role :owner}}]
    (dm/with-open [conn (db/open system)]
-     (#'teams/create-project-role conn {:project-id project-id
-                                        :profile-id profile-id
-                                        :role role}))))
+     (#'teams/create-project-role conn profile-id project-id role))))
 
 (defn create-file-role*
   ([params] (create-file-role* *system* params))
@@ -443,17 +492,33 @@
 
 (defn- prepare-rpc-params
   [data]
-  (let [params  (reduce-kv (fn [params k v]
-                             (if (qualified-keyword? k)
-                               (assoc params k v)
-                               params))
-                           {}
-                           (dissoc data ::type))
-        request (-> (make-dummy-request)
-                    (assoc :params (d/without-qualified data)))]
+  (let [params   (reduce-kv (fn [params k v]
+                              (if (qualified-keyword? k)
+                                (assoc params k v)
+                                params))
+                            {}
+                            (dissoc data ::type))
+        ;; Honor a caller-supplied request map from the data metadata so
+        ;; tests can inject headers, remote address and auth context (e.g.
+        ;; :app.http/auth-key-id). Non-map requests (reify IRequest stubs)
+        ;; fall back to the dummy request, which carries the body params
+        ;; the validation wrapper reads.
+        supplied (-> data meta :app.http/request)
+        request  (if (map? supplied)
+                   (assoc supplied :params (merge (:params supplied)
+                                                  (d/without-qualified data)))
+                   (assoc (make-dummy-request)
+                          :params (d/without-qualified data)))]
 
     (-> params
         (assoc :app.rpc/request-at (ct/now))
+        ;; Mirror of the production flag in `app.rpc/make-rpc-handler`:
+        ;; upload maps are only trusted over multipart. Tests declare it
+        ;; with a content-type header on the supplied request map.
+        (assoc ::rpc/is-multipart
+               (str/starts-with?
+                (str (yreq/get-header request "content-type"))
+                "multipart/"))
         (with-meta {:app.http/request request}))))
 
 (defn command!
@@ -467,6 +532,20 @@
     (let [params (prepare-rpc-params data)]
       (try-on! (method-fn params)))))
 
+(defn command-raw!
+  "Like `command!`, but returns the raw result without unwrapping it, so a test
+  can read the result metadata (for example the audit props a command sets on a
+  nil result). The HTTP layer unwraps it the same way in production."
+  [{:keys [::type] :as data}]
+  (let [[_ method-fn] (get-in *system* [:app.rpc/methods type])]
+    (when-not method-fn
+      (ex/raise :type :assertion
+                :code :rpc-method-not-found
+                :hint (str/ffmt "rpc method '%' not found" (name type))))
+
+    (let [params (prepare-rpc-params data)]
+      (method-fn params))))
+
 (defn management-command!
   [{:keys [::type] :as data}]
   (let [[_ method-fn] (get-in *system* [:app.rpc/management-methods type])]
@@ -477,29 +556,99 @@
     (let [params (prepare-rpc-params data)]
       (try-on! (method-fn params)))))
 
+(def multipart-headers
+  {"content-type" "multipart/form-data; boundary=test"})
+
+(defn with-multipart
+  "Attach a multipart content-type to RPC test params, declaring that the
+  upload maps they carry arrived over multipart (as the production
+  multipart parser would deliver them). Preserves any request metadata
+  already present on the data."
+  [data]
+  (let [request (-> data meta :app.http/request)]
+    (vary-meta data assoc :app.http/request
+               (assoc (if (map? request) request {})
+                      :headers (merge multipart-headers
+                                      (when (map? request)
+                                        (:headers request)))))))
+
+(defn multipart-command!
+  "Like `command!` but declares the request as multipart, for calls that
+  carry upload maps (`:file`, `:content`, `:media`)."
+  [data]
+  (command! (with-multipart data)))
+
+(defn multipart-management-command!
+  "Like `management-command!` but declares the request as multipart."
+  [data]
+  (management-command! (with-multipart data)))
+
 (defn run-task!
+  "Execute a job handler directly (in-process, no row): the handler gets a
+  nil context, because there is no job to describe."
   ([name]
    (run-task! name {}))
   ([name params]
-   (wrk/invoke! (-> *system*
-                    (assoc ::wrk/task name)
-                    (assoc ::wrk/params params)))))
+   (jobs/invoke (-> *system*
+                    (assoc ::jobs/name name)
+                    (assoc ::jobs/params params)))))
 
-(def sql:pending-tasks
-  "select t.* from task as t
-    where t.status = 'new'
-    order by t.priority desc, t.scheduled_at")
+(def sql:pending-jobs
+  "select * from job
+    where status = 'new'
+    order by priority desc, scheduled_at")
 
-(defn run-pending-tasks!
+(defn run-pending-jobs
+  "Execute the pending (status='new') `job` rows in-process (simulating
+  the dispatcher + runner for the tests). Each row gets its context and its
+  job-id, so heartbeats and progress reach it exactly like in the runner.
+  Does not touch the row status; only the handler side effects matter."
   []
-  (db/tx-run! *system* (fn [{:keys [::db/conn] :as cfg}]
-                         (let [tasks (->> (db/exec! conn [sql:pending-tasks])
-                                          (map #'app.worker.runner/decode-task-row))]
-                           (doseq [task tasks]
-                             (let [cfg (-> cfg
-                                           (assoc :app.worker.runner/queue (:queue task))
-                                           (assoc :app.worker.runner/id 0))]
-                               (#'app.worker.runner/run-task cfg task)))))))
+  (db/tx-run! *system*
+              (fn [{:keys [::db/conn]}]
+                (let [jobs-rows (db/exec! conn [sql:pending-jobs])]
+                  (doseq [row jobs-rows]
+                    (jobs/invoke (-> *system*
+                                     ;; the row stores a string; invoke
+                                     ;; takes the canonical keyword
+                                     (assoc ::jobs/name (keyword (:name row)))
+                                     (assoc ::jobs/params (:params row))
+                                     (assoc ::jobs/context (jobs/make-context row))
+                                     (assoc ::jobs/job-id (:id row)))))))))
+
+(defn metrics-stub
+  "A metrics instance with no collectors, where every `run!` is a no-op."
+  []
+  (reify metrics/IMetrics
+    (get-handler [_] nil)
+    (get-collector [_ _] nil)
+    (get-registry [_] nil)))
+
+(defn init-climit
+  "Build a concurrency limiter component from an inline config map. The
+  optional second argument is the metrics instance to publish to (a
+  `metrics-stub` by default, where every `run!` is a no-op)."
+  ([config]
+   (init-climit config (metrics-stub)))
+  ([config metrics]
+   (let [file (doto (java.io.File/createTempFile "climit" ".edn")
+                (.deleteOnExit))]
+     (spit file (pr-str config))
+     (ig/init-key ::rpc/climit
+                  {::climit/enabled true
+                   ::climit/config (.getAbsolutePath file)
+                   ::metrics/metrics metrics}))))
+
+(defmacro with-climit
+  "Build a concurrency limiter from an inline config map, run the body and
+  halt it, so the republisher thread it starts never outlives the test. An
+  optional third binding element is the metrics instance to publish to."
+  [[sym config & [metrics]] & body]
+  `(let [~sym (init-climit ~config ~@(when metrics [metrics]))]
+     (try
+       ~@body
+       (finally
+         (ig/halt-key! ::rpc/climit ~sym)))))
 
 ;; --- UTILS
 
@@ -610,6 +759,17 @@
 (defn db-delete!
   [& params]
   (apply db/delete! *pool* params))
+
+(defn db-force-delete
+  "Deletes rows whose table is guarded by `raise_deletion_protection`,
+  inside a transaction that disables the guard. Test-only escape hatch:
+  production delete paths disable protection in their own transaction
+  (see `app.jobs.gc`)."
+  [& params]
+  (db/tx-run! *pool*
+              (fn [{:keys [::db/conn]}]
+                (db/exec-one! conn ["SET LOCAL rules.deletion_protection TO off"])
+                (apply db/delete! conn params))))
 
 (defn db-query
   [& params]

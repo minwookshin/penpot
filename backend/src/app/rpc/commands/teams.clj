@@ -20,6 +20,7 @@
    [app.db.sql :as sql]
    [app.email :as eml]
    [app.features.logical-deletion :as ldel]
+   [app.jobs :as jobs]
    [app.loggers.audit :as audit]
    [app.main :as-alias main]
    [app.media.validation :as media.v]
@@ -28,12 +29,12 @@
    [app.rpc :as-alias rpc]
    [app.rpc.commands.profile :as profile]
    [app.rpc.doc :as-alias doc]
+   [app.rpc.helpers :as rph]
    [app.rpc.permissions :as perms]
    [app.rpc.quotes :as quotes]
    [app.setup :as-alias setup]
    [app.storage :as sto]
    [app.util.services :as sv]
-   [app.worker :as wrk]
    [clojure.set :as set]))
 
 ;; --- Helpers & Specs
@@ -563,7 +564,9 @@
         team     (db/tx-run! cfg create-team params)]
 
     (with-meta team
-      {::audit/props {:id (:id team)}})))
+      {::audit/props {:id (:id team)
+                      :created-at (:created-at team)
+                      :modified-at (:modified-at team)}})))
 
 
 (defn create-default-organization-team
@@ -618,10 +621,42 @@
                                     :default-team-id default-team-id}))
               default-team-id))))))))
 
+(defn- params->role
+  "Derive the team role from membership flags, inverse of
+  `types.team/permissions-for-role`. `team_profile_rel` carries no role
+  column, so no caller can pass it in `params`: derive it here so the event
+  always carries one."
+  [{:keys [is-owner is-admin can-edit]}]
+  (cond is-owner :owner is-admin :admin can-edit :editor :else :viewer))
+
+(defn- submit-membership-event
+  "Emits an audit event for a new team membership, so the event stream carries
+  every membership add, including the ones that only happen as a side effect of
+  another command (team creation, invitation accepted without email roundtrip,
+  duplicated team). `event-opts` carries what the row lacks: `:actor-id` (the
+  action owner, defaulting to the member) and `:rpc-params` (request context,
+  which sibling events get from `prepare-rpc-event`)."
+  [cfg {:keys [profile-id team-id] :as params} {:keys [actor-id rpc-params]}]
+  (when (contains? cf/flags :audit-log)
+    (audit/submit cfg
+                  (-> (audit/event-from-rpc-params (or rpc-params {}))
+                      (assoc :name "add-team-member"
+                             :type "action"
+                             :profile-id (or actor-id profile-id))
+                      (assoc :props (d/without-nils
+                                     {:team-id team-id
+                                      :member-id profile-id
+                                      :role (params->role params)
+                                      :is-owner (boolean (:is-owner params))
+                                      :is-admin (boolean (:is-admin params))
+                                      :can-edit (boolean (:can-edit params))}))))))
+
 (defn add-profile-to-team!
   ([cfg params]
-   (add-profile-to-team! cfg params nil))
-  ([{:keys [::db/conn] :as cfg} {:keys [:profile-id :team-id] :as params} options]
+   (add-profile-to-team! cfg params nil nil))
+  ([cfg params options]
+   (add-profile-to-team! cfg params options nil))
+  ([{:keys [::db/conn] :as cfg} {:keys [:profile-id :team-id] :as params} options event-opts]
    (assert (db/connection-map? cfg)
            "expected cfg with valid connection")
    (when (contains? cf/flags :admin-console)
@@ -631,7 +666,13 @@
               (some? (:organization-id membership)) ;; the team do belong to an organization
               (not (:is-member membership)))        ;; the user is not a member of the organization yet
          (initialize-user-in-organization cfg profile-id (:organization-id membership)))))
-   (db/insert! conn :team-profile-rel (assoc params :id (uuid/next)) options)))
+   (let [options (merge options {::db/return-keys [:id]})
+         result  (db/insert! conn :team-profile-rel (assoc params :id (uuid/next)) options)]
+     ;; Only emit when a row was actually inserted: with `on-conflict-do-nothing`
+     ;; an existing membership returns nil and must not be reported twice.
+     (when (some? result)
+       (submit-membership-event cfg params event-opts))
+     result)))
 
 (defn create-team
   "This is a complete team creation process, it creates the team
@@ -735,6 +776,37 @@
 
 ;; --- Mutation: Leave Team
 
+;; Remove every team-scoped relation of a profile that leaves (or is
+;; removed from) a team. File and project roles hang from the team
+;; membership: keeping them would let the former member keep reading
+;; and editing files through `sql:file-permissions`. Pins are personal
+;; state of the same team, so they go too. Other teams are untouched,
+;; and rejoining grants fresh roles. Runs inside the caller's
+;; transaction.
+(def ^:private sql:delete-team-file-rels
+  "DELETE FROM file_profile_rel AS fpr
+    USING file AS f
+    INNER JOIN project AS p ON (p.id = f.project_id)
+    WHERE fpr.file_id = f.id
+      AND p.team_id = ?
+      AND fpr.profile_id = ?")
+
+(def ^:private sql:delete-team-project-rels
+  "DELETE FROM project_profile_rel AS ppr
+    USING project AS p
+    WHERE ppr.project_id = p.id
+      AND p.team_id = ?
+      AND ppr.profile_id = ?")
+
+(defn- delete-team-rels
+  [conn profile-id team-id]
+  (db/exec! conn [sql:delete-team-file-rels team-id profile-id])
+  (db/exec! conn [sql:delete-team-project-rels team-id profile-id])
+  (db/delete! conn :team-project-profile-rel {:profile-id profile-id
+                                              :team-id team-id})
+  (db/delete! conn :team-profile-rel {:profile-id profile-id
+                                      :team-id team-id}))
+
 (defn leave-team
   [{:keys [::db/conn ::mbus/msgbus]} {:keys [profile-id id reassign-to]}]
   (let [perms   (get-permissions conn profile-id id)
@@ -785,9 +857,7 @@
                 :code :owner-cant-leave-team
                 :hint "releasing owner before leave"))
 
-    (db/delete! conn :team-profile-rel
-                {:profile-id profile-id
-                 :team-id id})
+    (delete-team-rels conn profile-id id)
 
     nil))
 
@@ -838,22 +908,27 @@
                 :code :non-deletable-team
                 :hint "impossible to delete default team"))
 
-    (let [delay (ldel/get-deletion-delay team)
-          team  (db/update! conn :team
-                            {:deleted-at (ct/in-future delay)}
-                            {:id team-id}
-                            {::db/return-keys true})]
+    (let [delay           (ldel/get-deletion-delay team)
+          organization-id (dm/get-in team [:organization :id])
+          team-name       (:name team)
+          team            (db/update! conn :team
+                                      {:deleted-at (ct/in-future delay)}
+                                      {:id team-id}
+                                      {::db/return-keys true})]
 
       ;; Api call to nitrate
       (when (contains? cf/flags :admin-console)
         (nitrate/call cfg :delete-team {:profile-id profile-id :team-id team-id}))
 
-      (wrk/submit! {::db/conn conn
-                    ::wrk/task :delete-object
-                    ::wrk/params {:object :team
-                                  :deleted-at (:deleted-at team)
-                                  :id team-id}})
-      team)))
+      (jobs/submit cfg
+                   {::jobs/name :delete-object
+                    ::jobs/params {:object :team
+                                   :deleted-at (:deleted-at team)
+                                   :id team-id}})
+      (rph/with-meta (rph/wrap team)
+        {::audit/props {:organization-id organization-id
+                        :team-id team-id
+                        :team-name team-name}}))))
 
 (def ^:private schema:delete-team
   [:map {:title "delete-team"}
@@ -865,8 +940,19 @@
    ::sm/params schema:delete-team
    ::db/transaction true}
   [cfg {:keys [::rpc/profile-id id] :as params}]
-  (delete-team cfg {:team-id id :profile-id profile-id})
-  nil)
+  (let [result (delete-team cfg {:team-id id :profile-id profile-id})
+        team   (rph/unwrap result)]
+    ;; The client keeps receiving nil; the audit event carries the deleted row.
+    ;; Both prop sets are kept: the organization ones (develop) and the entity
+    ;; identity and timestamps (staging); `with-meta` merges shallowly, so the
+    ;; maps are merged explicitly.
+    (rph/with-meta (rph/wrap)
+      {::audit/props (merge (::audit/props (meta result))
+                            {:id (:id team)
+                             :name (:name team)
+                             :created-at (:created-at team)
+                             :modified-at (:modified-at team)
+                             :deleted-at (:deleted-at team)})})))
 
 ;; --- Mutation: Team Update Role
 
@@ -933,7 +1019,13 @@
   {::doc/added "1.17"
    ::sm/params schema:update-team-member-role}
   [cfg {:keys [::rpc/profile-id] :as params}]
-  (db/tx-run! cfg update-team-member-role (assoc params :profile-id profile-id)))
+  (db/tx-run! cfg update-team-member-role (assoc params :profile-id profile-id))
+  ;; The client keeps receiving nil; when ownership moves, the audit event
+  ;; names the demoted member so a projection can keep a single owner.
+  (rph/with-meta (rph/wrap)
+    (if (= :owner (:role params))
+      {::audit/props {:prev-owner-id profile-id}}
+      {})))
 
 ;; --- Mutation: Delete Team Member
 
@@ -969,8 +1061,7 @@
       (ex/raise :type :validation
                 :code :cant-remove-owner))
 
-    (db/delete! conn :team-profile-rel {:profile-id member-id
-                                        :team-id team-id})
+    (delete-team-rels conn member-id team-id)
 
     ;; A removed member that owns the organization of this team keeps
     ;; read-only access to it, so instead of kicking them out we degrade
@@ -1003,7 +1094,8 @@
 
 (sv/defmethod ::update-team-photo
   {::doc/added "1.17"
-   ::sm/params schema:update-team-photo}
+   ::sm/params schema:update-team-photo
+   ::rpc/multipart-only-params [:file]}
   [cfg {:keys [::rpc/profile-id file] :as params}]
   ;; Validate incoming mime type
 
@@ -1012,7 +1104,7 @@
   (update-team-photo cfg (assoc params :profile-id profile-id)))
 
 (defn update-team-photo
-  [{:keys [::db/pool ::sto/storage] :as cfg} {:keys [profile-id team-id] :as params}]
+  [{:keys [::db/pool ::sto/storage] :as cfg} {:keys [profile-id team-id file] :as params}]
   (let [team  (get-team pool :profile-id profile-id :team-id team-id)
         photo (profile/upload-photo cfg params)]
 
@@ -1028,4 +1120,10 @@
                 {:photo-id (:id photo)}
                 {:id team-id})
 
-    (assoc team :photo-id (:id photo))))
+    (rph/with-meta (assoc team :photo-id (:id photo))
+      {::audit/replace-props
+       {:team-id team-id
+        :file-name (:filename file)
+        :file-size (:size file)
+        :file-path (str (:path file))
+        :file-mtype (:mtype file)}})))

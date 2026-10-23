@@ -13,7 +13,6 @@
    [app.common.schema :as sm]
    [app.common.spec :as us]
    [app.common.time :as ct]
-   [app.common.uri :as u]
    [app.common.uuid :as uuid]
    [app.config :as cf]
    [app.db :as db]
@@ -127,7 +126,15 @@
                                (-> (assoc ::auth-type :token)
                                    (assoc ::token-perms (set (::actoken/perms request #{})))))
                              (cond-> key-id
-                               (assoc ::auth-key-id key-id)))
+                               (assoc ::auth-key-id key-id))
+                             ;; Server-side only: request bodies cannot forge
+                             ;; it (qualified keys are stripped before the
+                             ;; merge). Upload maps are only trusted when they
+                             ;; arrive over multipart.
+                             (assoc ::is-multipart
+                                    (str/starts-with?
+                                     (str (yreq/get-header request "content-type"))
+                                     "multipart/")))
 
             data         (with-meta data
                            {::http/request request})
@@ -228,10 +235,23 @@
       (fn [cfg params]
         (let [request-params (-> params meta ::http/request :params decode)]
           (if (validate request-params)
-            (let [result (f cfg (merge params (d/without-qualified request-params)))]
-              (if (instance? clojure.lang.IObj result)
-                (vary-meta result assoc :encode/json encode)
-                result))
+            (let [merged (merge params (d/without-qualified request-params))]
+              ;; Upload temp files are created server-side by the multipart
+              ;; parser, so an upload map smuggled in a transit/JSON body can
+              ;; point :path at any internal server file. Methods declare
+              ;; their upload keys with ::multipart-only-params and they are
+              ;; only accepted when ::is-multipart arrived server-side with
+              ;; the request (request bodies cannot forge qualified keys).
+              (when (some #(and (contains? merged %)
+                                (not (::is-multipart merged)))
+                          (::multipart-only-params mdata))
+                (ex/raise :type :validation
+                          :code :params-validation
+                          :hint "upload requires multipart"))
+              (let [result (f cfg merged)]
+                (if (instance? clojure.lang.IObj result)
+                  (vary-meta result assoc :encode/json encode)
+                  result)))
             (ex/raise :type :validation
                       :code :params-validation
                       ::sm/explain (explain request-params))))))
@@ -380,6 +400,7 @@
           'app.rpc.commands.files-update
           'app.rpc.commands.files-snapshot
           'app.rpc.commands.files-thumbnails
+          'app.rpc.commands.jobs
           'app.rpc.commands.ldap
           'app.rpc.commands.management
           'app.rpc.commands.media
@@ -426,7 +447,9 @@
 (defn- resolve-management-methods
   [cfg]
   (let [cfg  (assoc cfg ::module "management" ::type "command" ::metrics-id :rpc-management-timing)
-        mods (cond->> (list 'app.rpc.management.exporter)
+        mods (cond->> (list 'app.rpc.management.exporter
+                            'app.rpc.management.jobs
+                            'app.rpc.management.files)
                (contains? cf/flags :admin-console)
                (cons 'app.rpc.management.nitrate))]
 
@@ -482,42 +505,40 @@
 
 (defmethod ig/init-key ::routes
   [_ {:keys [::methods ::management-methods ::setup/shared-keys] :as cfg}]
+  ["/api"
+   ["/management"
+    ["/methods/:method-name"
+     {:middleware [[mw/shared-key-auth shared-keys]
+                   [session/authz cfg]]
+      :handler (make-rpc-handler management-methods)}]
 
-  (let [public-uri (cf/get :public-uri)]
-    ["/api"
-     ["/management"
-      ["/methods/:method-name"
-       {:middleware [[mw/shared-key-auth shared-keys]
-                     [session/authz cfg]]
-        :handler (make-rpc-handler management-methods)}]
+    (doc/routes :methods management-methods
+                :label "management"
+                :base-uri (cf/get-public-uri "api/management")
+                :description "MANAGEMENT API")]
 
-      (doc/routes :methods management-methods
-                  :label "management"
-                  :base-uri (u/join public-uri "/api/management")
-                  :description "MANAGEMENT API")]
+   ["/main"
+    ["/methods/:method-name"
+     {:middleware [[mw/cors]
+                   [sec/client-header-check]
+                   [session/authz cfg]
+                   [actoken/authz cfg]]
+      :handler (make-rpc-handler methods)}]
 
-     ["/main"
-      ["/methods/:method-name"
-       {:middleware [[mw/cors]
-                     [sec/client-header-check]
-                     [session/authz cfg]
-                     [actoken/authz cfg]]
-        :handler (make-rpc-handler methods)}]
+    (doc/routes :methods methods
+                :label "main"
+                :base-uri (cf/get-public-uri "api/main")
+                :description "MAIN API")]
 
-      (doc/routes :methods methods
-                  :label "main"
-                  :base-uri (u/join public-uri "/api/main")
-                  :description "MAIN API")]
+   ;; BACKWARD COMPATIBILITY
+   ["/_doc" {:handler (redirect (cf/get-public-uri "api/main/doc"))}]
+   ["/doc" {:handler (redirect (cf/get-public-uri "api/main/doc"))}]
+   ["/openapi" {:handler (redirect (cf/get-public-uri "api/main/doc/openapi"))}]
+   ["/openapi.join" {:handler (redirect (cf/get-public-uri "api/main/doc/openapi.json"))}]
 
-     ;; BACKWARD COMPATIBILITY
-     ["/_doc" {:handler (redirect (u/join public-uri "/api/main/doc"))}]
-     ["/doc" {:handler (redirect (u/join public-uri "/api/main/doc"))}]
-     ["/openapi" {:handler (redirect (u/join public-uri "/api/main/doc/openapi"))}]
-     ["/openapi.join" {:handler (redirect (u/join public-uri "/api/main/doc/openapi.json"))}]
-
-     ["/rpc/command/:method-name"
-      {:middleware [[mw/cors]
-                    [sec/client-header-check]
-                    [session/authz cfg]
-                    [actoken/authz cfg]]
-       :handler (make-rpc-handler methods)}]]))
+   ["/rpc/command/:method-name"
+    {:middleware [[mw/cors]
+                  [sec/client-header-check]
+                  [session/authz cfg]
+                  [actoken/authz cfg]]
+     :handler (make-rpc-handler methods)}]])

@@ -12,29 +12,31 @@
    [app.binfile.v3 :as v3]
    [app.common.data :as d]
    [app.common.features :as cfeat]
+   [app.common.files.changes-builder :as pcb]
+   [app.common.files.tokens :as cfo]
    [app.common.files.validate :as cfv]
-   [app.common.pprint :as pp]
    [app.common.thumbnails :as thc]
    [app.common.time :as ct]
    [app.common.types.shape :as cts]
+   [app.common.types.token :as cto]
+   [app.common.types.tokens-lib :as ctob]
+   [app.common.types.tokens-status :as ctos]
    [app.common.uuid :as uuid]
    [app.config :as cf]
    [app.db :as db]
-   [app.db.sql :as sql]
-   [app.http :as http]
    [app.rpc :as-alias rpc]
    [app.rpc.commands.binfile :as binfile]
    [app.storage :as sto]
    [app.storage.tmp :as tmp]
    [backend-tests.helpers :as th]
    [backend-tests.storage-test :as stt]
+   [clojure.java.io :as jio]
    [clojure.test :as t]
    [cuerdas.core :as str]
    [datoteka.fs :as fs]
    [datoteka.io :as io])
   (:import
    java.io.ByteArrayInputStream
-   java.io.DataInputStream
    java.io.OutputStreamWriter
    java.io.Writer
    java.util.zip.Deflater
@@ -61,46 +63,158 @@
     (:result out)))
 
 (defn- prepare-simple-file
+  ([profile] (prepare-simple-file profile 1))
+  ([profile idx]
+   (let [page-id-1 (uuid/custom 1 1)
+         page-id-2 (uuid/custom 1 2)
+         shape-id  (uuid/custom 2 1)
+         file      (th/create-file* idx {:profile-id (:id profile)
+                                         :project-id (:default-project-id profile)
+                                         :is-shared false})]
+     (update-file!
+      :file-id (:id file)
+      :profile-id (:id profile)
+      :revn 0
+      :vern 0
+      :changes
+      [{:type :add-page
+        :name "test 1"
+        :id page-id-1}
+       {:type :add-page
+        :name "test 2"
+        :id page-id-2}])
+
+     (update-file!
+      :file-id (:id file)
+      :profile-id (:id profile)
+      :revn 0
+      :vern 0
+      :changes
+      [{:type :add-obj
+        :page-id page-id-1
+        :id shape-id
+        :parent-id uuid/zero
+        :frame-id uuid/zero
+        :components-v2 true
+        :obj (cts/setup-shape
+              {:id shape-id
+               :name "image"
+               :frame-id uuid/zero
+               :parent-id uuid/zero
+               :type :rect})}])
+
+     (dissoc file :data))))
+
+(defn- prepare-file-with-tokens-lib
+  "A shared library and a linked file with different active token sets.
+  The file has a rect with two applied tokens. Returns the created files,
+  and the ids and tokens needed to check them."
   [profile]
-  (let [page-id-1 (uuid/custom 1 1)
-        page-id-2 (uuid/custom 1 2)
-        shape-id  (uuid/custom 2 1)
-        file      (th/create-file* 1 {:profile-id (:id profile)
-                                      :project-id (:default-project-id profile)
-                                      :is-shared false})]
+  (let [lib-page-id    (uuid/custom 5 1)
+        file-page-id   (uuid/custom 5 2)
+        shape-id       (uuid/custom 5 3)
+        set-id         (uuid/custom 5 4)
+        theme-id       (uuid/custom 5 5)
+        other-set-id   (uuid/custom 5 8)
+        other-theme-id (uuid/custom 5 9)
+
+        token-radius  (ctob/make-token :id (uuid/custom 5 6)
+                                       :name "token-radius"
+                                       :type :border-radius
+                                       :value 10)
+
+        token-opacity (ctob/make-token :id (uuid/custom 5 7)
+                                       :name "token-opacity"
+                                       :type :opacity
+                                       :value 0.7)
+
+        tokens-lib    (-> (ctob/make-tokens-lib)
+                          (ctob/add-set (ctob/make-token-set :id set-id
+                                                             :name "test-token-set"))
+                          (ctob/add-theme (ctob/make-token-theme :id theme-id
+                                                                 :name "test-theme"
+                                                                 :sets #{"test-token-set"}))
+                          (ctob/add-set (ctob/make-token-set :id other-set-id
+                                                             :name "other-token-set"))
+                          (ctob/add-theme (ctob/make-token-theme :id other-theme-id
+                                                                 :name "other-theme"
+                                                                 :sets #{"other-token-set"}))
+                          (ctob/add-token other-set-id (ctob/make-token :id (uuid/custom 5 10)
+                                                                        :name "other-token"
+                                                                        :type :opacity
+                                                                        :value 0.4))
+                          (ctob/add-token set-id token-radius)
+                          (ctob/add-token set-id token-opacity))
+
+        library       (th/create-file* 1 {:profile-id (:id profile)
+                                          :project-id (:default-project-id profile)
+                                          :is-shared true
+                                          :name "Tokens Library"})
+
+        file          (th/create-file* 2 {:profile-id (:id profile)
+                                          :project-id (:default-project-id profile)
+                                          :is-shared false})]
+
+    (th/link-file-to-library* {:file-id (:id file)
+                               :library-id (:id library)})
+
     (update-file!
-     :file-id (:id file)
+     :file-id (:id library)
      :profile-id (:id profile)
      :revn 0
-     :vern 0
      :changes
-     [{:type :add-page
-       :name "test 1"
-       :id page-id-1}
-      {:type :add-page
-       :name "test 2"
-       :id page-id-2}])
+     (-> (pcb/empty-changes nil)
+         (pcb/with-library-data (:data library))
+         (pcb/add-empty-page lib-page-id "library page")
+         (pcb/set-tokens-lib tokens-lib)
+         (pcb/set-tokens-status (ctos/make-tokens-status :active-theme-ids #{other-theme-id}
+                                                         :active-set-ids #{other-set-id}))
+         (:redo-changes)))
 
     (update-file!
      :file-id (:id file)
      :profile-id (:id profile)
      :revn 0
-     :vern 0
      :changes
-     [{:type :add-obj
-       :page-id page-id-1
-       :id shape-id
-       :parent-id uuid/zero
-       :frame-id uuid/zero
-       :components-v2 true
-       :obj (cts/setup-shape
-             {:id shape-id
-              :name "image"
-              :frame-id uuid/zero
-              :parent-id uuid/zero
-              :type :rect})}])
+     (-> (pcb/empty-changes nil)
+         (pcb/with-library-data (:data file))
+         (pcb/add-empty-page file-page-id "file page")
+         (pcb/set-tokens-source (:id library))
+         (pcb/set-tokens-status (ctos/make-tokens-status :active-theme-ids #{theme-id}
+                                                         :active-set-ids #{set-id}))
+         (:redo-changes)))
 
-    (dissoc file :data)))
+    (let [page  (-> (bfc/get-file th/*system* (:id file) {:realize? true})
+                    (get-in [:data :pages-index file-page-id]))
+          shape (as-> (cts/setup-shape
+                       {:id shape-id
+                        :name "rect"
+                        :frame-id uuid/zero
+                        :parent-id uuid/zero
+                        :type :rect}) $
+                  (cto/apply-token-to-shape {:shape $
+                                             :token token-radius
+                                             :attributes [:r1 :r2 :r3 :r4]})
+                  (cto/apply-token-to-shape {:shape $
+                                             :token token-opacity
+                                             :attributes [:opacity]}))]
+      (update-file!
+       :file-id (:id file)
+       :profile-id (:id profile)
+       :revn 0
+       :changes
+       (-> (pcb/empty-changes nil)
+           (pcb/with-page page)
+           (pcb/with-objects (:objects page))
+           (pcb/add-object shape)
+           (:redo-changes))))
+
+    {:library library
+     :file file
+     :page-id file-page-id
+     :shape-id shape-id
+     :token-radius token-radius
+     :token-opacity token-opacity}))
 
 (def ^:private svg-raw-page-id (uuid/custom 1 1))
 (def ^:private svg-raw-root-id (uuid/custom 3 1))
@@ -109,58 +223,59 @@
 (defn- prepare-svg-raw-file
   "A file containing an svg-raw subtree (an svg-raw parent with an
   svg-raw child), which is what importing an SVG produces."
-  [profile]
-  (let [page-id  svg-raw-page-id
-        root-id  svg-raw-root-id
-        child-id svg-raw-child-id
+  ([profile] (prepare-svg-raw-file profile 1))
+  ([profile idx]
+   (let [page-id  svg-raw-page-id
+         root-id  svg-raw-root-id
+         child-id svg-raw-child-id
 
-        file     (th/create-file* 1 {:profile-id (:id profile)
-                                     :project-id (:default-project-id profile)
-                                     :is-shared false})]
-    (update-file!
-     :file-id (:id file)
-     :profile-id (:id profile)
-     :revn 0
-     :vern 0
-     :changes
-     [{:type :add-page
-       :name "page 1"
-       :id page-id}])
+         file     (th/create-file* idx {:profile-id (:id profile)
+                                        :project-id (:default-project-id profile)
+                                        :is-shared false})]
+     (update-file!
+      :file-id (:id file)
+      :profile-id (:id profile)
+      :revn 0
+      :vern 0
+      :changes
+      [{:type :add-page
+        :name "page 1"
+        :id page-id}])
 
-    (update-file!
-     :file-id (:id file)
-     :profile-id (:id profile)
-     :revn 0
-     :vern 0
-     :changes
-     [{:type :add-obj
-       :page-id page-id
-       :id root-id
-       :parent-id uuid/zero
-       :frame-id uuid/zero
-       :components-v2 true
-       :obj (cts/setup-shape
-             {:id root-id
-              :name "svg-root"
-              :frame-id uuid/zero
-              :parent-id uuid/zero
-              :type :svg-raw
-              :content {:tag :svg :attrs {} :content []}})}
-      {:type :add-obj
-       :page-id page-id
-       :id child-id
-       :parent-id root-id
-       :frame-id uuid/zero
-       :components-v2 true
-       :obj (cts/setup-shape
-             {:id child-id
-              :name "svg-text"
-              :frame-id uuid/zero
-              :parent-id root-id
-              :type :svg-raw
-              :content {:tag :text :attrs {} :content []}})}])
+     (update-file!
+      :file-id (:id file)
+      :profile-id (:id profile)
+      :revn 0
+      :vern 0
+      :changes
+      [{:type :add-obj
+        :page-id page-id
+        :id root-id
+        :parent-id uuid/zero
+        :frame-id uuid/zero
+        :components-v2 true
+        :obj (cts/setup-shape
+              {:id root-id
+               :name "svg-root"
+               :frame-id uuid/zero
+               :parent-id uuid/zero
+               :type :svg-raw
+               :content {:tag :svg :attrs {} :content []}})}
+       {:type :add-obj
+        :page-id page-id
+        :id child-id
+        :parent-id root-id
+        :frame-id uuid/zero
+        :components-v2 true
+        :obj (cts/setup-shape
+              {:id child-id
+               :name "svg-text"
+               :frame-id uuid/zero
+               :parent-id root-id
+               :type :svg-raw
+               :content {:tag :text :attrs {} :content []}})}])
 
-    (dissoc file :data)))
+     (dissoc file :data))))
 
 (t/deftest import-binfile-v3-preserves-svg-raw-children
   (let [profile (th/create-profile* 1)
@@ -176,6 +291,7 @@
     (let [result (-> th/*system*
                      (assoc ::bfc/project-id (:default-project-id profile))
                      (assoc ::bfc/profile-id (:id profile))
+                     (assoc ::bfc/team-id (:default-team-id profile))
                      (assoc ::bfc/input output)
                      (v3/import-files!))
           file-id  (first (:file-ids result))
@@ -198,6 +314,58 @@
       ;; of failing with :child-not-found on the next update-file.
       (t/is (nil? (cfv/validate-file imported []))))))
 
+(defn- import-svg-attrs-asset
+  "Imports the `svg-attrs-camel-case.penpot` asset, a real penpot export
+  whose shapes carry `:svg-attrs` keys in camelCase (the format the
+  binary export writes), and returns the imported file."
+  [profile]
+  (let [input  (-> "backend_tests/test_files/svg-attrs-camel-case.penpot"
+                   io/resource
+                   jio/file)
+        result (-> th/*system*
+                   (assoc ::bfc/project-id (:default-project-id profile))
+                   (assoc ::bfc/profile-id (:id profile))
+                   (assoc ::bfc/team-id (:default-team-id profile))
+                   (assoc ::bfc/input input)
+                   (v3/import-files!))]
+    (bfc/get-file th/*system* (first (:file-ids result)))))
+
+(t/deftest import-binfile-v3-preserves-camel-case-svg-attrs
+  ;; The json reader used by the v3 import rewrites every key of every
+  ;; zip entry to kebab-case, and `:svg-attrs` is the one shape map
+  ;; whose keys are camelCase react prop names. A shape exported with
+  ;; `fillRule: "evenodd"` must not come back as `:fill-rule`, or the
+  ;; renderer falls back to the default fill rule and the shape is
+  ;; painted without its hole.
+  (let [profile (th/create-profile* 1)
+        file    (import-svg-attrs-asset profile)
+        shape   (get-in file [:data :pages-index
+                              (uuid/uuid "fc80ab5f-1bf2-817c-8008-b5408f039100")
+                              :objects
+                              (uuid/uuid "ce3641bd-48c8-804c-8008-b54d35cc6f80")])]
+
+    (t/is (= {:fillRule "evenodd"}
+             (:svg-attrs shape)))))
+
+(t/deftest import-binfile-v3-preserves-camel-case-svg-attrs-on-components
+  ;; Same guarantee for shapes stored inside a component: the v3 import
+  ;; cleans those in a different code path than page shapes.
+  (let [profile (th/create-profile* 1)
+        file    (import-svg-attrs-asset profile)
+        shape   (fn [component-id shape-id]
+                  (-> file
+                      (get-in [:data :components (uuid/uuid component-id) :objects])
+                      (get (uuid/uuid shape-id))
+                      :svg-attrs))]
+
+    (t/is (= {:fillRule "evenodd"}
+             (shape "fae4bc76-0cc2-8057-8008-b540912cdf78"
+                    "fae4bc76-0cc2-8057-8008-b540912774cb")))
+
+    (t/is (= {:fillRule "nonzero"}
+             (shape "fae4bc76-0cc2-8057-8008-b540912c917b"
+                    "fae4bc76-0cc2-8057-8008-b540912774c8")))))
+
 (t/deftest export-binfile-v3
   (let [profile (th/create-profile* 1)
         file    (prepare-simple-file profile)
@@ -212,6 +380,7 @@
     (let [result (-> th/*system*
                      (assoc ::bfc/project-id (:default-project-id profile))
                      (assoc ::bfc/profile-id (:id profile))
+                     (assoc ::bfc/team-id (:default-team-id profile))
                      (assoc ::bfc/input output)
                      (v3/import-files!))]
       (t/is (map? result))
@@ -245,6 +414,7 @@
     (let [result   (-> th/*system*
                        (assoc ::bfc/project-id (:default-project-id profile))
                        (assoc ::bfc/profile-id (:id profile))
+                       (assoc ::bfc/team-id (:default-team-id profile))
                        (assoc ::bfc/input output)
                        (v3/import-files!))
           imported (bfc/get-file th/*system* (first (:file-ids result)))]
@@ -316,6 +486,299 @@
           (t/is (= "Icons Library" (:name ext-lib)))
           (t/is (= "icons-library" (:slug ext-lib)))
           (t/is (= [(:id file)] (:used-by ext-lib))))))))
+
+(defn- zip-entry-names
+  [path]
+  (with-open [zin (ZipFile. (fs/file path))]
+    (into #{} (map #(.getName ^ZipEntry %)) (iterator-seq (.entries zin)))))
+
+(t/deftest export-detach-libraries-removes-tokens-library-although-keeps-applied-tokens
+  (let [profile (th/create-profile* 1)
+        {:keys [library file page-id shape-id token-radius token-opacity]}
+        (prepare-file-with-tokens-lib profile)]
+
+    ;; Precondition: before the export, the file really depends on the
+    ;; tokens of the library
+    (let [file-data (:data (bfc/get-file th/*system* (:id file)))]
+      (t/is (= (:id library) (cfo/get-tokens-source file-data)))
+      (t/is (some? (cfo/get-tokens-status file-data)))
+      (t/is (nil? (cfo/get-tokens-lib file-data))))
+
+    ;; Do the export, with type :detach-libraries
+    (let [output (tmp/tempfile :suffix ".zip")]
+      (v3/export-files!
+       (-> th/*system*
+           (assoc ::bfc/ids #{(:id file)})
+           (assoc ::bfc/export-type :detach-libraries))
+       (io/output-stream output))
+
+      ;; Only the file is exported, not the library
+      (let [manifest (v3/get-manifest th/*system* output)
+            names    (zip-entry-names output)]
+        (t/is (= [(:id file)] (mapv :id (:files manifest))))
+        (t/is (empty? (:relations manifest)))
+        (t/is (empty? (:external-libraries manifest)))
+        (t/is (contains? names (str "files/" (:id file) ".json")))
+        (t/is (not-any? #(str/includes? % (str (:id library))) names)))
+
+      ;; The exported file has neither tokens library nor tokens status
+      (let [names (zip-entry-names output)]
+        (t/is (not (contains? names (str "files/" (:id file) "/tokens.json"))))
+        (t/is (not (contains? names (str "files/" (:id file) "/tokens-status.json")))))
+
+      ;; Import the file again
+      (let [result    (-> th/*system*
+                          (assoc ::bfc/project-id (:default-project-id profile))
+                          (assoc ::bfc/team-id (:default-team-id profile))
+                          (assoc ::bfc/profile-id (:id profile))
+                          (assoc ::bfc/input output)
+                          (v3/import-files!))
+            imported  (bfc/get-file th/*system* (first (:file-ids result)))
+            file-data (:data imported)
+            shape     (get-in file-data [:pages-index page-id :objects shape-id])]
+
+        (t/is (= 1 (count (:file-ids result))))
+
+        ;; ...so the imported file has no tokens source, status or library
+        (t/is (nil? (cfo/get-tokens-source file-data)))
+        (t/is (nil? (cfo/get-tokens-status file-data)))
+        (t/is (nil? (cfo/get-tokens-lib file-data)))
+
+        ;; The shape keeps the applied tokens
+        (t/is (some? shape))
+        (t/is (cfo/token-applied? token-radius shape [:r1 :r2 :r3 :r4]))
+        (t/is (cfo/token-applied? token-opacity shape [:opacity]))))))
+
+(t/deftest export-merge-libraries-embeds-tokens-library-and-keeps-applied-tokens
+  (let [profile (th/create-profile* 1)
+        {:keys [library file page-id shape-id token-radius token-opacity]}
+        (prepare-file-with-tokens-lib profile)]
+
+    ;; Precondition: before the export, the file depends on the tokens
+    ;; of the library and has no tokens library of its own
+    (let [file-data (:data (bfc/get-file th/*system* (:id file)))]
+      (t/is (= (:id library) (cfo/get-tokens-source file-data)))
+      (t/is (nil? (cfo/get-tokens-lib file-data))))
+
+    (let [library-tokens-lib (-> (bfc/get-file th/*system* (:id library))
+                                 (:data)
+                                 (cfo/get-tokens-lib))
+          output             (tmp/tempfile :suffix ".zip")]
+
+      (t/is (some? library-tokens-lib))
+
+      (v3/export-files!
+       (-> th/*system*
+           (assoc ::bfc/ids #{(:id file)})
+           (assoc ::bfc/export-type :merge-libraries))
+       (io/output-stream output))
+
+      ;; Only the file is exported, not the library
+      (let [manifest (v3/get-manifest th/*system* output)
+            names    (zip-entry-names output)]
+        (t/is (= [(:id file)] (mapv :id (:files manifest))))
+        (t/is (empty? (:relations manifest)))
+        (t/is (empty? (:external-libraries manifest)))
+        (t/is (contains? names (str "files/" (:id file) ".json")))
+        (t/is (not-any? #(str/includes? % (str (:id library))) names)))
+
+      ;; The exported file carries its own tokens library
+      (t/is (contains? (zip-entry-names output)
+                       (str "files/" (:id file) "/tokens.json")))
+
+      (let [result    (-> th/*system*
+                          (assoc ::bfc/project-id (:default-project-id profile))
+                          (assoc ::bfc/team-id (:default-team-id profile))
+                          (assoc ::bfc/profile-id (:id profile))
+                          (assoc ::bfc/input output)
+                          (v3/import-files!))
+            imported  (bfc/get-file th/*system* (first (:file-ids result)))
+            file-data (:data imported)
+            shape     (get-in file-data [:pages-index page-id :objects shape-id])]
+
+        (t/is (= 1 (count (:file-ids result))))
+
+        ;; The tokens library of the library file is now in the file...
+        ;; (the import gives new ids to the sets and tokens, so compare
+        ;; their content)
+        (t/is (some? (cfo/get-tokens-lib file-data)))
+        (t/is (= (ctob/export-dtcg-json library-tokens-lib)
+                 (ctob/export-dtcg-json (cfo/get-tokens-lib file-data))))
+
+        ;; ...so the file is its own tokens source
+        (t/is (nil? (cfo/get-tokens-source file-data)))
+
+        ;; Activation follows the consuming file, using the imported ids.
+        (t/is (= {:active-themes #{"/test-theme"}
+                  :active-sets #{"test-token-set"}}
+                 (cfo/ids->names (cfo/get-tokens-status file-data)
+                                 (cfo/get-tokens-lib file-data))))
+        (t/is (= #{"token-radius" "token-opacity"}
+                 (set (keys (cfo/get-tokens-in-active-sets
+                             (cfo/get-tokens-status file-data)
+                             (cfo/get-tokens-lib file-data))))))
+
+        ;; The shape keeps the applied tokens
+        (t/is (some? shape))
+        (t/is (cfo/token-applied? token-radius shape [:r1 :r2 :r3 :r4]))
+        (t/is (cfo/token-applied? token-opacity shape [:opacity]))))))
+
+(t/deftest export-detach-libraries-preserves-own-tokens-and-status
+  (let [profile (th/create-profile* 1)
+        {:keys [library file page-id shape-id token-radius token-opacity]}
+        (prepare-file-with-tokens-lib profile)
+        file-data    (:data (bfc/get-file th/*system* (:id file)))
+        library-data (:data (bfc/get-file th/*system* (:id library)))
+        tokens-lib   (cfo/get-tokens-lib library-data)
+        output       (tmp/tempfile :suffix ".zip")]
+
+    ;; Keep the linked library, but use the file's own tokens.
+    (update-file!
+     :file-id (:id file)
+     :profile-id (:id profile)
+     :changes
+     (-> (pcb/empty-changes nil)
+         (pcb/with-library-data file-data)
+         (pcb/set-tokens-source nil)
+         (pcb/set-tokens-lib tokens-lib)
+         (:redo-changes)))
+
+    (v3/export-files!
+     (assoc th/*system*
+            ::bfc/ids #{(:id file)}
+            ::bfc/export-type :detach-libraries)
+     (io/output-stream output))
+
+    (let [names (zip-entry-names output)]
+      (t/is (contains? names (str "files/" (:id file) "/tokens.json")))
+      (t/is (contains? names (str "files/" (:id file) "/tokens-status.json"))))
+
+    (let [result    (v3/import-files!
+                     (assoc th/*system*
+                            ::bfc/project-id (:default-project-id profile)
+                            ::bfc/team-id (:default-team-id profile)
+                            ::bfc/profile-id (:id profile)
+                            ::bfc/input output))
+          imported  (bfc/get-file th/*system* (first (:file-ids result)))
+          file-data (:data imported)
+          shape     (get-in file-data [:pages-index page-id :objects shape-id])]
+      (t/is (nil? (cfo/get-tokens-source file-data)))
+      (t/is (= (ctob/export-dtcg-json tokens-lib)
+               (ctob/export-dtcg-json (cfo/get-tokens-lib file-data))))
+      (t/is (some? (cfo/get-tokens-status file-data)))
+      (when-let [status (cfo/get-tokens-status file-data)]
+        (t/is (= {:active-themes #{"/test-theme"}
+                  :active-sets #{"test-token-set"}}
+                 (cfo/ids->names status (cfo/get-tokens-lib file-data)))))
+      (t/is (cfo/token-applied? token-radius shape [:r1 :r2 :r3 :r4]))
+      (t/is (cfo/token-applied? token-opacity shape [:opacity])))))
+
+(defn- import-output
+  "Import the exported output in the default project of the profile and
+  return the imported files, indexed by name."
+  [profile output]
+  (let [result (v3/import-files!
+                (assoc th/*system*
+                       ::bfc/project-id (:default-project-id profile)
+                       ::bfc/team-id (:default-team-id profile)
+                       ::bfc/profile-id (:id profile)
+                       ::bfc/input output))]
+    (into {}
+          (map (fn [id]
+                 (let [file (bfc/get-file th/*system* id)]
+                   [(:name file) file])))
+          (:file-ids result))))
+
+(t/deftest export-include-libraries-keeps-tokens-status-of-the-file
+  (let [profile (th/create-profile* 1)
+        {:keys [library file]} (prepare-file-with-tokens-lib profile)
+        output (tmp/tempfile :suffix ".zip")]
+
+    (v3/export-files!
+     (assoc th/*system*
+            ::bfc/ids #{(:id file)}
+            ::bfc/export-type :include-libraries)
+     (io/output-stream output))
+
+    (let [files        (import-output profile output)
+          library'     (get files (:name library))
+          file'        (get files (:name file))
+          file-data    (:data file')
+          library-lib  (cfo/get-tokens-lib (:data library'))
+          file-status  (cfo/get-tokens-status file-data)]
+
+      (t/is (= 2 (count files)))
+      (t/is (= (:id library') (cfo/get-tokens-source file-data)))
+
+      ;; The active sets of the file are resolved against the sets of the
+      ;; imported library, so they are not lost.
+      (t/is (= {:active-themes #{"/test-theme"}
+                :active-sets #{"test-token-set"}}
+               (cfo/ids->names file-status library-lib)))
+      (t/is (= #{"token-radius" "token-opacity"}
+               (set (keys (cfo/get-tokens-in-active-sets file-status library-lib))))))))
+
+(t/deftest export-file-with-deleted-tokens-library-embeds-its-tokens
+  (let [profile    (th/create-profile* 1)
+        {:keys [library file]} (prepare-file-with-tokens-lib profile)
+        tokens-lib (-> (bfc/get-file th/*system* (:id library))
+                       (:data)
+                       (cfo/get-tokens-lib))
+        output     (tmp/tempfile :suffix ".zip")]
+
+    ;; The state left by deleting the library: in the trash and unlinked,
+    ;; but still the tokens source of the file.
+    (th/db-update! :file {:deleted-at (ct/in-future {:days 7})} {:id (:id library)})
+    (th/db-delete! :file-library-rel {:library-file-id (:id library)})
+
+    (v3/export-files!
+     (assoc th/*system*
+            ::bfc/ids #{(:id file)}
+            ::bfc/export-type :include-libraries)
+     (io/output-stream output))
+
+    (t/is (contains? (zip-entry-names output)
+                     (str "files/" (:id file) "/tokens.json")))
+
+    (let [files     (import-output profile output)
+          file-data (:data (get files (:name file)))]
+      (t/is (= 1 (count files)))
+      (t/is (nil? (cfo/get-tokens-source file-data)))
+      (t/is (= (ctob/export-dtcg-json tokens-lib)
+               (ctob/export-dtcg-json (cfo/get-tokens-lib file-data))))
+      (t/is (= {:active-themes #{"/test-theme"}
+                :active-sets #{"test-token-set"}}
+               (cfo/ids->names (cfo/get-tokens-status file-data)
+                               (cfo/get-tokens-lib file-data)))))))
+
+(t/deftest export-file-with-missing-tokens-library-removes-tokens-source
+  (let [profile (th/create-profile* 1)
+        {:keys [library file]} (prepare-file-with-tokens-lib profile)
+        output  (tmp/tempfile :suffix ".zip")]
+
+    ;; The tokens source points to a library that does not exist anymore
+    (th/db-delete! :file-library-rel {:library-file-id (:id library)})
+    (update-file!
+     :file-id (:id file)
+     :profile-id (:id profile)
+     :changes
+     (-> (pcb/empty-changes nil)
+         (pcb/with-library-data (:data (bfc/get-file th/*system* (:id file))))
+         (pcb/set-tokens-source (uuid/next))
+         (:redo-changes)))
+
+    (v3/export-files!
+     (assoc th/*system*
+            ::bfc/ids #{(:id file)}
+            ::bfc/export-type :include-libraries)
+     (io/output-stream output))
+
+    (let [files     (import-output profile output)
+          file-data (:data (get files (:name file)))]
+      (t/is (= 1 (count files)))
+      (t/is (nil? (cfo/get-tokens-source file-data)))
+      (t/is (nil? (cfo/get-tokens-status file-data)))
+      (t/is (nil? (cfo/get-tokens-lib file-data))))))
 
 (t/deftest import-auto-links-single-candidate
   (let [profile (th/create-profile* 1)
@@ -1907,6 +2370,7 @@
     (let [cfg (-> th/*system*
                   (assoc ::bfc/project-id (:default-project-id profile))
                   (assoc ::bfc/profile-id (:id profile))
+                  (assoc ::bfc/team-id (:default-team-id profile))
                   (assoc ::bfc/input output)
                   (assoc ::bfc/import-max-zip-entries 1))
           out (try
@@ -1925,7 +2389,7 @@
   (let [storage (-> (:app.storage/storage th/*system*)
                     (stt/configure-storage-backend))
 
-        sobject (sto/put-object! storage {::sto/content (sto/content "media-bytes")
+        sobject (sto/put-object! storage {::sto/content (sto/content "<svg xmlns=\"http://www.w3.org/2000/svg\"/>")
                                           :content-type "image/svg+xml"
                                           :bucket "file-media-object"})
 
@@ -1963,6 +2427,7 @@
     (let [cfg (-> th/*system*
                   (assoc ::bfc/project-id (:default-project-id profile))
                   (assoc ::bfc/profile-id (:id profile))
+                  (assoc ::bfc/team-id (:default-team-id profile))
                   (assoc ::bfc/input output)
                   (assoc ::bfc/import-max-binary-entry-size 1))
           out (try
@@ -2051,6 +2516,7 @@
       (let [cfg (-> th/*system*
                     (assoc ::bfc/project-id (:default-project-id profile))
                     (assoc ::bfc/profile-id (:id profile))
+                    (assoc ::bfc/team-id (:default-team-id profile))
                     (assoc ::bfc/input bombed))
             out (try-import-files! cfg)]
         (t/is (= :validation (:type out)))
@@ -2092,11 +2558,19 @@
     (let [cfg (-> th/*system*
                   (assoc ::bfc/project-id (:default-project-id profile))
                   (assoc ::bfc/profile-id (:id profile))
+                  (assoc ::bfc/team-id (:default-team-id profile))
                   (assoc ::bfc/input output)
                   (assoc ::bfc/import-max-text-total-size 100))
           out (try-import-files! cfg)]
       (t/is (= :validation (:type out)))
       (t/is (= :max-file-size-reached (:code out))))))
+
+(t/deftest default-text-total-budget-fits-giant-legit-files
+  ;; A real-world giant export held ~437 MiB of JSON across ~178k
+  ;; KB-sized entries without tripping any per-entry cap. The default
+  ;; cumulative budget must clear that scale, or such files cannot be
+  ;; imported out of the box.
+  (t/is (>= bfc/default-max-text-total-size (* 1024 1024 450))))
 
 (defn- text-entries-sizes
   "Returns the decompressed sizes of every `.json` entry in the zip at
@@ -2139,6 +2613,7 @@
       (let [cfg (-> th/*system*
                     (assoc ::bfc/project-id (:default-project-id profile))
                     (assoc ::bfc/profile-id (:id profile))
+                    (assoc ::bfc/team-id (:default-team-id profile))
                     (assoc ::bfc/input exported)
                     (assoc ::bfc/import-max-text-total-size budget))
             out (try-import-files! cfg)]
@@ -2174,3 +2649,257 @@
                   (ex-data e)))]
       (t/is (= :validation (:type out)))
       (t/is (= :max-file-size-reached (:code out))))))
+
+(def ^:private sql:current-idle-timeout
+  "SELECT current_setting('idle_in_transaction_session_timeout')::interval
+          = interval '30 minutes' AS ok")
+
+(t/deftest binfile-transactions-use-a-finite-idle-timeout
+  ;; The binfile import and export transactions must set a finite
+  ;; ceiling for idle_in_transaction_session_timeout (30 min) instead
+  ;; of disabling it entirely: a stalled transaction must not retain a
+  ;; pool connection without any upper bound. The ceiling is scoped
+  ;; with SET LOCAL: once the transaction ends, the pool session
+  ;; default is restored for subsequent transactions.
+  (db/tx-run! th/*system*
+              (fn [{::db/keys [conn] :as cfg}]
+                (t/testing "export transaction"
+                  (bfc/set-transaction-idle-timeout cfg)
+                  (t/is (true? (-> (db/exec-one! conn [sql:current-idle-timeout])
+                                   :ok))))
+
+                (t/testing "import transaction"
+                  (bfc/configure-import-transaction cfg)
+                  (t/is (true? (-> (db/exec-one! conn [sql:current-idle-timeout])
+                                   :ok)))))))
+
+(def ^:private index-test-file-id "22222222-2222-2222-2222-222222222222")
+(def ^:private index-test-page-id "44444444-4444-4444-4444-444444444444")
+
+(defn- index-entries-of
+  [names]
+  (@#'v3/index-entries (map #(java.util.zip.ZipEntry. %) names)))
+
+(t/deftest index-entries-classifies-entry-names
+  (let [f     index-test-file-id
+        page  index-test-page-id
+        index (index-entries-of
+               ["manifest.json"
+                (str "files/" f ".json")
+                (str "files/" f "/plugin-data.json")
+                (str "files/" f "/tokens.json")
+                "objects/11111111-1111-1111-1111-111111111111.json"
+                (str "files/" f "/media/33333333-3333-3333-3333-333333333333.json")
+                (str "files/" f "/colors/not-a-uuid.json")
+                (str "files/" f "/components/comp.json")
+                (str "files/" f "/typographies/t.json")
+                (str "files/" f "/pages/" page ".json")
+                (str "files/" f "/pages/" page "/shape.json")
+                (str "files/" f "/thumbnails/medium/" page "/frame.json")])]
+
+    (t/is (= [(parse-uuid "11111111-1111-1111-1111-111111111111")]
+             (mapv :id (:objects index))))
+
+    (t/is (= #{f} (set (keys (:media index)))))
+    (t/is (= [(parse-uuid "33333333-3333-3333-3333-333333333333")]
+             (mapv :id (get (:media index) f))))
+
+    (t/is (= #{f} (set (keys (:colors index)))))
+    ;; non-uuid ids are preserved as nil, same as the matchers do today
+    (t/is (= [nil] (mapv :id (get (:colors index) f))))
+
+    (t/is (= #{f} (set (keys (:components index)))))
+    (t/is (= #{f} (set (keys (:typographies index)))))
+
+    (t/is (= #{f} (set (keys (:pages index)))))
+    (t/is (= [(parse-uuid page)] (mapv :id (get (:pages index) f))))
+
+    (t/is (= #{f} (set (keys (:shapes index)))))
+    (t/is (= #{page} (set (keys (get (:shapes index) f)))))
+    (t/is (= [nil] (mapv :id (get (get (:shapes index) f) page))))
+
+    (t/is (= #{f} (set (keys (:thumbnails index)))))
+    (let [thumb (first (get (:thumbnails index) f))]
+      (t/is (= "medium" (:tag thumb)))
+      (t/is (= (parse-uuid page) (:page-id thumb)))
+      (t/is (= (parse-uuid "frame") (:frame-id thumb)))
+      (t/is (= f (:file-id thumb))))
+
+    (t/is (= #{f} (set (keys (:tokens index)))))))
+
+(t/deftest index-entries-ignores-unknown-entry-names
+  ;; unknown paths, wrong depth, wrong suffix or non-uuid file segments
+  ;; are all ignored, same as today's anchored regexes
+  (t/is (empty? (index-entries-of ["manifest.json"])))
+  (t/is (empty? (index-entries-of [(str "files/" index-test-file-id ".json")])))
+  (t/is (empty? (index-entries-of [(str "files/" index-test-file-id "/plugin-data.json")])))
+  (t/is (empty? (index-entries-of ["objects/a/b.json"])))
+  (t/is (empty? (index-entries-of [(str "files/" index-test-file-id "/media/a/b.json")])))
+  (t/is (empty? (index-entries-of [(str "files/" index-test-file-id "/media/a.txt")])))
+  (t/is (empty? (index-entries-of [(str "files/" index-test-file-id "/unknown/a.json")])))
+  (t/is (empty? (index-entries-of [(str "files//media/a.json")]))))
+
+(t/deftest index-entries-requires-literal-json-suffix
+  ;; deliberate tightening vs today's regexes: the dot is unescaped in
+  ;; `([^/]+).json$` / `tokens.json$`, so today `tokensXjson` and
+  ;; `objects/x-json` DO match; the classifier requires a literal
+  ;; `.json` suffix and ignores them
+  (t/is (empty? (index-entries-of [(str "files/" index-test-file-id "/tokensXjson")])))
+  (t/is (empty? (index-entries-of ["objects/x-json"]))))
+
+(t/deftest import-binfile-v3-multiple-files-preserves-per-file-content
+  ;; the entries index must attribute every zip entry to the file it
+  ;; belongs to: with several files in the same manifest, pages and
+  ;; shapes of one file must not leak into another. The file also
+  ;; carries library content (color, typography, component and tokens
+  ;; set) so every rewired consumer is exercised on its present path.
+  (let [profile (th/create-profile* 1)
+        simple  (prepare-simple-file profile)
+        color-id (uuid/custom 5 1)
+        typo-id  (uuid/custom 5 2)
+        comp-id  (uuid/custom 5 3)
+        svg     (prepare-svg-raw-file profile 2)
+        output  (tmp/tempfile :suffix ".zip")]
+
+    (update-file!
+     :file-id (:id simple)
+     :profile-id (:id profile)
+     :revn 0
+     :vern 0
+     :changes
+     [{:type :add-color
+       :color {:id color-id
+               :name "import-color"
+               :color "#FF0000"}}
+      {:type :add-typography
+       :typography {:id typo-id
+                    :name "import-typography"
+                    :font-id "source-sans-pro"
+                    :font-family "Source Sans Pro"
+                    :font-variant-id "regular"
+                    :font-size "16"
+                    :font-weight "400"
+                    :font-style "normal"
+                    :line-height "1.4"
+                    :letter-spacing "0"
+                    :text-transform "none"}}
+      {:type :add-component
+       :id comp-id
+       :name "import-component"
+       :path ""
+       :main-instance-id (uuid/custom 2 1)
+       :main-instance-page (uuid/custom 1 1)}
+      {:type :set-tokens-lib
+       :tokens-lib (-> (ctob/make-tokens-lib)
+                       (ctob/add-set (ctob/make-token-set :name "ImportSet")))}])
+
+    (v3/export-files!
+     (-> th/*system*
+         (assoc ::bfc/ids #{(:id simple) (:id svg)})
+         (assoc ::bfc/embed-assets false)
+         (assoc ::bfc/include-libraries false))
+     (io/output-stream output))
+
+    ;; import returns the imported file ids plus the library link
+    ;; resolution; the test only needs the ids
+    (let [result (:file-ids (-> th/*system*
+                                (assoc ::bfc/project-id (:default-project-id profile))
+                                (assoc ::bfc/profile-id (:id profile))
+                                (assoc ::bfc/team-id (:default-team-id profile))
+                                (assoc ::bfc/input output)
+                                (v3/import-files!)))
+          files  (map #(bfc/get-file th/*system* %) result)
+          svg-imported (some #(when (contains? (get-in % [:data :pages-index
+                                                          svg-raw-page-id
+                                                          :objects])
+                                               svg-raw-root-id)
+                                %)
+                             files)
+          simple-imported (some #(when (contains? (get-in % [:data :pages-index
+                                                             (uuid/custom 1 1)
+                                                             :objects])
+                                                  (uuid/custom 2 1))
+                                   %)
+                                files)]
+
+      (t/is (= 2 (count result)))
+      (t/is (= 2 (count (distinct result))))
+      (t/is (some? svg-imported))
+      (t/is (some? simple-imported))
+
+      ;; the svg-raw file keeps its subtree on its own page (plus the
+      ;; default page created by create-file)
+      (t/is (= [svg-raw-child-id]
+               (get-in svg-imported [:data :pages-index svg-raw-page-id
+                                     :objects svg-raw-root-id :shapes])))
+      (t/is (= 2 (count (get-in svg-imported [:data :pages-index]))))
+
+      ;; the simple file keeps its default page plus its two pages and
+      ;; its shape
+      (t/is (= 3 (count (get-in simple-imported [:data :pages-index]))))
+      (t/is (contains? (get-in simple-imported
+                               [:data :pages-index (uuid/custom 1 1) :objects])
+                       (uuid/custom 2 1)))
+
+      ;; library content is restored on its present path: the
+      ;; consumers' get-in keys must match the classifier buckets
+      (t/is (some? (get-in simple-imported [:data :colors color-id])))
+      (t/is (some? (get-in simple-imported [:data :typographies typo-id])))
+      (t/is (some? (get-in simple-imported [:data :components comp-id])))
+      (t/is (= ["ImportSet"]
+               (vec (ctob/get-set-names
+                     (get-in simple-imported [:data :tokens-lib]))))))))
+
+(t/deftest import-binfile-v3-restores-media-objects
+  ;; storage objects, per-file media entries and object thumbnails
+  ;; are classified through the entries index and restored end to end
+  (let [profile (th/create-profile* 1)
+        file    (prepare-file-with-media profile)
+        thumb-page-id  (uuid/custom 1 1)
+        thumb-frame-id (uuid/custom 6 1)
+        thumb-tag      "medium"
+        output  (tmp/tempfile :suffix ".zip")]
+
+    ;; a thumbnail row backed by the same storage object as the media
+    ;; object, so the export produces a thumbnails/ zip entry
+    (let [mobj (th/db-get :file-media-object {:file-id (:id file)})]
+      (db/insert! th/*system* :file-tagged-object-thumbnail
+                  {:file-id (:id file)
+                   :tag thumb-tag
+                   :object-id (thc/fmt-object-id {:file-id (:id file)
+                                                  :page-id thumb-page-id
+                                                  :frame-id thumb-frame-id
+                                                  :tag thumb-tag})
+                   :media-id (:media-id mobj)}))
+
+    (v3/export-files!
+     (-> th/*system*
+         (assoc ::bfc/ids #{(:id file)})
+         (assoc ::bfc/embed-assets false)
+         (assoc ::bfc/include-libraries false))
+     (io/output-stream output))
+
+    ;; import returns the imported file ids plus the library link
+    ;; resolution; the test only needs the ids
+    (let [result  (:file-ids (-> th/*system*
+                                 (assoc ::bfc/project-id (:default-project-id profile))
+                                 (assoc ::bfc/profile-id (:id profile))
+                                 (assoc ::bfc/team-id (:default-team-id profile))
+                                 (assoc ::bfc/input output)
+                                 (v3/import-files!)))
+          mobjs   (db/query th/*system* :file-media-object
+                            {:file-id (first result)})
+          thumbs  (db/query th/*system* :file-tagged-object-thumbnail
+                            {:file-id (first result)})]
+      (t/is (= 1 (count result)))
+      (t/is (pos? (count mobjs)))
+      (t/is (every? some? (map :media-id mobjs)))
+
+      ;; the thumbnail is restored with its object-id rebuilt around
+      ;; the new file id and a media-id that resolves to storage
+      (t/is (= 1 (count thumbs)))
+      (let [thumb (first thumbs)]
+        (t/is (= thumb-tag (:tag thumb)))
+        (t/is (= (str (first result) "/" thumb-page-id "/" thumb-frame-id "/" thumb-tag)
+                 (:object-id thumb)))
+        (t/is (some? (:media-id thumb)))))))

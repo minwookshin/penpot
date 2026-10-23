@@ -10,14 +10,13 @@
    [app.binfile.common :as bfc]
    [app.binfile.v1 :as bf.v1]
    [app.binfile.v3 :as bf.v3]
-   [app.common.features :as cfeat]
    [app.common.schema :as sm]
    [app.common.time :as ct]
    [app.common.uri :as u]
    [app.config :as cf]
    [app.db :as db]
    [app.http.sse :as sse]
-   [app.loggers.audit :as-alias audit]
+   [app.loggers.audit :as audit]
    [app.loggers.webhooks :as-alias webhooks]
    [app.media.validation :as media.v]
    [app.rpc :as-alias rpc]
@@ -47,19 +46,12 @@
    [:embed-assets {:optional true} ::sm/boolean]])
 
 (defn- export-binfile
-  [{:keys [::sto/storage] :as cfg} {:keys [type file-id include-libraries embed-assets]}]
-  (let [output (tmp/tempfile*)
-        ;; Convert legacy boolean flags to unified export-type
-        export-type (cond
-                      (some? type) type
-                      (true? include-libraries) :include-libraries
-                      (true? embed-assets) :merge-libraries
-                      :else :detach-libraries)]
+  [{:keys [::sto/storage] :as cfg} {:keys [file-id] :as params}]
+  (let [output (tmp/tempfile*)]
 
     (try
-      (-> cfg
-          (assoc ::bfc/ids #{file-id})
-          (assoc ::bfc/export-type export-type)
+      (-> (bfc/export-cfg cfg {:ids #{file-id}
+                               :export-type (bfc/resolve-export-type params)})
           (bf.v3/export-files! output))
 
       (let [data   (sto/content output)
@@ -91,29 +83,20 @@
 ;; --- Command: import-binfile
 
 (defn- import-binfile
-  [{:keys [::db/pool] :as cfg} {:keys [profile-id project-id version name file upload-id]}]
+  [{:keys [::db/pool] :as cfg} {:keys [profile-id project-id version name file upload-id] :as params}]
   (let [team
         (teams/get-team pool
                         :profile-id profile-id
                         :project-id project-id)
 
         cfg
-        (-> cfg
-            (assoc ::bfc/features (cfeat/get-team-enabled-features cf/flags team))
-            (assoc ::bfc/project-id project-id)
-            (assoc ::bfc/profile-id profile-id)
-            (assoc ::bfc/team-id (:id team))
-            (assoc ::bfc/name name)
-            (assoc ::bfc/import-max-binary-entry-size (cf/get :binfile-import-max-binary-entry-size))
-            (assoc ::bfc/import-max-text-entry-size (cf/get :binfile-import-max-text-entry-size))
-            (assoc ::bfc/import-max-text-total-size (cf/get :binfile-import-max-text-total-size))
-            (assoc ::bfc/import-max-zip-entries (cf/get :binfile-import-max-zip-entries)))
+        (bfc/import-cfg cfg {:profile-id profile-id
+                             :project-id project-id
+                             :team team
+                             :name name
+                             :input (:path file)})
 
-        input-path (:path file)
-        owned?     (some? upload-id)
-
-        cfg
-        (assoc cfg ::bfc/input input-path)
+        owned? (some? upload-id)
 
         result
         (try
@@ -126,12 +109,20 @@
                              :version version})))
           (finally
             (when owned?
-              (fs/delete input-path))))]
+              (fs/delete (:path file)))))]
 
     (db/update! pool :project
                 {:modified-at (ct/now)}
                 {:id project-id}
                 {::db/return-keys false})
+
+    ;; The imported files get no event from their own command, so emit one per
+    ;; file inside a single transaction.
+    (db/tx-run! cfg
+                (fn [cfg]
+                  (doseq [file-id (:file-ids result)]
+                    (audit/submit-file-created-event cfg params file-id
+                                                     {:team-id (:id team)}))))
 
     result))
 
@@ -162,6 +153,7 @@
    ::webhooks/event? true
    ::sse/stream? true
    ::sm/params schema:import-binfile
+   ::rpc/multipart-only-params [:file]
    ::climit/id [[:import-binfile/by-profile ::rpc/profile-id]
                 [:import-binfile/global]]}
   [{:keys [::db/pool] :as cfg} {:keys [::rpc/profile-id project-id version upload-id] :as params}]
