@@ -1,6 +1,6 @@
 # Devenv startup and configuration
 
-Compose-based dev environment under `docker/devenv/`, driven by `manage.sh`. Parallel instances share infra + Postgres + RustFS; each instance has its own `main` container, Valkey, source checkout, tmux session.
+Compose-based dev environment under `docker/devenv/`, driven by `manage.sh`. Parallel instances share infra + Postgres + RustFS; each instance has its own `main` container, Valkey, source checkout, tmux session. The main database (`penpot`) and the S3 bucket (`penpot`) are shared by all instances on purpose; backend-test databases are isolated per instance (`penpot_test` on ws0, `penpot_test_wsN` on wsN) with per-instance Valkey DB numbers (`6+N`, since runtime backends occupy `0..5`).
 
 ## Compose project layout
 
@@ -12,7 +12,8 @@ Compose-based dev environment under `docker/devenv/`, driven by `manage.sh`. Par
 ## Source-of-truth files
 
 - `docker/devenv/defaults.env`: ws0 baseline — container/volume names, runtime env, published host ports, tmux defaults. `manage.sh` aborts if unreadable.
-- For ws1+, `instance-env-overrides` computes the per-instance overrides (container/volume names, host ports offset `10000·N`, `PENPOT_PUBLIC_URI`, `PENPOT_REDIS_URI`, `PENPOT_BACKEND_WORKER=false`) and `instance-compose` injects them as env vars at compose time — never written to disk, recomputed each call so they can't drift. ws0 uses `defaults.env` as-is.
+- For ws1+, `instance-env-overrides` computes the per-instance overrides (container/volume names, host ports offset `10000·N`, `PENPOT_PUBLIC_URI`, `PENPOT_REDIS_URI`, `PENPOT_TEST_DATABASE_URI`, `PENPOT_TEST_REDIS_URI`) and `instance-compose` injects them as env vars at compose time — never written to disk, recomputed each call so they can't drift. ws0 uses `defaults.env` as-is.
+- Per-instance test databases are created by `ensure-instance-test-database` (called from `start-instance`): `CREATE DATABASE` guarded by a `pg_database` existence check, so it is idempotent. Needed because `postgresql_init.sql` only runs on first volume creation. The backend applies migrations itself on first use, so an empty database is enough.
 - `backend/scripts/_env`: backend-internal only — secret keys, `PENPOT_FLAGS` (with `enable-backend-worker` gated on `PENPOT_BACKEND_WORKER`), `JAVA_OPTS`, `setup_s3_bucket()`. Never duplicates `defaults.env`.
 - Compose files use pure `${VAR}` substitution; missing var = compose fails.
 
@@ -23,10 +24,12 @@ Compose-based dev environment under `docker/devenv/`, driven by `manage.sh`. Par
 - Network aliases (`- main`, `- redis`) are not declared in main.yml. Compose's auto-service-alias still registers `redis` on the shared network, so DNS for `redis` is non-deterministic with multiple instances. Backend uses `PENPOT_REDIS_URI=redis://penpot-devenv-wsN-valkey/0` (container_name) instead.
 - No cross-project `depends_on`. `manage.sh ensure-infra-up` uses Compose `--wait`; PostgreSQL, RustFS, and Mailpit expose healthchecks. PostgreSQL checks TCP so its temporary init server cannot report ready.
 - `JAVA_OPTS` in `manage.sh` is shadowed inside the container by `_env`. The `-e JAVA_OPTS=...` flag only matters for processes that don't source `_env`.
+- opencode is not part of the devenv image. `scripts/setup-opencode` installs the `@opencode/cli` global pnpm package into the penpot user's `$PNPM_HOME` (`/home/penpot/.local/share/pnpm`, inside the user-data volume, so it survives a container re-creation); nothing pins the version in the repo, it tracks the `latest` dist-tag at install time. pnpm 12 puts the global packages in `$PNPM_HOME/global` and the bin dir in `$PNPM_HOME/bin`, and aborts with `ERR_PNPM_GLOBAL_BIN_DIR_NOT_IN_PATH` unless that bin dir is on `PATH`; `files/bashrc` and the script both add it. The script exports `PNPM_HOME` itself because non-interactive shells never read `~/.bashrc`.
+- `files/entrypoint.sh` chowns penpot's whole `~/.local` and `~/.cache` on every start, because `EXTERNAL_UID` remaps penpot's UID to the host user and build-time ownership then stops matching. That covers pnpm's global dir, store, `package-manager-store` and metadata cache, plus opencode's own state; without it, global installs and pnpm's `packageManager` auto-download fail on permissions. The dotfiles copied from `/root` (`.bashrc`, `.vimrc`, `.tmux.conf`) are chowned in the same pass. `~/.config` stays out on purpose (the opencode overlay bind-mounts a host directory inside it) and so does `/home/penpot` itself, which holds the repo bind mount.
 
 ## Worker policy
 
-Backend workers run only on ws0. `_env` gates `enable-backend-worker` on `PENPOT_BACKEND_WORKER`; ws1+ inject it as false. Workers are pure fire-and-forget: `wrk/submit!` inserts a row into the shared Postgres `task` table and returns; RPC handlers never wait on completion and workers never publish to msgbus. The reason for "ws0 only" is avoiding multi-instance worker races (cron dedup is best-effort across instances, `wrk/submit!` `dedupe` is racy across submitters); details in `mem:prod-infra/core`.
+Backend workers run only on ws0. `_env` gates `enable-backend-worker` on `PENPOT_BACKEND_WORKER`; ws1+ inject it as false. Workers are pure fire-and-forget: `jobs/submit` inserts a row into the shared Postgres `job` table and returns (the legacy `task` table stays dormant); RPC handlers never wait on completion and workers never publish to msgbus. The reason for "ws0 only" is avoiding multi-instance worker races (cron dedup is best-effort across instances, `jobs/submit` `dedupe` is racy across submitters); details in `mem:prod-infra/core`.
 
 Each workspace is independent and can be started/stopped in any order. Shared infra (Postgres, RustFS, etc.) is shut down only when no instances remain running.
 
@@ -74,3 +77,42 @@ No `--delete` on the working-tree pass: gitignored caches in the workspace survi
 - `start-devenv` / `log-devenv` / `drop-devenv`: legacy paths around ws0 + shared infra. `drop-devenv` never removes volumes.
 
 `exporter/scripts/run` and `wait-and-start.sh` source `backend/scripts/_env` then `_env.local` if present.
+
+## Image and dependency pins
+
+Two Dockerfile trees, both multi-arch (`linux/amd64,linux/arm64`):
+`docker/devenv` (dev) and `docker/images` + `docker/imagemagick` (prod).
+
+- Hand-pinned versions, one source each:
+  - `docker/devenv/Dockerfile`: `NODE_VERSION` (+ per-arch `NODE_SHA256`),
+    `PNPM_VERSION` (+ `PNPM_SHA256`), `CADDY_VERSION`, `CLOJURE_VERSION`,
+    Zulu JDK URL + `ESUM`, `RUSTUP_VERSION`/`RUST_VERSION`/
+    `EMSCRIPTEN_VERSION`, `CLJKONDO_VERSION`, `BABASHKA_VERSION`,
+    `CLJFMT_VERSION`, `PIXI_VERSION`, `GITHUB_CLI_VERSION`,
+    `AWS_CLI_VERSION` (+ `BINARY_SHA256`), `UV_VERSION`, `SERENA_VERSION`,
+    `postgresql-client-18`, and the `penpotapp/imagemagick:<tag>`
+    `COPY --from`.
+  - `docker/images/Dockerfile.backend`: Zulu JDK URL + `ESUM`. The `jlink`
+    `--add-modules` list must keep `jdk.management`
+    (`mem:backend/subtleties`).
+  - `docker/images/Dockerfile.{exporter,mcp,media-processor}`: `ARG
+    PNPM_VERSION` (+ arch SHAs, same values as devenv).
+- Node and pnpm must agree in five places: `.nvmrc`, the devenv tarball pin,
+  the two `plugins-deploy-*` workflows that set `runtime: node@<version>`, and
+  the four Dockerfile pins. pnpm procedure: `mem:workflow/updating-pnpm`.
+- `dhi.io` base images are pinned `tag@sha256:<index digest>`; Renovate moves
+  them (`penpot-renovate[bot]`, commits titled `:arrow_up: Update DHI base
+  images`). Tag and digest move together: a new tag with the old digest still
+  pulls the old image, and the digest must be the multi-arch index, not a
+  per-platform one.
+- Every hand-pinned checksum is per architecture; one wrong value breaks half
+  of the multi-arch build.
+- `SERENA_UPDATE_VERSION` in `docker-compose.main.yml` must never be lower than the Dockerfile's `SERENA_VERSION`. Any value makes `start-tmux.sh` install that Serena release on start, overriding the version baked into the image; a stale value silently downgrades Serena (it once replaced 1.7.0 with 1.6.1). If the image already has that version the install is an offline no-op; otherwise it downloads on every start (`run-devenv` recreates the container) and, offline, fails after ~25s and keeps the image version. Bump both together; empty means use the image version.
+- Infra images live in `docker-compose.infra.yml`: `rustfs/rustfs` (owns the
+  S3 data volume), `axllent/mailpit` (SQLite in a volume), `valkey/valkey`,
+  `postgres:18.6`, `rroemhild/test-openldap`. Keep the volume names stable
+  when bumping them; replacement services get new volumes and leave the old
+  data untouched.
+- Build locally: `docker build -f docker/devenv/Dockerfile docker/devenv/`
+  and `cd docker/images && ./build.sh <image> --local`. CI:
+  `build-docker-devenv.yml`, `build-docker.yml`.

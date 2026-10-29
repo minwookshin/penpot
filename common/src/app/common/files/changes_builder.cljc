@@ -187,7 +187,8 @@
   (assert (check-changes changes)
           "expected valid changes")
 
-  (if-let [file-data (::file-data (meta changes))]
+  (if-let [file-data (and (not (::skip-local? (meta changes)))
+                          (::file-data (meta changes)))]
     (let [library-data  (::library-data (meta changes))
           index         (::applied-changes-count (meta changes))
           redo-changes  (:redo-changes changes)
@@ -205,6 +206,11 @@
                  ::library-data new-library-data
                  ::applied-changes-count (count redo-changes)))
     changes))
+
+(defn skip-local
+  "Stop applying changes to the builder objects."
+  [changes skip?]
+  (vary-meta changes assoc ::skip-local? skip?))
 
 (defn- without-changes-local
   "Append changes through `f` without applying them to the mounted page's
@@ -242,7 +248,7 @@
    (let [page (::page (meta changes))]
      (mod-page changes page options)))
 
-  ([changes page {:keys [name background pixel-grid-color pixel-grid-opacity]}]
+  ([changes page {:keys [name background pixel-grid-color pixel-grid-opacity] :as options}]
    (let [change {:type :mod-page :id (:id page)}
          redo   (cond-> change
                   (some? name)
@@ -250,6 +256,9 @@
 
                   (some? background)
                   (assoc :background background)
+
+                  (contains? options :background-token)
+                  (assoc :background-token (:background-token options))
 
                   (some? pixel-grid-color)
                   (assoc :pixel-grid-color pixel-grid-color)
@@ -263,6 +272,9 @@
 
                   (some? background)
                   (assoc :background (:background page))
+
+                  (contains? options :background-token)
+                  (assoc :background-token (:background-token page))
 
                   (some? pixel-grid-color)
                   (assoc :pixel-grid-color (:pixel-grid-color page))
@@ -1070,6 +1082,24 @@
          (update :redo-changes conj {:type :set-tokens-status :theme-ids theme-ids :set-ids set-ids})
          (update :undo-changes conj {:type :set-tokens-status :theme-ids prev-theme-ids :set-ids prev-set-ids})
          (apply-changes-local)))))
+
+(defn set-own-tokens-status
+  "Keep aside the tokens status of the file's own tokens-lib, or remove it
+   when `tokens-status` is nil."
+  [changes tokens-status]
+  (assert-library! changes)
+  (assert (or (ctos/tokens-status? tokens-status)
+              (nil? tokens-status)))
+  (let [library-data       (::library-data (meta changes))
+        prev-tokens-status (cfo/get-own-tokens-status library-data)
+        ->change           (fn [tokens-status]
+                             {:type :set-own-tokens-status
+                              :theme-ids (some-> tokens-status ctos/get-active-theme-ids)
+                              :set-ids (some-> tokens-status ctos/get-active-set-ids)})]
+    (-> changes
+        (update :redo-changes conj (->change tokens-status))
+        (update :undo-changes conj (->change prev-tokens-status))
+        (apply-changes-local))))
 
 (defn rename-token-set-group
   [changes set-group-path set-group-fname]

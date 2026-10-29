@@ -264,6 +264,7 @@
      ;; All props are optional, background can be nil because is the
      ;; way to remove already set background
      [:background {:optional true} [:maybe ctc/schema:hex-color]]
+     [:background-token {:optional true} [:maybe cto/schema:token-name]]
      [:name {:optional true} :string]
      ;; Pixel grid display controls — nil removes the per-page override
      ;; and falls back to the default hardcoded grid color/opacity.
@@ -405,6 +406,12 @@
      [:type [:= :set-tokens-status]]
      [:theme-ids [:set ::sm/uuid]]
      [:set-ids [:set ::sm/uuid]]]]
+
+   [:set-own-tokens-status
+    [:map {:title "SetOwnTokensStatus"}
+     [:type [:= :set-own-tokens-status]]
+     [:theme-ids [:maybe [:set ::sm/uuid]]]
+     [:set-ids [:maybe [:set ::sm/uuid]]]]]
 
    [:rename-token-set-group
     [:map {:title "RenameTokenSetGroup"}
@@ -699,9 +706,14 @@
                   xform     (comp
                              (mapcat #(cons % (cfh/get-parent-ids objects %)))
                              (filter #(contains? #{:group :bool} (-> % lookup :type)))
-                             (distinct))]
+                             (distinct)
+                             (map (fn [id] [id (count (cfh/get-parent-ids objects id))])))]
 
               (->> (sequence xform shapes)
+                   ;; Recalculate every affected child before its parents,
+                   ;; including parents shared by multiple changed branches.
+                   (sort-by second >)
+                   (map first)
                    (reduce update-fn objects))))
 
           (set-mask-selrect [group children]
@@ -873,6 +885,7 @@
                     (fn [page]
                       (let [name       (get params :name)
                             bg         (get params :background :not-found)
+                            bg-token   (get params :background-token :not-found)
                             grid-color (get params :pixel-grid-color :not-found)
                             grid-op    (get params :pixel-grid-opacity :not-found)]
                         (cond-> page
@@ -884,6 +897,12 @@
 
                           (nil? bg)
                           (dissoc :background)
+
+                          (string? bg-token)
+                          (assoc :background-token bg-token)
+
+                          (and (not= bg-token :not-found) (nil? bg-token))
+                          (dissoc :background-token)
 
                           (string? grid-color)
                           (assoc :pixel-grid-color grid-color)
@@ -1053,6 +1072,13 @@
   [data {:keys [theme-ids set-ids]}]
   (-> (cfo/ensure-tokens-lib data)
       (cfo/update-tokens-status ctos/set-tokens-status theme-ids set-ids)))
+
+(defmethod process-change :set-own-tokens-status
+  [data {:keys [theme-ids set-ids]}]
+  (cfo/set-own-tokens-status data
+                             (when (or (some? theme-ids) (some? set-ids))
+                               (ctos/make-tokens-status :active-theme-ids theme-ids
+                                                        :active-set-ids set-ids))))
 
 (defmethod process-change :rename-token-set-group
   [data {:keys [set-group-path set-group-fname]}]

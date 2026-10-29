@@ -103,7 +103,7 @@
   [:> icon-button* {:variant "ghost"
                     :icon i/add
                     :on-click on-start-creation
-                    :aria-label (tr "workspace.tokens.add set")}])
+                    :aria-label (tr "workspace.tokens.add-set")}])
 
 (mf/defc sets-tree-set-group*
   {::mf/private true}
@@ -260,10 +260,10 @@
 
         on-drag
         (mf/use-fn
-         (mf/deps path)
+         (mf/deps id is-selected on-select)
          (fn [_]
            (when-not is-selected
-             (on-select path))))
+             (on-select id))))
 
         on-drop
         (mf/use-fn

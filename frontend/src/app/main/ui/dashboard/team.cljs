@@ -52,33 +52,6 @@
    [cuerdas.core :as str]
    [rumext.v2 :as mf]))
 
-(def ^:private arrow-icon
-  (deprecated-icon/icon-xref :arrow (stl/css :arrow-icon)))
-
-(def ^:private menu-icon
-  (deprecated-icon/icon-xref :menu (stl/css :menu-icon)))
-
-(def ^:private organization-menu-icon
-  (deprecated-icon/icon-xref :menu (stl/css :organization-menu-icon)))
-
-(def ^:private warning-icon
-  (deprecated-icon/icon-xref :msg-warning (stl/css :warning-icon)))
-
-(def ^:private success-icon
-  (deprecated-icon/icon-xref :msg-success (stl/css :success-icon)))
-
-(def ^:private image-icon
-  (deprecated-icon/icon-xref :img (stl/css :image-icon)))
-
-(def ^:private user-icon
-  (deprecated-icon/icon-xref :user (stl/css :user-icon)))
-
-(def ^:private document-icon
-  (deprecated-icon/icon-xref :document (stl/css :document-icon)))
-
-(def ^:private group-icon
-  (deprecated-icon/icon-xref :group (stl/css :group-icon)))
-
 (mf/defc header*
   {::mf/wrap [mf/memo]}
   [{:keys [section team profile]}]
@@ -323,8 +296,11 @@
       [:div {:class (stl/css :modal-restricted-header)}
        [:h2 {:class (stl/css :modal-restricted-title)}
         (tr "modals.invite-restricted-members.title")]
-       [:button {:class (stl/css :modal-close-btn)
-                 :on-click modal/hide!} deprecated-icon/close]]
+       [:> icon-button* {:variant "ghost"
+                         :tooltip-class (stl/css :modal-close-btn)
+                         :aria-label (tr "labels.close")
+                         :icon i/close
+                         :on-click modal/hide!}]]
 
       [:div {:class (stl/css :modal-restricted-content)}
        [:p (tr "modals.invite-restricted-members.description")]
@@ -400,24 +376,25 @@
                              (and can-change-rol (or member-is-admin member-is-editor member-is-viewer)))
 
         role             (cond
-                           member-is-owner  "labels.owner"
-                           member-is-admin  "labels.admin"
-                           member-is-editor "labels.editor"
-                           :else            "labels.viewer")
+                           member-is-owner  (tr "labels.owner")
+                           member-is-admin  (tr "labels.admin")
+                           member-is-editor (tr "labels.editor")
+                           :else            (tr "labels.viewer"))
 
         on-show          (mf/use-fn #(reset! show? true))
         on-hide          (mf/use-fn #(reset! show? false))]
     [:*
      (if (and can-change-rol not-superior (not (and is-you is-owner)))
-       [:div {:class (stl/css :rol-selector :has-priv)
-              :role "combobox"
-              :aria-labelledby "role-label-id"
-              :on-click on-show}
-        [:span {:class (stl/css :rol-label)
-                :id "role-label-id"} (tr role)]
-        arrow-icon]
+       [:button {:class (stl/css :rol-selector :has-priv)
+                 :type "button"
+                 :aria-haspopup "listbox"
+                 :aria-expanded @show?
+                 :on-click on-show}
+        [:span {:class (stl/css :rol-label)} role]
+        [:> icon* {:icon-id i/arrow-down
+                   :class (stl/css :arrow-icon)}]]
        [:div {:class (stl/css :rol-selector)}
-        [:span {:class (stl/css :rol-label)} (tr role)]])
+        [:span {:class (stl/css :rol-label)} role]])
 
      [:& dropdown {:show @show? :on-close on-hide :dropdown-id (str "member-role-" (:id member))}
       [:ul {:class (stl/css :roles-dropdown)
@@ -451,9 +428,12 @@
 
     (when (or is-you? (and can-delete? (not (and is-owner? (not owner?)))))
       [:*
-       [:button {:class (stl/css :menu-btn)
-                 :on-click on-show}
-        menu-icon]
+       [:> icon-button* {:variant "ghost"
+                         :aria-label (tr "labels.options")
+                         :aria-haspopup "menu"
+                         :aria-expanded @show?
+                         :icon i/menu
+                         :on-click on-show}]
 
        [:& dropdown {:show @show? :on-close on-hide :dropdown-id (str "member-actions-" (:id member))}
         [:ul {:class (stl/css :actions-dropdown)}
@@ -691,10 +671,14 @@
 
     [:*
      (if (and can-invite (= status :pending))
-       [:div {:class (stl/css :rol-selector :has-priv)
-              :on-click on-show}
+       [:button {:class (stl/css :rol-selector :has-priv)
+                 :type "button"
+                 :aria-haspopup "listbox"
+                 :aria-expanded @show?
+                 :on-click on-show}
         [:span {:class (stl/css :rol-label)} label]
-        arrow-icon]
+        [:> icon* {:icon-id i/arrow-down
+                   :class (stl/css :arrow-icon)}]]
        [:div {:class (stl/css :rol-selector)}
         [:span {:class (stl/css :rol-label)} label]])
 
@@ -872,8 +856,11 @@
         (tr "dashboard.invitation-modal.title.delete-invitations")
         (tr "dashboard.invitation-modal.title.resend-invitations"))]
 
-     [:button {:class (stl/css :modal-close-btn)
-               :on-click modal/hide!} deprecated-icon/close]]
+     [:> icon-button* {:variant "ghost"
+                       :tooltip-class (stl/css :modal-close-btn)
+                       :aria-label (tr "labels.close")
+                       :icon i/close
+                       :on-click modal/hide!}]]
 
     [:div {:class (stl/css :modal-invitation-content)}
      [:p
@@ -883,7 +870,13 @@
      [:div {:class (stl/css :invitation-list)}
       (for [{:keys [email role]} selected]
         [:p {:key email}
-         (str "- " email " (" (tr (str "labels." (name role))) ")")])]]
+         (str "- " email " ("
+              (cond
+                (= role :owner)  (tr "labels.owner")
+                (= role :admin)  (tr "labels.admin")
+                (= role :editor) (tr "labels.editor")
+                :else            (tr "labels.viewer"))
+              ")")])]]
 
     [:div {:class (stl/css :modal-footer)}
      [:div {:class (stl/css :action-buttons :modal-invitation-action-buttons)}
@@ -915,7 +908,7 @@
 (mf/defc select-organization-modal
   {::mf/register modal/components
    ::mf/register-as :select-organization-modal}
-  [{:keys [organizations organizations-allowed current-organization on-confirm title-key text-key choose-key placeholder-key accept-key cancel-key info-message-key description-key team-id]}]
+  [{:keys [organizations organizations-allowed current-organization on-confirm title text choose placeholder accept cancel info-message description team-id]}]
   (let [current-organization-id (:id current-organization)
         has-current-org?        (some? current-organization)
         valid-organizations     (mf/with-memo [organizations current-organization-id]
@@ -992,30 +985,33 @@
      [:div {:class (stl/css :modal-select-organization-container :modal-container)}
       [:div {:class (stl/css :modal-select-organization-header)}
        [:h2 {:class (stl/css :modal-select-organization-title)}
-        (tr title-key)]
+        title]
 
-       [:button {:class (stl/css :modal-close-btn)
-                 :on-click modal/hide!} deprecated-icon/close]]
+       [:> icon-button* {:variant "ghost"
+                         :tooltip-class (stl/css :modal-close-btn)
+                         :aria-label (tr "labels.close")
+                         :icon i/close
+                         :on-click modal/hide!}]]
 
-      (when text-key
-        [:div {:class (stl/css :modal-content :modal-select-organization-text)} (tr text-key)])
+      (when text
+        [:div {:class (stl/css :modal-content :modal-select-organization-text)} text])
 
       [:div {:class (stl/css :modal-select-organization-body)}
-       (when (or description-key info-message-key)
+       (when (or description info-message)
          [:div {:class (stl/css :modal-select-organization-info)}
-          (when description-key
+          (when description
             [:div
-             (tr description-key)])
-          (when info-message-key
+             description])
+          (when info-message
             [:div
-             (tr info-message-key)])])
+             info-message])])
        [:div {:class (stl/css :modal-select-organization-content)}
-        (tr choose-key)]
+        choose]
        [:> combobox* {:id "selected-id"
                       :class (stl/css :team-member)
                       :options options
                       :select-only true
-                      :placeholder (tr placeholder-key)
+                      :placeholder placeholder
                       :on-change on-change
                       :default-selected (if has-current-org?
                                           (str current-organization-id)
@@ -1042,14 +1038,14 @@
           :variant "secondary"
           :type "button"
           :on-click modal/hide!}
-         (tr cancel-key)]
+         cancel]
         [:> button*
          {:class (stl/css :accept-btn)
           :variant "primary"
           :type "button"
           :disabled disabled?
           :on-click on-confirm'}
-         (tr accept-key)]]]]]))
+         accept]]]]]))
 
 (mf/defc invitation-section*
   {::mf/private true}
@@ -1114,7 +1110,7 @@
 
               (and (= :restriction type)
                    (= :max-quote-reached code))
-              (st/emit! (ntf/error (tr "errors.max-quote-reached" (:target error))))
+              (st/emit! (ntf/error (tr "errors.max-quota-reached" (:target error))))
 
               (or (= :member-is-muted code)
                   (= :email-has-permanent-bounces code)
@@ -1374,8 +1370,11 @@
            (tr "modals.edit-webhook.title")
            (tr "modals.create-webhook.title"))]
 
-        [:button {:class (stl/css :modal-close-btn)
-                  :on-click modal/hide!} deprecated-icon/close]]
+        [:> icon-button* {:variant "ghost"
+                          :tooltip-class (stl/css :modal-close-btn)
+                          :aria-label (tr "labels.close")
+                          :icon i/close
+                          :on-click modal/hide!}]]
 
        [:div {:class (stl/css :modal-content)}
         [:div {:class (stl/css :fields-row)}
@@ -1416,8 +1415,10 @@
     (tr "labels.webhooks")]
    [:> i18n/tr-html* {:class (stl/css :hero-desc)
                       :content (tr "dashboard.webhooks.description")}]
-   [:button {:class (stl/css :hero-btn)
-             :on-click #(st/emit! (modal/show :webhook {}))}
+   [:> button* {:variant "primary"
+                :type "button"
+                :class (stl/css :hero-btn)
+                :on-click #(st/emit! (modal/show :webhook {}))}
     (tr "dashboard.webhooks.create")]])
 
 (mf/defc webhook-actions*
@@ -1428,9 +1429,12 @@
         on-hide (mf/use-fn #(reset! show? false))]
     (if can-edit
       [:*
-       [:button {:class (stl/css :menu-btn)
-                 :on-click on-show}
-        menu-icon]
+       [:> icon-button* {:variant "ghost"
+                         :aria-label (tr "labels.options")
+                         :aria-haspopup "menu"
+                         :aria-expanded @show?
+                         :icon i/menu
+                         :on-click on-show}]
        [:& dropdown {:show @show? :on-close on-hide :dropdown-id "webhook-actions"}
         [:ul {:class (stl/css :webhook-actions-dropdown)}
          [:li {:on-click on-edit
@@ -1496,8 +1500,10 @@
      [:div {:class (stl/css :table-field :last-delivery)
             :title last-delivery-text}
       (if (nil? error-code)
-        success-icon
-        warning-icon)]
+        [:> icon* {:icon-id i/msg-success
+                   :class (stl/css :success-icon)}]
+        [:> icon* {:icon-id i/msg-warning
+                   :class (stl/css :warning-icon)}])]
      [:div {:class (stl/css :table-field :uri)}
       [:div (dm/str (:uri webhook))]]
      [:div {:class (stl/css :table-field :active)}
@@ -1651,7 +1657,9 @@
          (when can-edit
            [:button {:class (stl/css :update-overlay)
                      :on-click on-image-click}
-            image-icon])
+            [:> icon* {:icon-id i/img
+                       :size "l"
+                       :class (stl/css :image-icon)}]])
          [:img {:class (stl/css :team-image)
                 :src (cfg/resolve-team-photo-url team)}]
          (when can-edit
@@ -1682,7 +1690,8 @@
                                 :type "button"
                                 :class (stl/css-case :organization-options-btn (not show-organization-options-menu?) :organization-options-btn-open show-organization-options-menu?)
                                 :on-click on-show-options-click}
-                    organization-menu-icon
+                    [:> icon* {:icon-id i/menu
+                               :class (stl/css :organization-menu-icon)}]
 
                     [:& dropdown {:show show-organization-options-menu? :on-close close-organization-options-menu :dropdown-id "organization-options"}
                      [:ul {:class (stl/css :organization-dropdown)
@@ -1714,7 +1723,8 @@
           (str (:name owner) " ("  (tr "labels.owner") ")")]]
 
         [:div {:class (stl/css :block-content)}
-         user-icon
+         [:> icon* {:icon-id i/user
+                    :class (stl/css :user-icon)}]
          [:span {:class (stl/css :block-text)}
           (tr "dashboard.num-of-members" (count members))]]]
 
@@ -1723,12 +1733,14 @@
          (tr "dashboard.team-projects")]
 
         [:div {:class (stl/css :block-content)}
-         group-icon
+         [:> icon* {:icon-id i/group
+                    :class (stl/css :group-icon)}]
          [:span {:class (stl/css :block-text)}
           (tr "labels.num-of-projects" (i18n/c (dec (:projects stats))))]]
 
         [:div {:class (stl/css :block-content)}
-         document-icon
+         [:> icon* {:icon-id i/document
+                    :class (stl/css :document-icon)}]
          [:span {:class (stl/css :block-text)}
           (tr "labels.num-of-files" (i18n/c (:files stats)))]]]
 

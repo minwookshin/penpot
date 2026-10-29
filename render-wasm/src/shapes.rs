@@ -416,6 +416,7 @@ impl Shape {
 
     pub fn set_clip(&mut self, value: bool) {
         self.clip_content = value;
+        self.invalidate_extrect();
     }
 
     pub fn set_rotation(&mut self, angle: f32) {
@@ -708,6 +709,29 @@ impl Shape {
         self.strokes.push(s)
     }
 
+    /// Whether a drop-shadow spread grows this shape through its strokes
+    /// ([`Self::apply_shadow_spread`]) instead of a geometric fill outset.
+    pub fn spreads_through_strokes(&self) -> bool {
+        matches!(
+            self.shape_type,
+            Type::Path(_) | Type::Bool(_) | Type::Circle
+        )
+    }
+
+    /// Offsets the shape outline by `spread` with the shape's own joins:
+    /// every stroke widens by `spread` on each side and a black `2·spread`
+    /// center stroke grows the fill.
+    pub fn apply_shadow_spread(&mut self, spread: f32) {
+        let is_open = self.is_open();
+        for stroke in self.strokes.iter_mut() {
+            stroke.grow_by_spread(spread, is_open);
+        }
+        let mut outline =
+            Stroke::new_center_stroke(2.0 * spread, StrokeStyle::Solid, None, None, None, None);
+        outline.fill = Fill::Solid(SolidColor(skia::Color::BLACK));
+        self.add_stroke(outline);
+    }
+
     pub fn set_last_stroke_widths(&mut self, widths: [f32; 4]) -> Result<(), String> {
         let stroke = self.strokes.last_mut().ok_or("Shape has no strokes")?;
         stroke.widths = Some(widths);
@@ -974,13 +998,21 @@ impl Shape {
     }
 
     fn apply_shadow_bounds(&self, bounds: Bounds) -> Bounds {
+        // A path spread is a mitered stroke (`apply_shadow_spread`): its tips
+        // reach up to Skia's miter limit (4) half-widths from the vertex.
+        const MITER_LIMIT: f32 = 4.0;
+        let mitered = matches!(self.shape_type, Type::Path(_) | Type::Bool(_));
+        let max_stroke = Stroke::max_bounds_width(self.strokes.iter(), self.is_open());
+
         let mut rect = bounds.to_rect();
-        for shadow in self.shadows_visible() {
-            if !shadow.hidden() {
-                if let Some(filter) = shadow.get_drop_shadow_filter() {
-                    let shadow_bounds = filter.compute_fast_bounds(rect);
-                    rect.join(shadow_bounds);
+        for shadow in self.drop_shadows_visible() {
+            if let Some(filter) = shadow.get_drop_shadow_filter() {
+                let mut source = rect;
+                if mitered && shadow.spread > 0.0 {
+                    let tip = (MITER_LIMIT - 1.0) * (max_stroke + shadow.spread);
+                    source.outset((tip, tip));
                 }
+                rect.join(filter.compute_fast_bounds(source));
             }
         }
         Bounds::from_rect(&rect)
@@ -1114,8 +1146,26 @@ impl Shape {
         extrect
     }
 
-    fn own_extrect_bounds(&self) -> Bounds {
+    pub(crate) fn own_extrect_bounds(&self) -> Bounds {
         self.expand_own_bounds(self.own_base_bounds(), true)
+    }
+
+    /// Bounds for a headless export rooted at this shape.
+    ///
+    /// Frames keep the classic board-box crop of overflowing children, but
+    /// still expand by their own strokes / drop shadows / layer blur so those
+    /// effects are not clipped (parity with single-export `extrect` for the
+    /// board itself). Other shapes use full [`Self::extrect`].
+    pub fn export_root_bounds(&self, tree: ShapesPoolRef, scale: f32) -> math::Rect {
+        if matches!(self.shape_type, Type::Frame(_)) {
+            let mut bounds = self.own_extrect_bounds();
+            if !self.transform.is_identity() {
+                bounds.transform_mut(&self.centered_transform());
+            }
+            bounds.to_rect()
+        } else {
+            self.extrect(tree, scale)
+        }
     }
 
     /// The shape's own geometry bounds, before stroke/shadow/blur margins.
@@ -1462,10 +1512,6 @@ impl Shape {
             .filter(|shadow| shadow.style() == ShadowStyle::Inner && !shadow.hidden())
     }
 
-    pub fn shadows_visible(&self) -> impl DoubleEndedIterator<Item = &Shadow> {
-        self.shadows.iter().rev().filter(|shadow| !shadow.hidden())
-    }
-
     pub fn to_path_transform(&self) -> Option<Matrix> {
         match self.shape_type {
             Type::Path(_) | Type::Bool(_) => {
@@ -1785,6 +1831,31 @@ impl Shape {
         !self.fills.is_empty()
     }
 
+    /// Whether this fill-less leaf paints its group's fills (SVG inheritance,
+    /// broken by `fill="none"`).
+    pub fn inherits_fills(&self) -> bool {
+        self.fills.is_empty()
+            && !matches!(self.shape_type, Type::Group(_) | Type::Frame(_))
+            && !self.svg_attrs.as_ref().is_some_and(|attrs| attrs.fill_none)
+    }
+
+    /// Fills a fill-less child inherits when rendering starts at this shape:
+    /// the nearest group's fills, or none past a frame (seeds `nested_fills`).
+    pub fn inherited_fills(&self, shapes: ShapesPoolRef) -> Vec<Fill> {
+        let mut parent_id = self.parent_id;
+        while let Some(id) = parent_id {
+            let Some(parent) = shapes.get(&id) else {
+                break;
+            };
+            match parent.shape_type {
+                Type::Group(_) => return parent.fills.clone(),
+                Type::Frame(_) => break,
+                _ => parent_id = parent.parent_id,
+            }
+        }
+        Vec::new()
+    }
+
     /// Determines if this frame or group can be flattened (doesn't affect children visually)
     /// A container can be flattened if it has no visual effects that affect its children
     /// and doesn't render its own content (no fills/strokes)
@@ -1882,6 +1953,26 @@ impl Shape {
         }
     }
 
+    /// How far the masked-group layer filter reaches past the content, in
+    /// document units: the widest drop shadow plus the layer blur.
+    pub fn masked_group_filter_reach(&self) -> f32 {
+        let reach = |filter: Option<skia::ImageFilter>| {
+            filter.map_or(0.0, |f| {
+                let r = f.compute_fast_bounds(math::Rect::default());
+                (-r.left).max(-r.top).max(r.right).max(r.bottom)
+            })
+        };
+        let shadows = self
+            .drop_shadows_visible()
+            .map(|shadow| reach(shadow.get_drop_shadow_filter()))
+            .fold(0.0, f32::max);
+        let blur = self.masked_group_layer_blur().map_or(0.0, |blur| {
+            let sigma = radius_to_sigma(blur.value);
+            reach(skia::image_filters::blur((sigma, sigma), None, None, None))
+        });
+        shadows + blur
+    }
+
     /// Shadows of the given style that the masked-group layer filter must
     /// carry, bottom-most first, already converted to device space.
     ///
@@ -1905,6 +1996,25 @@ impl Shape {
                 scaled.scale_to_device(scale);
                 scaled
             })
+    }
+
+    /// Source graphic with every visible inner shadow of the masked group over
+    /// it, for the CPU export renderer; `None` without inner shadows.
+    pub fn masked_group_inner_shadow_filter(&self) -> Option<skia::ImageFilter> {
+        if !self.is_masked_group() {
+            return None;
+        }
+
+        let mut layers: Vec<Option<skia::ImageFilter>> = vec![None];
+        for shadow in self.inner_shadows_visible() {
+            layers.push(shadow.get_inner_shadow_filter());
+        }
+
+        if layers.len() > 1 {
+            skia::image_filters::merge(layers, None)
+        } else {
+            None
+        }
     }
 
     /// Image filter for the `save_layer` that wraps a masked group, i.e. for
@@ -1936,7 +2046,7 @@ impl Shape {
 
         if !skip_shadows {
             for shadow in self.masked_group_layer_shadows(scale, ShadowStyle::Drop) {
-                layers.push(shadow.get_drop_shadow_filter());
+                layers.push(shadow.get_layer_drop_shadow_filter());
             }
         }
 
@@ -2006,10 +2116,7 @@ impl Shape {
     /// contribute to the shadow silhouette, so frames with outer/center strokes can
     /// look slightly narrower here. We keep them eligible anyway for performance.
     pub fn uses_direct_container_drop_shadow(&self, tree: ShapesPoolRef) -> bool {
-        if !matches!(self.shape_type, Type::Frame(_)) {
-            return false;
-        }
-        if !self.has_fills() {
+        if !self.is_filled_frame() {
             return false;
         }
         if self.blend_mode() != BlendMode::default() {
@@ -2032,7 +2139,11 @@ impl Shape {
     /// When true, the container's own fill shadow mask is enough and descendant
     /// silhouettes can be skipped (same geometry assumption as the direct path).
     pub fn container_fill_covers_shadow_descendants(&self, tree: ShapesPoolRef) -> bool {
-        self.has_fills() && self.descendants_contained_for_frame_shadow(tree, self.selrect())
+        self.is_filled_frame() && self.descendants_contained_for_frame_shadow(tree, self.selrect())
+    }
+
+    fn is_filled_frame(&self) -> bool {
+        matches!(self.shape_type, Type::Frame(_)) && self.has_fills()
     }
 
     fn descendants_have_drop_shadows(&self, tree: ShapesPoolRef) -> bool {
@@ -2299,6 +2410,28 @@ mod tests {
     }
 
     #[test]
+    fn masked_group_inner_shadow_filter_needs_an_inner_shadow() {
+        let drop_only = masked_group_with(vec![drop_shadow(4.0, 0.0, (10.0, 10.0))], None);
+        assert!(drop_only.masked_group_inner_shadow_filter().is_none());
+
+        let inner = masked_group_with(vec![inner_shadow(4.0, (10.0, 10.0))], None);
+        assert!(inner.masked_group_inner_shadow_filter().is_some());
+
+        let mut unmasked = inner.clone();
+        unmasked.set_masked(false);
+        assert!(unmasked.masked_group_inner_shadow_filter().is_none());
+    }
+
+    #[test]
+    fn masked_group_inner_shadow_filter_keeps_imperceptible_shadows() {
+        // Too small for the workspace filter at 1x, but export draws it.
+        let shape = masked_group_with(vec![inner_shadow(1.0, (0.0, 0.0))], None);
+
+        assert!(shape.masked_group_layer_filter(1.0, false, false).is_none());
+        assert!(shape.masked_group_inner_shadow_filter().is_some());
+    }
+
+    #[test]
     fn masked_group_layer_filter_is_none_without_effects() {
         let shape = masked_group_with(vec![], None);
         assert!(shape.masked_group_layer_filter(1.0, false, false).is_none());
@@ -2473,6 +2606,35 @@ mod tests {
         assert!(extrect.bottom > 50.0 + 20.0);
     }
 
+    /// Inner shadows are drawn inside the shape; they must not inflate export
+    /// size (WebGL PNG surface uses `extrect`). Regression for #12386.
+    #[test]
+    fn leaf_extrect_ignores_inner_shadow_offset() {
+        let mut pool = ShapesPool::new();
+        pool.initialize(1);
+
+        let shape_id = Uuid::new_v4();
+        {
+            let shape = pool.add_shape(shape_id);
+            shape.set_shape_type(Type::Rect(Rect::default()));
+            shape.set_selrect(0.0, 0.0, 200.0, 200.0);
+            shape.add_shadow(inner_shadow(0.0, (0.0, 1.0)));
+        }
+
+        let shape = pool.get(&shape_id).expect("shape should exist");
+        let baseline = {
+            let mut no_shadow = shape.clone();
+            no_shadow.clear_shadows();
+            no_shadow.calculate_extrect(&pool, 1.0)
+        };
+        let extrect = shape.calculate_extrect(&pool, 1.0);
+
+        assert_eq!(extrect.height(), baseline.height());
+        assert_eq!(extrect.width(), baseline.width());
+        assert_eq!(extrect.height(), 200.0);
+        assert_eq!(extrect.width(), 200.0);
+    }
+
     #[test]
     fn test_apply_transform() {
         let mut shape = Shape::new(Uuid::new_v4());
@@ -2640,6 +2802,17 @@ mod tests {
         let frame = pool.get(&frame_id).expect("frame");
         assert!(!frame.uses_direct_container_drop_shadow(&pool));
         assert!(!frame.container_fill_covers_shadow_descendants(&pool));
+    }
+
+    #[test]
+    fn filled_group_does_not_cover_shadow_descendants() {
+        let (mut pool, group_id) =
+            frame_with_fill_and_child(Fill::Solid(SolidColor(skia::Color::BLACK)), 1.0);
+        pool.get_mut(&group_id)
+            .expect("group")
+            .set_shape_type(Type::Group(Group { masked: false }));
+        let group = pool.get(&group_id).expect("group");
+        assert!(!group.container_fill_covers_shadow_descendants(&pool));
     }
 
     #[test]

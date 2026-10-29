@@ -181,7 +181,7 @@
            (let [name-input     (mf/ref-val ref)
                  name           (str/trim (dom/get-value name-input))]
              (reset! edition* false)
-             (st/emit! (dw/end-rename-shape frame-id name))
+             (st/emit! (dw/rename-shape-or-variant frame-id name))
              (on-frame-leave frame-id))))
 
         cancel-edit
@@ -259,10 +259,12 @@
 
 (mf/defc frame-titles*
   {::mf/wrap [mf/memo]}
-  [{:keys [objects zoom selected focus is-show-artboard-names
+  [{:keys [objects base-objects zoom selected focus is-show-artboard-names
            on-frame-enter on-frame-leave on-frame-select]}]
   (let [selected       (or selected #{})
-        shapes         (ctt/get-frames objects {:skip-copies? true :ignore-index? true})
+        frame-ids      (mf/with-memo [base-objects]
+                         (vec (ctt/get-frames-ids base-objects {:skip-copies? true :ignore-index? true})))
+        shapes         (into [] (keep (d/getf objects)) frame-ids)
         shapes         (if (dbg/enabled? :shape-titles)
                          (into (set shapes)
                                (map (d/getf objects))

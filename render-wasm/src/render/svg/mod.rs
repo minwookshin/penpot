@@ -1,5 +1,6 @@
 use skia_safe::{self as skia};
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::error::Result;
@@ -61,7 +62,8 @@ fn svg_page_bounds(shape: &Shape, tree: ShapesPoolRef, scale: f32) -> skia::Rect
 /// `<clipPath>`.
 ///
 /// Layer blur and drop/inner shadows are re-emitted as a native SVG `<filter>`
-/// wrapper. Masks still need dedicated SVG re-emission.
+/// wrapper. Masked groups use a native alpha `<mask>`. Background blur uses an
+/// XHTML `foreignObject` with CSS `backdrop-filter` (browser rendering).
 /// Solid Inner/Outer and dotted/dashed strokes go out as filled outlines;
 /// image-filled strokes use a linked `<image>` clipped to the stroke;
 /// text strokes use `<g opacity>` / glyph clipPath / inverse glyph mask, and
@@ -102,6 +104,88 @@ pub(crate) fn render_tree_to_svg(
     collect_font_aliases(tree, id, &mut aliases);
     let font_css = shared.fonts.font_face_css_for_aliases(&aliases);
 
+    Ok(emit_svg_document(page_w, page_h, &font_css, &defs, &body))
+}
+
+/// Multi-root SVG export: one document whose viewBox covers every visible root,
+/// with relative placement preserved (inspect / copy-as-svg multi-select).
+pub fn render_to_svg_multi(
+    shared: &mut RenderResources,
+    ids: &[Uuid],
+    tree: ShapesPoolRef,
+    scale: f32,
+) -> Result<Vec<u8>> {
+    render_trees_to_svg(shared, ids, tree, scale)
+}
+
+/// Core multi-root SVG export for headless tests and the WASM bridge.
+pub(crate) fn render_trees_to_svg(
+    shared: &mut RenderResources,
+    ids: &[Uuid],
+    tree: ShapesPoolRef,
+    scale: f32,
+) -> Result<Vec<u8>> {
+    if ids.is_empty() {
+        return Ok(emit_svg_document(0.0, 0.0, "", "", ""));
+    }
+
+    let mut joined: Option<skia::Rect> = None;
+    let mut roots: Vec<Uuid> = Vec::with_capacity(ids.len());
+    for id in ids {
+        let Some(shape) = tree.get(id) else {
+            continue;
+        };
+        if shape.hidden {
+            continue;
+        }
+        let bounds = svg_page_bounds(shape, tree, scale);
+        match &mut joined {
+            None => joined = Some(bounds),
+            Some(acc) => {
+                acc.join(bounds);
+            }
+        }
+        roots.push(*id);
+    }
+
+    // Missing or hidden-only roots: empty document (same as empty `ids`), not
+    // CriticalError — inspect/copy must not crash the host when nothing is drawable.
+    let Some(bounds) = joined else {
+        return Ok(emit_svg_document(0.0, 0.0, "", "", ""));
+    };
+
+    let page_w = bounds.width() * scale;
+    let page_h = bounds.height() * scale;
+    let rect = skia::Rect::from_xywh(0., 0., page_w, page_h);
+    let tx = -bounds.left();
+    let ty = -bounds.top();
+
+    let mut builder = SvgLayerCanvas::new(scale, rect, tx, ty);
+    for id in &roots {
+        if let Some(shape) = tree.get(id) {
+            builder.nested_fills.push(shape.inherited_fills(tree));
+        }
+        render_tree(&mut builder, shared, id, tree, scale)?;
+        builder.nested_fills.pop();
+    }
+    builder.flush();
+
+    let mut aliases = HashSet::new();
+    for id in &roots {
+        collect_font_aliases(tree, id, &mut aliases);
+    }
+    let font_css = shared.fonts.font_face_css_for_aliases(&aliases);
+
+    Ok(emit_svg_document(
+        page_w,
+        page_h,
+        &font_css,
+        &builder.defs,
+        &builder.out,
+    ))
+}
+
+fn emit_svg_document(page_w: f32, page_h: f32, font_css: &str, defs: &str, body: &str) -> Vec<u8> {
     let mut out = String::with_capacity(body.len() + defs.len() + font_css.len() + 256);
     out.push_str("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\n");
     out.push_str(&format!(
@@ -116,28 +200,33 @@ pub(crate) fn render_tree_to_svg(
                 "<style type=\"text/css\"><![CDATA[{font_css}]]></style>"
             ));
         }
-        out.push_str(&defs);
+        out.push_str(defs);
         out.push_str("</defs>");
     }
 
-    out.push_str(&body);
+    out.push_str(body);
     out.push_str("</svg>");
-
-    Ok(out.into_bytes())
+    out.into_bytes()
 }
 
+mod background_blur;
 mod document;
 mod frames;
 mod groups;
 mod images;
 mod text;
 
+use background_blur::emit_background_blur;
 use document::SvgLayerCanvas;
 use frames::render_frame;
 use groups::render_group;
 use text::{render_text_fill, render_text_strokes};
 
-use document::{effect_attrs, push_text_silhouette_spread_filter, shape_with_selrect_outset};
+use crate::shapes::Shadow;
+use document::{
+    content_effect_attrs, effect_attrs, opacity_blend_attrs, push_container_drop_filter,
+    push_text_silhouette_spread_filter, shape_with_selrect_outset,
+};
 use images::{emit_fills, emit_strokes};
 
 /// Renders `id`'s subtree to an SVG body, returning `(defs, body)`.
@@ -151,6 +240,9 @@ fn render_body(
     ty: f32,
 ) -> Result<(String, String)> {
     let mut builder = SvgLayerCanvas::new(scale, page_rect, tx, ty);
+    if let Some(shape) = tree.get(id) {
+        builder.nested_fills.push(shape.inherited_fills(tree));
+    }
     render_tree(&mut builder, shared, id, tree, scale)?;
     builder.flush();
     Ok((builder.defs, builder.out))
@@ -189,71 +281,145 @@ fn render_leaf(
     tree: ShapesPoolRef,
     scale: f32,
 ) -> Result<()> {
+    // Text keeps the classic leaf filter graph (GPU dilates glyph alpha). Geometry
+    // leaves match container drops: geometric offset+spread silhouette, then content.
+    if matches!(element.shape_type, Type::Text(_)) {
+        return render_leaf_text(builder, shared, element, scale);
+    }
+
+    emit_background_blur(builder, element, scale)?;
+
+    let composite = opacity_blend_attrs(element);
+    if let Some(attrs) = &composite {
+        builder.open_group(attrs);
+    }
+
+    // Own drop silhouettes: GPU paints geometric spread/offset (avoids
+    // feMorphology rounding on circles). Filter only blurs/tints.
+    if !builder.suppress_filters {
+        let drops: Vec<Shadow> = element.drop_shadows_visible().copied().collect();
+        for shadow in &drops {
+            let id = push_container_drop_filter(builder, shadow);
+            builder.open_group(&format!("filter=\"url(#{id})\""));
+            let prev_suppress = builder.suppress_filters;
+            let prev_spread = builder.silhouette_spread;
+            let prev_offset = builder.silhouette_offset;
+            builder.suppress_filters = true;
+            builder.silhouette_spread = shadow.spread;
+            builder.silhouette_offset = shadow.offset;
+            render_leaf_geometry(builder, shared, element, tree, scale)?;
+            builder.silhouette_offset = prev_offset;
+            builder.silhouette_spread = prev_spread;
+            builder.suppress_filters = prev_suppress;
+            builder.close_group();
+        }
+    }
+
+    let effects = content_effect_attrs(builder, element);
+    if let Some(attrs) = &effects {
+        builder.open_group(attrs);
+    }
+    render_leaf_geometry(builder, shared, element, tree, scale)?;
+    if effects.is_some() {
+        builder.close_group();
+    }
+
+    if composite.is_some() {
+        builder.close_group();
+    }
+    Ok(())
+}
+
+fn render_leaf_text(
+    builder: &mut SvgLayerCanvas,
+    shared: &mut RenderResources,
+    element: &Shape,
+    scale: f32,
+) -> Result<()> {
+    emit_background_blur(builder, element, scale)?;
+
     let effects = effect_attrs(builder, element);
     if let Some(attrs) = &effects {
         builder.open_group(attrs);
     }
 
-    {
-        let spread = builder.silhouette_spread;
-        // Spread outsets fills only (GPU). Rect/Frame strokes ignore outset.
-        // Text keeps its selrect: GPU dilates shadow alpha, not layout bounds.
-        let fill_shape = shape_with_selrect_outset(element, spread);
-        // Always from the original element (not outset selrect) so the pivot
-        // matches content; offset comes from the parent silhouette pass.
-        let draw_matrix = builder.silhouette_draw_matrix(element);
-        if matches!(element.shape_type, Type::Text(_)) {
-            // See `push_text_silhouette_spread_filter`: morph-before-blur approx
-            // of GPU dilate(drop_shadow) for inherited container spread.
-            let morph_id = push_text_silhouette_spread_filter(builder, spread);
-            if let Some(id) = &morph_id {
-                builder.open_group(&format!("filter=\"url(#{id})\""));
-            }
-            render_text_fill(builder, shared, element, draw_matrix)?;
-            render_text_strokes(builder, shared, element, draw_matrix)?;
-            if morph_id.is_some() {
-                builder.close_group();
-            }
-        } else if matches!(element.shape_type, Type::SVGRaw(_)) {
-            let canvas = builder.canvas();
-            canvas.save();
-            canvas.concat(&draw_matrix);
-            let mut renderer = VectorRenderer::new(canvas, shared, scale, false);
-            renderer.draw_svg(element)?;
-            canvas.restore();
-        } else {
-            emit_fills(
-                builder,
-                shared,
-                &fill_shape,
-                &fill_shape.fills,
-                tree,
-                scale,
-                Some(draw_matrix),
-            )?;
-
-            // Drop/inner shadows are native SVG filters on the effects `<g>` —
-            // do not draw them via Skia image-filters (SkSVGDevice drops them).
-
-            // Stroke geometry stays on the original selrect (GPU Rect/Frame
-            // drop-shadow outset is a no-op for single strokes). Image strokes
-            // go through emit_strokes (linked <image> + stroke clip).
-            let visible_strokes: Vec<_> = element.visible_strokes().collect();
-            if !visible_strokes.is_empty() {
-                emit_strokes(
-                    builder,
-                    shared,
-                    element,
-                    &visible_strokes,
-                    scale,
-                    Some(draw_matrix),
-                )?;
-            }
-        }
+    let spread = builder.silhouette_spread;
+    let draw_matrix = builder.silhouette_draw_matrix(element);
+    // See `push_text_silhouette_spread_filter`: morph-before-blur approx of
+    // GPU dilate(drop_shadow) for inherited container spread.
+    let morph_id = push_text_silhouette_spread_filter(builder, spread);
+    if let Some(id) = &morph_id {
+        builder.open_group(&format!("filter=\"url(#{id})\""));
+    }
+    render_text_fill(builder, shared, element, draw_matrix)?;
+    render_text_strokes(builder, shared, element, draw_matrix)?;
+    if morph_id.is_some() {
+        builder.close_group();
     }
 
     if effects.is_some() {
         builder.close_group();
+    }
+    Ok(())
+}
+
+fn render_leaf_geometry(
+    builder: &mut SvgLayerCanvas,
+    shared: &mut RenderResources,
+    element: &Shape,
+    tree: ShapesPoolRef,
+    scale: f32,
+) -> Result<()> {
+    let spread = builder.silhouette_spread;
+    // Spread outsets fills only (GPU). Rect/Frame strokes ignore outset.
+    // Paths and circles spread through strokes instead (see below).
+    let fill_outset = if element.spreads_through_strokes() {
+        0.0
+    } else {
+        spread
+    };
+    let fill_shape = shape_with_selrect_outset(element, fill_outset);
+    // Always from the original element (not outset selrect) so the pivot
+    // matches content; offset comes from the silhouette pass.
+    let draw_matrix = builder.silhouette_draw_matrix(element);
+    if matches!(element.shape_type, Type::SVGRaw(_)) {
+        let canvas = builder.canvas();
+        canvas.save();
+        canvas.concat(&draw_matrix);
+        let mut renderer = VectorRenderer::new(canvas, shared, scale, false);
+        renderer.draw_svg(element)?;
+        canvas.restore();
+        return Ok(());
+    }
+
+    let fills = builder.effective_fills_owned(&fill_shape);
+    emit_fills(
+        builder,
+        shared,
+        &fill_shape,
+        &fills,
+        tree,
+        scale,
+        Some(draw_matrix),
+    )?;
+
+    // Stroke geometry stays on the original selrect (GPU Rect/Frame
+    // drop-shadow outset is a no-op for single strokes). Paths and circles
+    // spread through widened strokes, as on the GPU.
+    let mut stroke_shape = Cow::Borrowed(element);
+    if spread > 0.0 && element.spreads_through_strokes() {
+        stroke_shape.to_mut().apply_shadow_spread(spread);
+    }
+    let visible_strokes: Vec<_> = stroke_shape.visible_strokes().collect();
+    if !visible_strokes.is_empty() {
+        emit_strokes(
+            builder,
+            shared,
+            &stroke_shape,
+            &visible_strokes,
+            scale,
+            Some(draw_matrix),
+        )?;
     }
     Ok(())
 }

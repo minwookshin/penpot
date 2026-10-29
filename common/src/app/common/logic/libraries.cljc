@@ -56,6 +56,10 @@
        ;; We don't do automatic update of the `layout-grid-cells` property.
        (remove #(= :layout-grid-cells %))))
 
+;; Flex-child layout attrs synced between main and copy (interactions are only kept on swap)
+(def ^:private flex-child-attrs
+  (disj ctk/swap-keep-attrs :interactions))
+
 (defn enabled-shape?
   [id container]
   (or (empty? log-shape-ids)
@@ -2375,6 +2379,15 @@
                 (assoc attr (get origin attr)))))
           dest))))
 
+(defn- get-flex-child-main
+  "The near-main child that owns this copy child's flex-item attrs.
+  Non-swapped copies match by shape-ref; swapped copies match by swap slot
+  (the original occupant of the parent layout slot)."
+  [main-container main-component child-copy]
+  (or (ctf/get-ref-shape main-container main-component child-copy)
+      (some->> (ctk/get-swap-slot child-copy)
+               (ctf/get-component-shape main-container main-component))))
+
 (defn- update-flex-child-copy-attrs
   "Synchronizes the attributes inside the flex-child items (main->copy)"
   [changes shape-main shape-copy main-container main-component copy-container omit-touched?]
@@ -2400,9 +2413,9 @@
             (pcb/update-shapes
              (:shapes shape-copy)
              (fn [child-copy]
-               (let [child-main (ctf/get-ref-shape main-container main-component child-copy)]
-                 (-> child-copy
-                     (propagate-attrs child-main ctk/swap-keep-attrs omit-touched?))))
+               (if-let [child-main (get-flex-child-main main-container main-component child-copy)]
+                 (propagate-attrs child-copy child-main flex-child-attrs omit-touched?)
+                 child-copy))
              {:ignore-touched true}))]
     (pcb/concat-changes changes new-changes)))
 
@@ -2432,7 +2445,7 @@
              (fn [child-main]
                (let [child-copy (ctf/get-shape-in-copy copy-container child-main shape-copy)]
                  (-> child-main
-                     (propagate-attrs child-copy ctk/swap-keep-attrs omit-touched?))))
+                     (propagate-attrs child-copy flex-child-attrs omit-touched?))))
              {:ignore-touched true}))]
     (pcb/concat-changes changes new-changes)))
 
@@ -2783,7 +2796,7 @@
   (let [shape-inst (ctn/get-shape container id)
         objects    (:objects container)
         parent     (get objects (:parent-id shape-inst))
-        head       (ctn/get-component-shape container parent)
+        head       (ctn/get-component-shape objects parent)
         changes
         (-> changes
             (pcb/with-container container)
@@ -2802,6 +2815,10 @@
             (pcb/with-objects objects)
             (generate-sync-shape-direct file-full libraries container id true))]
 
+    ;; If the shape has been swapped, the reset also have to undo the swap. As the
+    ;; shape has been reset and it's not touched now, by the sync above, if we
+    ;; do another reset of the parent, the shape will be reset as it is in the
+    ;; near main component.
     (cond-> changes
       (some? swap-slot)
       (generate-sync-head file-full libraries container id true))))

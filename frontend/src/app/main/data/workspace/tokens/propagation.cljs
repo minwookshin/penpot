@@ -6,13 +6,14 @@
 
 (ns app.main.data.workspace.tokens.propagation
   (:require
-   [app.common.data :as d]
+   [app.common.files.changes-builder :as pcb]
    [app.common.files.helpers :as cfh]
    [app.common.files.tokens :as cfo]
    [app.common.logging :as l]
    [app.common.time :as ct]
    [app.common.types.token :as ctt]
    [app.config :as cf]
+   [app.main.data.changes :as dch]
    [app.main.data.helpers :as dsh]
    [app.main.data.style-dictionary :as sd]
    [app.main.data.tokenscript :as ts]
@@ -131,8 +132,27 @@
                update-infos)))
           shapes-update-info))
 
+(defn- update-canvas-background
+  "Set the background of `page-id` to the resolved value of its linked
+  color token, when that value differs from the current background."
+  [page-id resolved-tokens]
+  (ptk/reify ::update-canvas-background
+    ptk/WatchEvent
+    (watch [it state _]
+      (let [page       (dsh/lookup-page state page-id)
+            token-name (:background-token page)
+            color      (some-> (get-in resolved-tokens [token-name :resolved-value])
+                               (dwta/value->color)
+                               (:color))]
+        (when (and (some? color) (not= color (:background page)))
+          (rx/of (dch/commit-changes
+                  (-> (pcb/empty-changes it)
+                      (pcb/with-page page)
+                      (pcb/mod-page {:background color})))))))))
+
 (defn propagate-tokens
-  "Propagate tokens values to all shapes where they are applied"
+  "Propagate tokens values to all shapes and page backgrounds where they
+  are applied"
   [state resolved-tokens]
   (let [file-id         (get state :current-file-id)
         current-page-id (get state :current-page-id)
@@ -168,6 +188,9 @@
                (when (seq observable) (apply rx/merge observable))
                (when (seq normal) (rx/concat-all (rx/of normal)))
 
+               (when (:background-token page)
+                 (rx/of (update-canvas-background page-id resolved-tokens)))
+
                (->> (rx/from frame-ids)
                     (rx/mapcat (fn [frame-id]
                                  (rx/of (dwt/clear-thumbnail file-id page-id frame-id "frame")
@@ -193,8 +216,7 @@
         (when (and tokens-lib tokens-status)
           (when-let [tokens-tree (cfo/get-tokens-in-active-sets tokens-status tokens-lib)]
             (->> (if (contains? cf/flags :tokenscript)
-                   (rx/of (-> (ts/resolve-tokens tokens-tree)
-                              (d/update-vals #(update % :resolved-value ts/tokenscript-symbols->penpot-unit))))
+                   (rx/of (ts/resolve-tokens tokens-tree))
                    (sd/resolve-tokens tokens-tree))
                  (rx/mapcat
                   (fn [sd-tokens]

@@ -49,7 +49,7 @@
                       (update :lang #(or % ""))
                       (update :theme #(if (= % "default")
                                         "dark"
-                                        (or % "dark")))))
+                                        (or % theme/default)))))
 
         form    (fm/use-form :schema schema:options-form
                              :initial initial)]
@@ -100,9 +100,9 @@
                                             "disable-webgl-rendering")
                                 ::ev/origin "settings"})
                      (du/update-profile-props {:renderer (if enabled? :wasm :svg)})
-                     (ntf/success (tr (if enabled?
-                                        "webgl.toast.webgl-render-enabled"
-                                        "webgl.toast.webgl-render-disabled"))))))]
+                     (ntf/success (if enabled?
+                                    (tr "webgl.toast.webgl-render-enabled")
+                                    (tr "webgl.toast.webgl-render-disabled"))))))]
     [:section {:class (stl/css :webgl-container)}
      [:header {:class (stl/css :webgl-header)}
       [:> heading* {:class (stl/css :title) :level 2 :typography t/title-large} (tr "dashboard.webgl-switch.title")]

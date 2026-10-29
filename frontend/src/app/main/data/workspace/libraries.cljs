@@ -498,15 +498,11 @@
   (ptk/reify ::rename-component-and-main-instance
     ptk/WatchEvent
     (watch [_ state _]
-      (let [name        (str/trim name)
-            clean-name  (cpn/clean-path name)
-            valid?      (and (not (str/ends-with? name "/"))
-                             (string? clean-name)
-                             (not (str/blank? clean-name)))
+      (let [clean-name (cpn/normalize-path-name name)
             data       (dsh/lookup-file-data state)
             component  (dm/get-in data [:components component-id])]
 
-        (when (and valid? component)
+        (when (and (some? clean-name) component)
           (let [shape-id (:main-instance-id component)
                 page-id  (:main-instance-page component)]
 
@@ -531,7 +527,8 @@
              (-> (pcb/empty-changes it nil)
                  (cll/generate-duplicate-component library component-id new-component-id))]
          (rx/of
-          (ptk/data-event :layout/update {:ids [(:id main-instance)]})
+          (ptk/data-event :layout/update {:page-id (:main-instance-page (get-in library [:data :components component-id]))
+                                          :ids [(:id main-instance)]})
           (dch/commit-changes changes)))))))
 
 (defn delete-component
@@ -1049,6 +1046,17 @@
                  second)
             0)))))
 
+(defn component-swap-nesting-loop?
+  [objects shape library-data component-id]
+  (let [component (ctkl/get-component library-data component-id true)
+        page      (ctf/get-component-page library-data component)
+        root      (ctf/get-component-root library-data component)]
+    (and page
+         root
+         (cfh/components-nesting-loop?
+          (cfh/get-children-with-self (:objects page) (:id root))
+          (cfh/get-parents-with-self objects (:parent-id shape))))))
+
 (defn component-swap
   "Swaps a component with another one"
   [shape file-id id-new-component keep-touched?]
@@ -1450,6 +1458,12 @@
                 (wrf/finish! task)
                 (swap! pending-sync-barriers* disj task)))
 
+            ;; Each batch entry is [[event task] old-data].
+            finish-batch-barriers!
+            (fn [batch]
+              (doseq [[[_ task] _] batch]
+                (finish-sync-barrier! task)))
+
             commits-s
             (->> stream
                  (rx/filter dch/commit?)
@@ -1462,12 +1476,20 @@
                  (rx/filter (complement :skip-component-sync?))
                  ;; Keep waits pending while component changes are checked.
                  (rx/map start-sync-barrier)
-                 (rx/observe-on :async))
+                 ;; Paired as it arrives, so later commits in the same batch
+                 ;; cannot hide the shapes this one moved or deleted.
+                 (rx/with-latest-from workspace-buffer-s)
+                 (rx/share))
 
-            get-component-events
-            (fn [[event old-data]]
-              (let [{:keys [file-id changes save-undo? undo-group]} event
-                    changed-components
+            ;; Buffers commits until a timer turn passes with no new ones. The
+            ;; debounce timer (not a microtask) queues behind any timers already
+            ;; due, so a burst of commits is inspected as one batch in one task.
+            commit-batches-s
+            (rx/buffer-until (rx/debounce 0 commits-s) commits-s)
+
+            get-component-changes
+            (fn [old-data {:keys [file-id changes save-undo? undo-group]}]
+              (let [changed-components
                     (when (and old-data
                                (or (nil? file-id) (= file-id (:id old-data))))
                       (into #{}
@@ -1475,29 +1497,40 @@
                             changes))]
                 (cond
                   (empty? changed-components)
-                  (rx/empty)
+                  nil
 
                   save-undo?
                   (do
                     (log/info :hint "detected component changes"
                               :ids (map str changed-components)
                               :undo-group undo-group)
-                    (->> (rx/from changed-components)
-                         (rx/map #(component-changed
-                                   % (:id old-data) undo-group))))
+                    (map #(vector ::component-changed % (:id old-data) undo-group)
+                         changed-components))
 
                   :else
                   ;; Undos only bump :modified-at.
-                  (->> (rx/from changed-components)
-                       (rx/map touch-component)))))
+                  (map #(vector ::touch-component %) changed-components))))
+
+            ;; One event per distinct component change in the batch, each
+            ;; commit checked against the file data right before it
+            get-component-events
+            (fn [batch]
+              (->> batch
+                   (mapcat (fn [[[event _] old-data]]
+                             (get-component-changes old-data event)))
+                   (distinct)
+                   (map (fn [[type component-id file-id undo-group]]
+                          (if (= type ::component-changed)
+                            (component-changed component-id file-id undo-group)
+                            (touch-component component-id))))
+                   (rx/from)))
 
             component-events-s
-            (->> commits-s
-                 (rx/with-latest-from workspace-buffer-s)
+            (->> commit-batches-s
                  (rx/mapcat
-                  (fn [[[event task] old-data]]
-                    (->> (get-component-events [event old-data])
-                         (rx/finalize #(finish-sync-barrier! task)))))
+                  (fn [batch]
+                    (->> (get-component-events batch)
+                         (rx/finalize #(finish-batch-barriers! batch)))))
                  ;; Close barriers left behind when the page shuts down.
                  (rx/finalize #(wrf/finish-tasks! @pending-sync-barriers*))
                  (rx/share))
