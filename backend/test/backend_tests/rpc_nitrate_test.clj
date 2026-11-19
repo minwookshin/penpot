@@ -87,6 +87,15 @@
        :issuer "https://idp.example.com"
        :organization-id organization-id}
 
+      :get-organization-membership
+      {:is-member true
+       :organization-id organization-id}
+
+      :get-organization-summary
+      {:id organization-id
+       :owner-id organization-owner-id
+       :teams []}
+
       nil)))
 
 (defn- unauthorized-sso-mock
@@ -127,7 +136,7 @@
                            {::th/type :check-nitrate-sso
                             ::rpc/profile-id (:id external-profile)
                             :team-id (:id team)
-                            :url "https://penpot.example.com/#/workspace"}
+                            :query-string "screen=workspace&team-id=0e5f-1a2b"}
                            {::http/request {}})]
     (binding [cf/flags (conj cf/flags :admin-console)]
       (with-redefs [nitrate/call
@@ -154,7 +163,7 @@
                           {::th/type :check-nitrate-sso
                            ::rpc/profile-id (:id team-owner)
                            :team-id (:id team)
-                           :url "https://penpot.example.com/#/workspace"}
+                           :query-string "screen=workspace&team-id=0e5f-1a2b"}
                           {::http/request {}})]
     (binding [cf/flags (conj cf/flags :admin-console)]
       (with-redefs [nitrate/call
@@ -175,8 +184,9 @@
           (t/is (= {:authorized false
                     :redirect-uri redirect-uri}
                    (:result out)))
-          (t/is (= #{:dest-url :organization-id} (set (keys @redirect-options))))
-          (t/is (= "https://penpot.example.com/#/workspace" (str (:dest-url @redirect-options))))
+          (t/is (= #{:query-string :organization-id :profile-id} (set (keys @redirect-options))))
+          (t/is (= "screen=workspace&team-id=0e5f-1a2b" (:query-string @redirect-options)))
+          (t/is (= (:id team-owner) (:profile-id @redirect-options)))
           (t/is (nil? (:organization-id @redirect-options)))
           (t/is (= {:profile-id (:id team-owner)
                     :organization-id organization-id}
@@ -191,10 +201,16 @@
                           {::th/type :check-nitrate-sso
                            ::rpc/profile-id (:id profile)
                            :organization-id organization-id
-                           :url "https://penpot.example.com/#/workspace"}
+                           :query-string "screen=workspace&team-id=0e5f-1a2b"}
                           {::http/request {}})]
     (binding [cf/flags (conj cf/flags :admin-console)]
       (with-redefs [nitrate/sso-session-authorized? (unauthorized-sso-mock organization-id)
+                    nitrate/call
+                    (fn [_cfg method _params]
+                      (case method
+                        :get-organization-membership {:is-member true
+                                                      :organization-id organization-id}
+                        nil))
                     oidc/build-organization-sso-auth-redirect-uri (fn [& _] (throw cause))
                     oidc/submit-organization-sso-auth-failed-event
                     (fn [_cfg _request profile-id received-organization-id received-cause]
@@ -218,7 +234,7 @@
                           {::th/type :check-nitrate-sso
                            ::rpc/profile-id (:id organization-owner)
                            :team-id (:id team)
-                           :url "https://penpot.example.com/#/workspace"}
+                           :query-string "screen=workspace&team-id=0e5f-1a2b"}
                           {::http/request {}})]
     (binding [cf/flags (conj cf/flags :admin-console)]
       (with-redefs [nitrate/organization-owner-of-team?
@@ -246,7 +262,7 @@
                           {::th/type :check-nitrate-sso
                            ::rpc/profile-id (:id team-owner)
                            :team-id (:id team)
-                           :url "https://penpot.example.com/#/workspace"}
+                           :query-string "screen=workspace&team-id=0e5f-1a2b"}
                           {::http/request {}})]
     (binding [cf/flags (conj cf/flags :admin-console)]
       (with-redefs [nitrate/sso-session-authorized?
@@ -258,6 +274,153 @@
         (let [out (th/command! params)]
           (t/is (th/success? out))
           (t/is (= {:authorized true :reason :sso-satisfied} (:result out))))))))
+
+(t/deftest check-nitrate-sso-denies-an-organization-the-profile-does-not-belong-to
+  (let [profile         (th/create-profile* 1 {:is-active true})
+        organization-id (uuid/random)
+        params          (with-meta
+                          {::th/type :check-nitrate-sso
+                           ::rpc/profile-id (:id profile)
+                           :organization-id organization-id
+                           :query-string "screen=workspace"}
+                          {::http/request {}})]
+    (binding [cf/flags (conj cf/flags :admin-console)]
+      (with-redefs [nitrate/call
+                    (fn [_cfg method _params]
+                      (case method
+                        :get-organization-membership {:is-member false
+                                                      :organization-id organization-id}
+                        :get-organization-summary {:id organization-id
+                                                   :owner-id (uuid/random)
+                                                   :teams []}
+                        :get-organization-sso {:active true
+                                               :issuer "https://idp.example.com"
+                                               :organization-id organization-id}
+                        nil))
+                    oidc/build-organization-sso-auth-redirect-uri
+                    (constantly "https://idp.example.com/authorize")]
+        (let [out (th/command! params)]
+          (t/is (th/success? out))
+          ;; The organization id comes from the client: a profile that does
+          ;; not belong to the organization must not start a flow for it.
+          (t/is (= {:authorized true :reason :no-organization-access} (:result out))))))))
+
+(t/deftest check-nitrate-sso-denies-an-organization-the-profile-does-not-belong-to-even-with-a-team
+  (let [profile         (th/create-profile* 1 {:is-active true})
+        team            (th/create-team* 1 {:profile-id (:id profile)})
+        organization-id (uuid/random)
+        params          (with-meta
+                          {::th/type :check-nitrate-sso
+                           ::rpc/profile-id (:id profile)
+                           :team-id (:id team)
+                           :organization-id organization-id
+                           :query-string "screen=workspace"}
+                          {::http/request {}})]
+    (binding [cf/flags (conj cf/flags :admin-console)]
+      (with-redefs [nitrate/call
+                    (fn [_cfg method _params]
+                      (case method
+                        :get-organization-membership {:is-member false
+                                                      :organization-id organization-id}
+                        :get-organization-summary {:id organization-id
+                                                   :owner-id (uuid/random)
+                                                   :teams []}
+                        :get-organization-sso {:active true
+                                               :issuer "https://idp.example.com"
+                                               :organization-id organization-id}
+                        nil))
+                    oidc/build-organization-sso-auth-redirect-uri
+                    (constantly "https://idp.example.com/authorize")]
+        (let [out (th/command! params)]
+          (t/is (th/success? out))
+          ;; The organization id comes from the client too when the team is
+          ;; also sent, so the check applies to both shapes.
+          (t/is (= {:authorized true :reason :no-organization-access} (:result out))))))))
+
+(t/deftest check-nitrate-sso-survives-an-organization-that-does-not-exist
+  (let [profile         (th/create-profile* 1 {:is-active true})
+        organization-id (uuid/random)
+        params          (with-meta
+                          {::th/type :check-nitrate-sso
+                           ::rpc/profile-id (:id profile)
+                           :organization-id organization-id
+                           :query-string "screen=workspace"}
+                          {::http/request {}})]
+    (binding [cf/flags (conj cf/flags :admin-console)]
+      (with-redefs [nitrate/call
+                    (fn [_cfg _method _params] nil)
+                    oidc/build-organization-sso-auth-redirect-uri
+                    (constantly "https://idp.example.com/authorize")]
+        (let [out (th/command! params)]
+          (t/is (th/success? out))
+          ;; Nitrate knows nothing about the organization: that is a denial,
+          ;; not a crash.
+          (t/is (= {:authorized true :reason :no-organization-access} (:result out))))))))
+
+(t/deftest check-nitrate-sso-ignores-a-value-that-is-not-a-route
+  (let [profile         (th/create-profile* 1 {:is-active true})
+        organization-id (uuid/random)
+        redirect-uri    "https://idp.example.com/authorize"]
+    (doseq [query-string ["https://evil.example/" ""]]
+      (let [params (with-meta
+                     {::th/type :check-nitrate-sso
+                      ::rpc/profile-id (:id profile)
+                      :organization-id organization-id
+                      :query-string query-string}
+                     {::http/request {}})]
+        (binding [cf/flags (conj cf/flags :admin-console)]
+          (with-redefs [nitrate/call
+                        (fn [_cfg method _params]
+                          (case method
+                            :get-organization-membership {:is-member true
+                                                          :organization-id organization-id}
+                            :get-organization-summary {:id organization-id
+                                                       :owner-id (:id profile)
+                                                       :teams []}
+                            :get-organization-sso {:active true
+                                                   :issuer "https://idp.example.com"
+                                                   :organization-id organization-id}
+                            nil))
+                        oidc/prepare-organization-sso-provider (constantly {:type "oidc"})
+                        oidc/build-auth-redirect-uri           (constantly redirect-uri)]
+            (let [out (th/command! params)]
+              (t/is (th/success? out))
+              ;; A destination the server cannot render must not break the
+              ;; flow: the user lands on the public uri instead.
+              (t/is (= {:authorized false
+                        :redirect-uri redirect-uri}
+                       (:result out))))))))))
+
+(t/deftest check-nitrate-sso-allows-the-owner-of-the-organization
+  (let [profile         (th/create-profile* 1 {:is-active true})
+        organization-id (uuid/random)
+        redirect-uri    "https://idp.example.com/authorize"
+        params          (with-meta
+                          {::th/type :check-nitrate-sso
+                           ::rpc/profile-id (:id profile)
+                           :organization-id organization-id
+                           :query-string "screen=workspace"}
+                          {::http/request {}})]
+    (binding [cf/flags (conj cf/flags :admin-console)]
+      (with-redefs [nitrate/call
+                    (fn [_cfg method _params]
+                      (case method
+                        :get-organization-membership {:is-member false
+                                                      :organization-id organization-id}
+                        :get-organization-summary {:id organization-id
+                                                   :owner-id (:id profile)
+                                                   :teams []}
+                        :get-organization-sso {:active true
+                                               :issuer "https://idp.example.com"
+                                               :organization-id organization-id}
+                        nil))
+                    oidc/build-organization-sso-auth-redirect-uri
+                    (constantly redirect-uri)]
+        (let [out (th/command! params)]
+          (t/is (th/success? out))
+          (t/is (= {:authorized false
+                    :redirect-uri redirect-uri}
+                   (:result out))))))))
 
 (t/deftest nitrate-sso-required-error-resolves-the-team-from-the-file
   (t/testing "the workspace path, where the file id arrives as :id, still reports the team"
@@ -584,6 +747,8 @@
                   :teams-to-transfer 0
                   :teams-to-exit 0
                   :teams-to-detach 0
+                  :team-ids-to-delete []
+                  :transferable-teams []
                   :member-added-at (ct/inst "2026-07-17T12:00:00Z")
                   :organization-member-count-before 2}
                  (:result out)))))))
@@ -618,9 +783,49 @@
                   :teams-to-transfer 0
                   :teams-to-exit 0
                   :teams-to-detach 1
+                  :team-ids-to-delete [(:id extra-team)]
+                  :transferable-teams []
                   :member-added-at (ct/inst "2026-07-17T12:00:00Z")
                   :organization-member-count-before 2}
                  (:result out)))))))
+
+(t/deftest get-leave-organization-summary-lists-transferable-teams-with-members
+  (let [profile-owner  (th/create-profile* 1 {:is-active true})
+        profile-user   (th/create-profile* 2 {:is-active true})
+        ;; profile-user owns both; only pair-team has another member
+        solo-team      (th/create-team* 1 {:profile-id (:id profile-user)})
+        pair-team      (th/create-team* 2 {:profile-id (:id profile-user)})
+        _              (th/create-team-role* {:team-id    (:id pair-team)
+                                              :profile-id (:id profile-owner)
+                                              :role       :admin})
+        organization-default-team (th/create-team* 99 {:profile-id (:id profile-user)})
+
+        organization-id (uuid/random)
+        your-penpot-id  (:id organization-default-team)
+        organization-summary (make-organization-summary
+                              :organization-id organization-id
+                              :organization-name "Test Org"
+                              :owner-id (:id profile-owner)
+                              :your-penpot-teams [your-penpot-id]
+                              :organization-teams [(:id solo-team) (:id pair-team)])]
+
+    (with-redefs [nitrate/call (nitrate-organization-summary-only-mock organization-summary)]
+      (let [out    (th/command! {::th/type :get-leave-organization-summary
+                                 ::rpc/profile-id (:id profile-user)
+                                 :id organization-id
+                                 :default-team-id your-penpot-id})
+            result (:result out)]
+        (t/is (th/success? out))
+        (t/is (= 1 (:teams-to-transfer result)))
+        (t/is (= [(:id solo-team)] (:team-ids-to-delete result)))
+        ;; The members that can take over pair-team, without profile-user
+        (t/is (= [{:id      (:id pair-team)
+                   :name    (:name pair-team)
+                   :members [{:id       (:id profile-owner)
+                              :name     (:fullname profile-owner)
+                              :email    (:email profile-owner)
+                              :is-admin true}]}]
+                 (:transferable-teams result)))))))
 
 (t/deftest leave-organization-error-organization-owner-cannot-leave
   (let [profile-owner  (th/create-profile* 1 {:is-active true})
@@ -1155,7 +1360,7 @@
                                  :sso-active? true
                                  :set-team-params set-team-params})
                   teams/initialize-user-in-organization (fn [& _] nil)
-                  eml/send! (fn [params] (swap! sent conj params))]
+                  eml/send-template (fn [_cfg params] (swap! sent conj params))]
       (let [out (th/command! {::th/type :add-team-to-organization
                               ::rpc/profile-id (:id owner)
                               :team-id (:id team)
@@ -1172,7 +1377,7 @@
       (t/is (= #{"member302@example.com"} emails))
       (doseq [email-params @sent]
         (t/is (= organization-name (:organization-name email-params)))
-        (t/is (= eml/organization-setup-sso (::eml/factory email-params)))))))
+        (t/is (= "organization-setup-sso" (::eml/template email-params)))))))
 
 (t/deftest add-team-to-organization-deletes-external-invitations-for-unregistered-users
   (let [owner      (th/create-profile* 305 {:is-active true
@@ -1286,13 +1491,188 @@
                                  :team-id (:id team)
                                  :sso-active? false})
                   teams/initialize-user-in-organization (fn [& _] nil)
-                  eml/send! (fn [params] (swap! sent conj params))]
+                  eml/send-template (fn [_cfg params] (swap! sent conj params))]
       (let [out (th/command! {::th/type :add-team-to-organization
                               ::rpc/profile-id (:id owner)
                               :team-id (:id team)
                               :organization-id organization-id})]
         (t/is (th/success? out))
         (t/is (empty? @sent))))))
+
+;; The move-teams tests below simulate a second session: Nitrate answers
+;; with the permissions as they are at the moment of the call, as if the
+;; organization owner had changed them after the user opened the modal.
+
+(defn- move-team-nitrate-mock
+  [{:keys [owner-id team-id source-organization perms-by-organization-id calls]}]
+  (fn [_cfg method params]
+    (swap! calls conj method)
+    (case method
+      :get-organization-membership {:is-member true :organization-id (:organization-id params)}
+      :get-organization-members [owner-id]
+      :get-team-organization {:organization source-organization}
+      :get-organization-permissions (get perms-by-organization-id (:organization-id params))
+      :set-team-organization {:id team-id}
+      :get-organization-sso {:active false}
+      :get-organization-summary {:id (:organization-id params) :teams [{:id team-id}]}
+      nil)))
+
+(t/deftest remove-team-from-organization-follows-move-teams
+  (doseq [[i move-teams allowed?] [[401 "always" true]
+                                   [402 "myOrganizations" false]
+                                   [403 "never" false]]]
+    (t/testing move-teams
+      (let [owner           (th/create-profile* i {:is-active true})
+            team            (th/create-team* i {:profile-id (:id owner)})
+            organization-id (uuid/random)
+            calls           (atom [])]
+        (with-redefs [cf/flags (conj cf/flags :admin-console)
+                      nitrate/call (move-team-nitrate-mock
+                                    {:owner-id (:id owner)
+                                     :team-id (:id team)
+                                     :perms-by-organization-id
+                                     {organization-id {:owner-id (uuid/random)
+                                                       :permissions {:move-teams move-teams}}}
+                                     :calls calls})]
+          (let [out (th/command! {::th/type :remove-team-from-organization
+                                  ::rpc/profile-id (:id owner)
+                                  :team-id (:id team)
+                                  :organization-id organization-id
+                                  :organization-name "Org"})]
+            (if allowed?
+              (t/is (th/success? out))
+              (t/is (= :not-allowed (th/ex-code (:error out)))))
+            (t/is (= allowed?
+                     (contains? (set @calls) :remove-team-from-organization)))))))))
+
+(t/deftest add-team-to-organization-move-follows-move-teams
+  (doseq [[i desc move-teams same-owner? requester-owns-organization? allowed?]
+          [[411 "myOrganizations, same owner" "myOrganizations" true false true]
+           [412 "myOrganizations, other owner" "myOrganizations" false false false]
+           [413 "never" "never" true false false]
+           [414 "never, organization owner" "never" true true false]]]
+    (t/testing desc
+      (let [owner              (th/create-profile* i {:is-active true})
+            team               (th/create-team* i {:profile-id (:id owner)})
+            source-id          (uuid/random)
+            target-id          (uuid/random)
+            source-owner-id    (if requester-owns-organization? (:id owner) (uuid/random))
+            target-owner-id    (if same-owner? source-owner-id (uuid/random))
+            calls              (atom [])]
+        (with-redefs [cf/flags (conj cf/flags :admin-console)
+                      nitrate/call (move-team-nitrate-mock
+                                    {:owner-id (:id owner)
+                                     :team-id (:id team)
+                                     :source-organization {:id source-id}
+                                     :perms-by-organization-id
+                                     {source-id {:owner-id source-owner-id
+                                                 :permissions {:create-teams "any"
+                                                               :move-teams move-teams}}
+                                      target-id {:owner-id target-owner-id
+                                                 :permissions {:create-teams "any"
+                                                               :move-teams "always"}}}
+                                     :calls calls})
+                      teams/initialize-user-in-organization (fn [& _] nil)]
+          (let [out (th/command! {::th/type :add-team-to-organization
+                                  ::rpc/profile-id (:id owner)
+                                  :team-id (:id team)
+                                  :organization-id target-id})]
+            (if allowed?
+              (t/is (th/success? out))
+              (t/is (= :not-allowed (th/ex-code (:error out)))))
+            (t/is (= allowed?
+                     (contains? (set @calls) :set-team-organization)))))))))
+
+(t/deftest remove-team-from-organization-follows-move-team-restriction
+  (doseq [[i restrictions-met allowed?] [[431 {:move-teams false} false]
+                                         [432 {:move-teams true} true]]]
+    (t/testing (str "move-teams restriction met=" (:move-teams restrictions-met))
+      (let [owner           (th/create-profile* i {:is-active true})
+            team            (th/create-team* i {:profile-id (:id owner)})
+            organization-id (uuid/random)
+            perms-params    (atom nil)
+            calls           (atom [])]
+        (with-redefs [cf/flags (conj cf/flags :admin-console)
+                      nitrate/call
+                      (fn [_cfg method params]
+                        (swap! calls conj method)
+                        (case method
+                          :get-organization-membership {:is-member true :organization-id (:organization-id params)}
+                          :get-organization-members [(:id owner)]
+                          :get-team-organization {:organization nil}
+                          :get-organization-permissions
+                          (do
+                            (reset! perms-params params)
+                            {:owner-id (uuid/random)
+                             :permissions {:move-teams "always"}
+                             :restrictions-met restrictions-met})
+                          :remove-team-from-organization nil
+                          nil))]
+          (let [out (th/command! {::th/type :remove-team-from-organization
+                                  ::rpc/profile-id (:id owner)
+                                  :team-id (:id team)
+                                  :organization-id organization-id
+                                  :organization-name "Org"})]
+            (if allowed?
+              (t/is (th/success? out))
+              (t/is (= :not-allowed (th/ex-code (:error out)))))
+            ;; the caller's profile-id travels to the permissions lookup
+            (t/is (= (:id owner) (::rpc/profile-id @perms-params)))
+            (t/is (= allowed?
+                     (contains? (set @calls) :remove-team-from-organization)))))))))
+
+(t/deftest add-team-to-organization-follows-move-and-create-restrictions
+  (doseq [[i desc source-met target-met allowed?]
+          [[441 "source move restriction not met" {:move-teams false} {:create-teams true} false]
+           [442 "target create restriction not met" {:move-teams true} {:create-teams false} false]
+           [443 "both met" {:move-teams true} {:create-teams true} true]]]
+    (t/testing desc
+      (let [owner           (th/create-profile* i {:is-active true})
+            team            (th/create-team* i {:profile-id (:id owner)})
+            source-id       (uuid/random)
+            target-id       (uuid/random)
+            org-owner-id    (uuid/random)
+            perms-params    (atom [])
+            calls           (atom [])]
+        (with-redefs [cf/flags (conj cf/flags :admin-console)
+                      nitrate/call
+                      (fn [_cfg method params]
+                        (swap! calls conj method)
+                        (case method
+                          :get-organization-membership {:is-member true :organization-id (:organization-id params)}
+                          :get-organization-members [(:id owner)]
+                          :get-team-organization
+                          (do
+                            (swap! perms-params conj params)
+                            {:organization {:id source-id}})
+                          :get-organization-permissions
+                          (do
+                            (swap! perms-params conj params)
+                            (cond
+                              (= (:organization-id params) source-id)
+                              {:owner-id org-owner-id
+                               :permissions {:create-teams "any" :move-teams "always"}
+                               :restrictions-met source-met}
+                              (= (:organization-id params) target-id)
+                              {:owner-id org-owner-id
+                               :permissions {:create-teams "any" :move-teams "always"}
+                               :restrictions-met target-met}))
+                          :set-team-organization {:id (:id team)}
+                          :get-organization-sso {:active false}
+                          :get-organization-summary {:id (:organization-id params) :teams [{:id (:id team)}]}
+                          nil))
+                      teams/initialize-user-in-organization (fn [& _] nil)]
+          (let [out (th/command! {::th/type :add-team-to-organization
+                                  ::rpc/profile-id (:id owner)
+                                  :team-id (:id team)
+                                  :organization-id target-id})]
+            (if allowed?
+              (t/is (th/success? out))
+              (t/is (= :not-allowed (th/ex-code (:error out)))))
+            ;; every gating lookup carries the caller's profile-id
+            (t/is (every? #(= (:id owner) (::rpc/profile-id %)) @perms-params))
+            (t/is (= allowed?
+                     (contains? (set @calls) :set-team-organization)))))))))
 
 (t/deftest get-nitrate-activation-code-request
   (let [profile    (th/create-profile* 1 {:is-active true})

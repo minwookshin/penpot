@@ -87,13 +87,11 @@ impl TryFrom<&[u8]> for RawFillData {
 // FIXME: return Result
 pub fn read_fills_from_bytes(buffer: &[u8], num_fills: usize) -> Vec<shapes::Fill> {
     buffer
-        .chunks_exact(RAW_FILL_DATA_SIZE)
+        .as_chunks::<RAW_FILL_DATA_SIZE>()
+        .0
+        .iter()
         .take(num_fills)
-        .map(|bytes| {
-            RawFillData::try_from(bytes)
-                .expect("Invalid fill data")
-                .into()
-        })
+        .map(|bytes| RawFillData::from(*bytes).into())
         .collect()
 }
 
@@ -179,7 +177,8 @@ mod tests {
 
     #[test]
     fn test_image_fill_round_trip() {
-        let image_fill = shapes::ImageFill::new(crate::uuid::Uuid::nil(), 0x80, 300, 200, true);
+        let image_fill =
+            shapes::ImageFill::new(crate::uuid::Uuid::nil(), 0x80, 300, 200, true).with_mtype(0x02);
         let fill = shapes::Fill::Image(image_fill);
         let raw_fill = RawFillData::try_from(&fill).expect("image fill must be serializable");
         let bytes = <[u8; RAW_FILL_DATA_SIZE]>::from(raw_fill);

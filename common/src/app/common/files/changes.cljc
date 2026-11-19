@@ -264,6 +264,7 @@
      ;; All props are optional, background can be nil because is the
      ;; way to remove already set background
      [:background {:optional true} [:maybe ctc/schema:hex-color]]
+     [:background-token {:optional true} [:maybe cto/schema:token-name]]
      [:name {:optional true} :string]
      ;; Pixel grid display controls — nil removes the per-page override
      ;; and falls back to the default hardcoded grid color/opacity.
@@ -406,6 +407,12 @@
      [:theme-ids [:set ::sm/uuid]]
      [:set-ids [:set ::sm/uuid]]]]
 
+   [:set-own-tokens-status
+    [:map {:title "SetOwnTokensStatus"}
+     [:type [:= :set-own-tokens-status]]
+     [:theme-ids [:maybe [:set ::sm/uuid]]]
+     [:set-ids [:maybe [:set ::sm/uuid]]]]]
+
    [:rename-token-set-group
     [:map {:title "RenameTokenSetGroup"}
      [:type [:= :rename-token-set-group]]
@@ -516,6 +523,59 @@
    (binding [*touched-changes* (volatile! #{})]
      (let [result (reduce #(or (process-change %1 %2) %1) data items)]
        (reduce process-touched-change result @*touched-changes*)))))
+
+(defn- get-frame-descendant-ids
+  "Ids below `id` whose `:frame-id` a move rewrites; the walk stops at
+  boards, as `update-frame-id` in `:mov-objects` does."
+  [objects id]
+  (let [shape (get objects id)]
+    (when-not (cfh/frame-shape? shape)
+      (mapcat #(cons % (get-frame-descendant-ids objects %))
+              (get shape :shapes)))))
+
+(defn- get-change-candidate-ids
+  [old-objects new-objects change]
+  (case (:type change)
+    :add-obj
+    (let [parent-id (or (:parent-id change) (:frame-id change))]
+      [(:id change)
+       (if (contains? new-objects parent-id) parent-id uuid/zero)])
+
+    (:mod-obj :fix-obj)
+    [(:id change)]
+
+    :del-obj
+    (let [id     (:id change)
+          target (get old-objects id)]
+      (when (some? target)
+        (into [id (or (:parent-id target) (:frame-id target))]
+              (cfh/get-children-ids old-objects id))))
+
+    :mov-objects
+    (let [shapes (:shapes change)]
+      (-> [(:parent-id change)]
+          (into shapes)
+          (into (keep #(dm/get-in old-objects [% :parent-id])) shapes)
+          (into (mapcat #(get-frame-descendant-ids new-objects %)) shapes)))
+
+    :reg-objects
+    (let [shapes (:shapes change)]
+      (into (vec shapes) (mapcat #(cfh/get-parent-ids new-objects %)) shapes))
+
+    :reorder-children
+    [(:parent-id change)]
+
+    nil))
+
+(defn get-candidate-object-ids
+  "Ids on `page-id` that `changes` may have added, edited or removed;
+  it may hold unchanged ids but never misses a changed one."
+  [old-objects new-objects page-id changes]
+  (into #{}
+        (comp (filter #(= page-id (:page-id %)))
+              (mapcat #(get-change-candidate-ids old-objects new-objects %))
+              (remove nil?))
+        changes))
 
 ;; --- Comment Threads
 
@@ -646,6 +706,7 @@
   [objects {:keys [parent-id shapes allow-altering-copies] :as change}]
   (if-let [old-shapes (dm/get-in objects [parent-id :shapes])]
     ;; Component sync owns copy child ordering.
+    ;; The worker replays this on trimmed shapes: see `app.worker.trim`.
     (if (and (not allow-altering-copies)
              (ctk/in-component-copy? (get objects parent-id)))
       objects
@@ -699,9 +760,14 @@
                   xform     (comp
                              (mapcat #(cons % (cfh/get-parent-ids objects %)))
                              (filter #(contains? #{:group :bool} (-> % lookup :type)))
-                             (distinct))]
+                             (distinct)
+                             (map (fn [id] [id (count (cfh/get-parent-ids objects id))])))]
 
               (->> (sequence xform shapes)
+                   ;; Recalculate every affected child before its parents,
+                   ;; including parents shared by multiple changed branches.
+                   (sort-by second >)
+                   (map first)
                    (reduce update-fn objects))))
 
           (set-mask-selrect [group children]
@@ -724,6 +790,7 @@
                              (empty? children)
                              group
 
+                             ;; The worker replays this on trimmed shapes: see `app.worker.trim`.
                              (= :bool (:type group))
                              (path/update-bool-shape group objects)
 
@@ -752,6 +819,7 @@
           ;; Avoid placing a shape as a direct or indirect child of itself, or
           ;; inside its main component if it's in a copy, or inside a copy, or
           ;; from a copy
+          ;; The worker replays this on trimmed shapes: see `app.worker.trim`.
           (is-valid-move? [objects shape-id]
             (let [invalid-targets (calculate-invalid-targets objects shape-id)
                   shape (get objects shape-id)]
@@ -862,6 +930,13 @@
   (when (and id name page)
     (ex/raise :type :conflict
               :hint "id+name or page should be provided, never both"))
+
+  ;; NOTE: we only perform hard validation on backend. The page arrives
+  ;; whole (duplicate page, undo of a page deletion), as the client holds
+  ;; it, so each of its shapes is validated as `:add-obj` validates one.
+  #?(:clj (doseq [shape (vals (:objects page))]
+            (validate-shape shape (:id page))))
+
   (let [page (if (and (string? name) (uuid? id))
                (ctp/make-empty-page {:id id :name name})
                page)]
@@ -873,6 +948,7 @@
                     (fn [page]
                       (let [name       (get params :name)
                             bg         (get params :background :not-found)
+                            bg-token   (get params :background-token :not-found)
                             grid-color (get params :pixel-grid-color :not-found)
                             grid-op    (get params :pixel-grid-opacity :not-found)]
                         (cond-> page
@@ -884,6 +960,12 @@
 
                           (nil? bg)
                           (dissoc :background)
+
+                          (string? bg-token)
+                          (assoc :background-token bg-token)
+
+                          (and (not= bg-token :not-found) (nil? bg-token))
+                          (dissoc :background-token)
 
                           (string? grid-color)
                           (assoc :pixel-grid-color grid-color)
@@ -1053,6 +1135,13 @@
   [data {:keys [theme-ids set-ids]}]
   (-> (cfo/ensure-tokens-lib data)
       (cfo/update-tokens-status ctos/set-tokens-status theme-ids set-ids)))
+
+(defmethod process-change :set-own-tokens-status
+  [data {:keys [theme-ids set-ids]}]
+  (cfo/set-own-tokens-status data
+                             (when (or (some? theme-ids) (some? set-ids))
+                               (ctos/make-tokens-status :active-theme-ids theme-ids
+                                                        :active-set-ids set-ids))))
 
 (defmethod process-change :rename-token-set-group
   [data {:keys [set-group-path set-group-fname]}]

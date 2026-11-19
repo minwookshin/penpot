@@ -60,8 +60,8 @@
 (def varia
   "Rest of the flags"
   #{:audit-log
-    :audit-log-archive
-    :audit-log-gc
+    ;; Enables shipping audit_log chunks to Nexus.
+    :nexus
     :audit-log-logger
     :auto-file-snapshot
     ;; enables the `/api/doc` endpoint that lists all the rpc methods available.
@@ -84,6 +84,10 @@
     :demo-users
     ;; disabled by default. When enabled, it displays a warning that this is a test instance and data will be deleted periodically.
     :demo-warning
+    ;; disabled by default. When enabled, server errors are persisted
+    ;; on the database (server-error-report) and notified to mattermost
+    ;; (only when the webhook url is also configured).
+    :error-reporting
     ;; Activates the schema validation during update file.
     :file-schema-validation
     ;; Reports the schema validation errors internally.
@@ -92,12 +96,18 @@
     :file-validation
     ;; Reports the referential integrity validation errors internally.
     :soft-file-validation
+    ;; Disabled by default; never enable it in production. Lets a save
+    ;; carry a marker that makes the backend fail it with a chosen error
+    ;; (frontend `debug.failNextSave`).
+    :debug-save-faults
     ;; TODO: deprecate this flag and consolidate the code
     :frontend-svgo
     ;; TODO: deprecate this flag and consolidate the code
     :exporter-svgo
     ;; TODO: deprecate this flag and consolidate the code
     :backend-svgo
+    ;; Enables account lockout after repeated failed login attempts.
+    :account-lockout
     ;; If enabled, it makes the Google Fonts available.
     :google-fonts-provider
     ;; Enables the Ladybug graph subsystem: the `/dbg` graph console and its
@@ -168,7 +178,7 @@
     ;; redis for caching data
     :redis-cache
 
-    ;; Activates the admin-console module
+    ;; enabled by default. Activates the admin-console module
     :admin-console
 
     ;; disabled by default. When enabled, allows the admin-console
@@ -181,17 +191,19 @@
     :available-viewer-wasm
     :stroke-path
     :stroke-per-side
+    ;; Enables bullet lists in the v3 (WASM) text editor.
+    :text-editor-wasm-v1-lists
 
-    ;; Exporter only: uses render-wasm for export instead of browser
-    ;; renderer.
-    :wasm-export
     :custom-shortcuts
     :remote-media-processing
 
     ;; Enables serving link preview (Open Graph) metadata for shared
     ;; links; exposes file names and dashboard thumbnails to anyone
     ;; that knows the file id.
-    :link-preview})
+    :link-preview
+
+    ;; Shows the "link later" option on the files export modal.
+    :export-link-later})
 
 (def all-flags
   (set/union email login varia))
@@ -220,13 +232,18 @@
    :enable-inspect-styles
    :enable-feature-fdata-objects-map
    :enable-feature-render-wasm
+   :enable-feature-text-editor-wasm-html-paste
    :enable-token-import-from-library
    :enable-render-switch
    :enable-render-wasm-info
    :enable-available-viewer-wasm
    :enable-background-blur
    :enable-stroke-path
-   :enable-token-combobox])
+   :enable-stroke-per-side
+   :enable-token-combobox
+   :enable-custom-shortcuts
+   :enable-token-lib-sync
+   :enable-admin-console])
 
 (defn parse
   [& flags]

@@ -20,7 +20,7 @@
    [app.main.ui.components.title-bar :refer [title-bar*]]
    [app.main.ui.ds.buttons.button :refer [button*]]
    [app.main.ui.ds.buttons.icon-button :refer [icon-button*]]
-   [app.main.ui.ds.foundations.assets.icon :as i]
+   [app.main.ui.ds.foundations.assets.icon :as i :refer [icon*]]
    [app.main.ui.icons :as deprecated-icon]
    [app.plugins.register :as preg]
    [app.util.avatars :as avatars]
@@ -30,9 +30,6 @@
    [beicon.v2.core :as rx]
    [cuerdas.core :as str]
    [rumext.v2 :as mf]))
-
-(def ^:private close-icon
-  (deprecated-icon/icon-xref :close (stl/css :close-icon)))
 
 (defn- normalize-plugin-url
   "Automatically appens manifest.json if the plugin-uri comes without it."
@@ -56,7 +53,7 @@
           icon))
 
 (mf/defc plugin-entry*
-  [{:keys [index manifest user-can-edit on-open-plugin on-remove-plugin]}]
+  [{:keys [index manifest user-can-edit on-open-plugin on-remove-plugin remove-disabled]}]
 
   (let [{:keys [plugin-id host icon name description permissions]} manifest
         plugins-permissions-peek (deref refs/plugins-permissions-peek)
@@ -86,8 +83,8 @@
                     (icon-url host icon)
                     (avatars/generate {:name name}))}]]
      [:div {:class (stl/css :plugin-description)}
-      [:div {:class (stl/css :plugin-title)} name]
-      [:div {:class (stl/css :plugin-summary)} (d/nilv description "")]]
+      [:div {:class (stl/css :plugin-title) :title name} name]
+      [:div {:class (stl/css :plugin-summary) :title description} (d/nilv description "")]]
 
 
      [:> button* {:class (stl/css :open-button)
@@ -100,6 +97,7 @@
      [:> icon-button* {:variant "ghost"
                        :aria-label (tr "workspace.plugins.remove-plugin")
                        :on-click handle-delete-click
+                       :disabled remove-disabled
                        :icon i/delete}]]))
 
 (mf/defc plugin-management-dialog
@@ -113,18 +111,23 @@
         plugin-url*     (mf/use-state "")
         plugin-url      (deref plugin-url*)
 
-        input-status*   (mf/use-state nil) ;; :error-url :error-manifest :success
+        input-status*   (mf/use-state nil) ;; :error-url :error-manifest :error-global :success
         input-status    (deref input-status*)
 
         error-url?      (= :error-url input-status)
         error-manifest? (= :error-manifest input-status)
-        error?          (or error-url? error-manifest?)
+        error-global?   (= :error-global input-status)
+        error?          (or error-url? error-manifest? error-global?)
 
         permissions     (mf/deref refs/permissions)
         user-can-edit?  (get permissions :can-edit)
 
         fetching-manifest?
         (mf/use-state false)
+
+        ;; Ids with a persist in flight; their remove button is disabled
+        in-flight*
+        (mf/use-state #{})
 
         on-url-change
         (mf/use-fn
@@ -157,7 +160,10 @@
                  (fn [err]
                    (.error js/console err)
                    (reset! fetching-manifest? false)
-                   (reset! input-status* :error-url))))))
+                   (reset! input-status*
+                           (if (= ::preg/global-not-allowed (:type (ex-data err)))
+                             :error-global
+                             :error-url)))))))
 
         on-open-plugin
         (mf/use-fn
@@ -174,17 +180,43 @@
          (mf/deps plugins-state)
          (fn [plugin-index]
            (let [plugins-list (preg/plugins-list)
-                 plugin (nth plugins-list plugin-index)]
-             (st/emit! (ev/event {::ev/name "remove-plugin"
-                                  :name (:name plugin)
-                                  :host (:host plugin)}))
-             (dp/close-plugin! plugin)
-             (preg/remove-plugin! plugin)
-             (reset! plugins-state* (preg/plugins-list)))))]
+                 plugin       (nth plugins-list plugin-index)
+                 plugin-name  (:name plugin)
+                 ;; Truncated so long names fit the confirm dialog
+                 plugin-name  (if (> (count plugin-name) 60)
+                                (str (subs plugin-name 0 60) "…")
+                                plugin-name)]
+             (modal/show!
+              {:type :confirm
+               :title (tr "workspace.plugins.remove-confirmation.title")
+               :message (tr "workspace.plugins.remove-confirmation.message" plugin-name)
+               :accept-label (tr "workspace.plugins.remove-plugin")
+               :on-accept (fn [_]
+                            (st/emit! (ev/event {::ev/name "remove-plugin"
+                                                 :name (:name plugin)
+                                                 :host (:host plugin)}))
+                            (dp/close-plugin! plugin)
+                            (preg/remove-plugin! plugin)
+                            (modal/show! :plugin-management {}))
+               :on-cancel (fn [_]
+                            (modal/show! :plugin-management {}))}))))]
+
+    (mf/with-effect []
+      (let [listener (preg/subscribe-in-flight! #(reset! in-flight* %))]
+        (partial preg/unsubscribe-in-flight! listener)))
+
+    ;; Re-reads the list on every registry change, including rollbacks
+    (mf/with-effect []
+      (let [listener (preg/subscribe-registry! #(reset! plugins-state* (preg/plugins-list)))]
+        (partial preg/unsubscribe-registry! listener)))
 
     [:div {:class (stl/css :modal-overlay)}
      [:div {:class (stl/css :modal-dialog :plugin-management)}
-      [:button {:class (stl/css :close-btn) :on-click modal/hide!} close-icon]
+      [:> icon-button* {:variant "ghost"
+                        :tooltip-class (stl/css :close-btn)
+                        :aria-label (tr "labels.close")
+                        :icon i/close
+                        :on-click modal/hide!}]
       [:div {:class (stl/css :modal-title)} (tr "workspace.plugins.title")]
 
       [:div {:class (stl/css :modal-content)}
@@ -195,9 +227,9 @@
                          :placeholder (tr "workspace.plugins.search-placeholder")
                          :class (stl/css-case :input-error error?)}]
 
-        [:button {:class (stl/css :primary-button)
-                  :disabled @fetching-manifest?
-                  :on-click on-install}
+        [:> button* {:variant "primary"
+                     :disabled @fetching-manifest?
+                     :on-click on-install}
          (tr "workspace.plugins.install")]]
 
        (when error-url?
@@ -207,6 +239,10 @@
        (when error-manifest?
          [:div {:class (stl/css-case :info true :error error?)}
           (tr "workspace.plugins.error.manifest")])
+
+       (when error-global?
+         [:div {:class (stl/css-case :info true :error error?)}
+          (tr "workspace.plugins.error.global-not-allowed")])
 
        (when-not (empty? plugins-state)
          [:> i18n/tr-html*
@@ -218,13 +254,17 @@
 
        (if (empty? plugins-state)
          [:div {:class (stl/css :plugins-empty)}
-          [:div {:class (stl/css :plugins-empty-logo)} deprecated-icon/puzzle]
+          [:div {:class (stl/css :plugins-empty-logo)}
+           [:> icon* {:icon-id i/puzzle :size "m"}]]
           [:div {:class (stl/css :plugins-empty-text)} (tr "workspace.plugins.empty-plugins")]
           [:a {:class (stl/css :plugins-link)
                :href cfg/plugins-list-uri
                :target "_blank"
                :on-click #(st/emit! (ev/event {::ev/name "open-plugins-list"}))}
-           (tr "workspace.plugins.plugin-list-link") deprecated-icon/external-link]]
+           (tr "workspace.plugins.plugin-list-link")
+           [:> icon* {:icon-id i/external-link
+                      :size "s"
+                      :class (stl/css :plugins-link-icon)}]]]
 
          [:*
           [:> title-bar* {:collapsable false
@@ -236,6 +276,7 @@
                                 :index idx
                                 :manifest manifest
                                 :user-can-edit user-can-edit?
+                                :remove-disabled (contains? @in-flight* (:plugin-id manifest))
                                 :on-open-plugin on-open-plugin
                                 :on-remove-plugin on-remove-plugin}])]])]]]))
 
@@ -304,6 +345,34 @@
        (tr "workspace.plugins.permissions.allow-localstorage")]])
 
    (cond
+     (contains? permissions "allow:global")
+     [:div {:class (stl/css :permissions-list-entry)}
+      deprecated-icon/oauth-1
+      [:p {:class (stl/css :permissions-list-text)}
+       (tr "workspace.plugins.permissions.allow-global")]])
+
+   (cond
+     (contains? permissions "manage:projects")
+     [:div {:class (stl/css :permissions-list-entry)}
+      deprecated-icon/oauth-1
+      [:p {:class (stl/css :permissions-list-text)}
+       (tr "workspace.plugins.permissions.manage-projects")]])
+
+   (cond
+     (contains? permissions "manage:teams")
+     [:div {:class (stl/css :permissions-list-entry)}
+      deprecated-icon/oauth-1
+      [:p {:class (stl/css :permissions-list-text)}
+       (tr "workspace.plugins.permissions.manage-teams")]])
+
+   (cond
+     (contains? permissions "manage:delete")
+     [:div {:class (stl/css :permissions-list-entry)}
+      deprecated-icon/oauth-1
+      [:p {:class (stl/css :permissions-list-text)}
+       (tr "workspace.plugins.permissions.manage-delete")]])
+
+   (cond
      (contains? permissions "clipboard:write")
      [:div {:class (stl/css :permissions-list-entry)}
       deprecated-icon/oauth-1
@@ -355,7 +424,11 @@
 
     [:div {:class (stl/css :modal-overlay)}
      [:div {:class (stl/css :modal-dialog :plugin-permissions)}
-      [:button {:class (stl/css :close-btn) :on-click on-close-dialog} close-icon]
+      [:> icon-button* {:variant "ghost"
+                        :tooltip-class (stl/css :close-btn)
+                        :aria-label (tr "labels.close")
+                        :icon i/close
+                        :on-click on-close-dialog}]
       [:div {:class (stl/css :modal-title)} (tr "workspace.plugins.permissions.title" (str/upper (:name plugin)))]
 
       [:div {:class (stl/css :modal-content)}
@@ -367,17 +440,15 @@
 
       [:div {:class (stl/css :modal-footer)}
        [:div {:class (stl/css :action-buttons)}
-        [:input
-         {:class (stl/css :cancel-button :button-expand)
-          :type "button"
-          :value (tr "ds.confirm-cancel")
-          :on-click on-close-dialog}]
+        [:> button* {:variant "secondary"
+                     :class (stl/css :button-expand)
+                     :on-click on-close-dialog}
+         (tr "ds.confirm-cancel")]
 
-        [:input
-         {:class (stl/css :primary-button :button-expand)
-          :type "button"
-          :value (tr "ds.confirm-allow")
-          :on-click on-accept-dialog}]]]]]))
+        [:> button* {:variant "primary"
+                     :class (stl/css :button-expand)
+                     :on-click on-accept-dialog}
+         (tr "ds.confirm-allow")]]]]]))
 
 
 (mf/defc plugins-permissions-updated-dialog
@@ -419,7 +490,11 @@
 
     [:div {:class (stl/css :modal-overlay)}
      [:div {:class (stl/css :modal-dialog :plugin-permissions)}
-      [:button {:class (stl/css :close-btn) :on-click on-close-dialog} close-icon]
+      [:> icon-button* {:variant "ghost"
+                        :tooltip-class (stl/css :close-btn)
+                        :aria-label (tr "labels.close")
+                        :icon i/close
+                        :on-click on-close-dialog}]
       [:div {:class (stl/css :modal-title)}
        (tr "workspace.plugins.permissions-update.title" (str/upper (:name plugin)))]
 
@@ -430,17 +505,15 @@
 
       [:div {:class (stl/css :modal-footer)}
        [:div {:class (stl/css :action-buttons)}
-        [:input
-         {:class (stl/css :cancel-button :button-expand)
-          :type "button"
-          :value (tr "ds.confirm-cancel")
-          :on-click on-close-dialog}]
+        [:> button* {:variant "secondary"
+                     :class (stl/css :button-expand)
+                     :on-click on-close-dialog}
+         (tr "ds.confirm-cancel")]
 
-        [:input
-         {:class (stl/css :primary-button :button-expand)
-          :type "button"
-          :value (tr "ds.confirm-allow")
-          :on-click on-accept-dialog}]]]]]))
+        [:> button* {:variant "primary"
+                     :class (stl/css :button-expand)
+                     :on-click on-accept-dialog}
+         (tr "ds.confirm-allow")]]]]]))
 
 
 (mf/defc plugins-try-out-dialog
@@ -474,7 +547,11 @@
 
     [:div {:class (stl/css :modal-overlay)}
      [:div {:class (stl/css :modal-dialog :plugin-try-out)}
-      [:button {:class (stl/css :close-btn) :on-click on-close-dialog} close-icon]
+      [:> icon-button* {:variant "ghost"
+                        :tooltip-class (stl/css :close-btn)
+                        :aria-label (tr "labels.close")
+                        :icon i/close
+                        :on-click on-close-dialog}]
       [:div {:class (stl/css :modal-title)}
        [:div {:class (stl/css :plugin-icon)}
         [:img {:src (if (some? icon)
@@ -488,14 +565,12 @@
 
       [:div {:class (stl/css :modal-footer)}
        [:div {:class (stl/css :action-buttons)}
-        [:input
-         {:class (stl/css :cancel-button :button-expand)
-          :type "button"
-          :value (tr "workspace.plugins.try-out.cancel")
-          :on-click on-close-dialog}]
+        [:> button* {:variant "secondary"
+                     :class (stl/css :button-expand)
+                     :on-click on-close-dialog}
+         (tr "workspace.plugins.try-out.cancel")]
 
-        [:input
-         {:class (stl/css :primary-button :button-expand)
-          :type "button"
-          :value (tr "workspace.plugins.try-out.try")
-          :on-click on-accept-dialog}]]]]]))
+        [:> button* {:variant "primary"
+                     :class (stl/css :button-expand)
+                     :on-click on-accept-dialog}
+         (tr "workspace.plugins.try-out.try")]]]]]))

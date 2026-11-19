@@ -57,7 +57,9 @@
 
 (def ^:private schema:pool-options
   [:map {:title "pool-options"}
-   [::connect-timeout {:optional true} ::sm/int]
+   [::connection-timeout {:optional true} ::sm/int]
+   [::idle-timeout {:optional true} ::sm/int]
+   [::max-lifetime {:optional true} ::sm/int]
    [::max-size {:optional true} ::sm/int]
    [::min-size {:optional true} ::sm/int]
    [::name {:optional true} :keyword]
@@ -65,10 +67,23 @@
    [::password {:optional true} :string]
    [::username {:optional true} :string]
    [::validation-timeout {:optional true} ::sm/int]
-   [::read-only {:optional true} ::sm/boolean]])
+   [::read-only {:optional true} ::sm/boolean]
+   ;; pgjdbc prepared statement cache. Absent keys mean the driver
+   ;; defaults; the size is in bytes and is converted to whole MiB for
+   ;; the driver (see create-datasource-config). The threshold is the
+   ;; executions before a statement is server-prepared: 0 stops
+   ;; server-side prepared statements (the cache of parsed queries stays
+   ;; in use) and -1 prepares from the first execution. Any other
+   ;; negative is a typo the driver would clamp to -1, so the schema
+   ;; rejects it.
+   [::prepared-statement-cache-threshold {:optional true} [::sm/int {:min -1}]]
+   [::prepared-statement-cache-queries {:optional true} [::sm/int {:min 0}]]
+   [::prepared-statement-cache-size {:optional true} [::sm/int {:min 0}]]
+   [::mtx/metrics ::mtx/metrics]])
 
 (def defaults
   {::name :main
+   ::min-size 0
    ::max-size 60
    ::connection-timeout 30000
    ::validation-timeout 10000
@@ -91,9 +106,11 @@
               :read-only read-only
               :credentials (and (contains? cfg ::username)
                                 (contains? cfg ::password))
-              :min-size (or (::min-size cfg)
-                            (::max-size cfg))
-              :max-size (::max-size cfg))
+              :min-size (::min-size cfg)
+              :max-size (::max-size cfg)
+              :prepared-statement-cache-threshold (::prepared-statement-cache-threshold cfg)
+              :prepared-statement-cache-queries (::prepared-statement-cache-queries cfg)
+              :prepared-statement-cache-size (::prepared-statement-cache-size cfg))
       (create-pool cfg))))
 
 (defmethod ig/halt-key! ::pool
@@ -107,15 +124,27 @@
 
 (def initsql
   (str "SET statement_timeout = 300000;\n"
-       "SET idle_in_transaction_session_timeout = 300000;"))
+       "SET idle_in_transaction_session_timeout = 300000;\n"
+       ;; lets the planner resolve a join between two partitioned tables
+       ;; pairwise, when both are partitioned with the same bounds
+       "SET enable_partitionwise_join = on;"))
+
+;; pgjdbc reads dataSourceProperties through Properties.getProperty, which
+;; drops non-String values silently, so everything is passed as a string.
+;; preparedStatementCacheSizeMiB only accepts a whole-MiB integer: the
+;; configured size (bytes) is converted up, so any positive value keeps the
+;; cache enabled and 0 disables the cache. A query parameter of the same name
+;; in the URI wins over these properties: pgjdbc ignores the Properties value
+;; when the URL carries it.
+(defn- bytes->mib-ceil
+  [bytes]
+  (Math/ceilDiv (long bytes) (* 1024 1024)))
 
 (defn- create-datasource-config
   [{:keys [::uri] :as cfg}]
 
   ;; (app.common.pprint/pprint cfg)
-  (let [config   (HikariConfig.)
-        max-size (::max-size cfg)
-        min-size (or (::min-size cfg) max-size)]
+  (let [config (HikariConfig.)]
     (doto config
       (.setJdbcUrl           (str "jdbc:" uri))
       (.setPoolName          (d/name (::name cfg)))
@@ -125,16 +154,21 @@
       (.setValidationTimeout (::validation-timeout cfg))
       (.setIdleTimeout       (::idle-timeout cfg))
       (.setMaxLifetime       (::max-lifetime cfg))
-      (.setMinimumIdle       min-size)
-      (.setMaximumPoolSize   max-size)
+      (.setMinimumIdle       (::min-size cfg))
+      (.setMaximumPoolSize   (::max-size cfg))
       (.setConnectionInitSql initsql)
       (.setInitializationFailTimeout -1))
 
-    ;; When metrics namespace is provided
-    (when-let [instance (::mtx/metrics cfg)]
-      (->> (mtx/get-registry instance)
-           (PrometheusMetricsTrackerFactory.)
-           (.setMetricsTrackerFactory config)))
+    (some->> (::prepared-statement-cache-threshold cfg) (str)
+             (.addDataSourceProperty config "prepareThreshold"))
+    (some->> (::prepared-statement-cache-queries cfg) (str)
+             (.addDataSourceProperty config "preparedStatementCacheQueries"))
+    (some->> (::prepared-statement-cache-size cfg) (bytes->mib-ceil) (str)
+             (.addDataSourceProperty config "preparedStatementCacheSizeMiB"))
+
+    (->> (mtx/get-registry (::mtx/metrics cfg))
+         (PrometheusMetricsTrackerFactory.)
+         (.setMetricsTrackerFactory config))
 
     (some->> ^String (::username cfg) (.setUsername config))
     (some->> ^String (::password cfg) (.setPassword config))
@@ -584,12 +618,70 @@
      (l/trc :hint "explicit rollback requested (savepoint)")
      (.rollback conn sp))))
 
+(def ^:dynamic *after-commit-context* nil)
+
+;; the connection the ambient transaction owns, bound by `transact!` for
+;; the extent of its body. It is what tells a nested call (same
+;; connection) from an independent one (any other).
+(def ^:dynamic *after-commit-conn* nil)
+
+(defn- run-after-commit-callbacks
+  [callbacks]
+  (doseq [callback callbacks]
+    (try
+      (callback)
+      (catch Throwable cause
+        (l/wrn :hint "after-commit callback failed" :cause cause)))))
+
+(defn after-commit
+  "Run a callback after the current transaction commits.
+
+  The callback runs immediately when called outside a transaction.
+
+  Nesting follows the connection, not an ambient flag. A transaction
+  opened on the connection the surrounding one owns is part of it and
+  shares its context, so callbacks are never drained before the
+  transaction that owns the connection commits. A transaction opened on
+  any other connection is an independent unit of work: it owns its
+  context, drains its callbacks at its own commit and drops them if it
+  rolls back."
+  [f]
+  (if *after-commit-context*
+    (swap! *after-commit-context* conj f)
+    (f)))
+
+(defn- joins-transaction?
+  "True when `transactable` is the very connection the ambient
+  transaction owns, which is what makes this call part of it."
+  [transactable]
+  (boolean
+   (and *after-commit-conn*
+        (identical? transactable *after-commit-conn*))))
+
 (defn transact!
   "A lower-level function for executing function in a transaction"
   ([transactable f] (transact! transactable f {}))
   ([transactable f opts]
-   (binding [next.jdbc.transaction/*nested-tx* :ignore]
-     (jdbc/transact transactable f opts))))
+   (if (joins-transaction? transactable)
+     (binding [next.jdbc.transaction/*nested-tx* :ignore]
+       (jdbc/transact transactable f opts))
+     (let [context (atom [])]
+       (try
+         (let [result (binding [*after-commit-context* context]
+                        (binding [next.jdbc.transaction/*nested-tx* :ignore]
+                          (jdbc/transact
+                           transactable
+                           (fn [conn]
+                             (binding [*after-commit-conn* conn]
+                               (f conn)))
+                           opts)))]
+           ;; a rollback-only transaction commits nothing, so its
+           ;; callbacks have nothing to follow
+           (when-not (:rollback-only opts)
+             (run-after-commit-callbacks @context))
+           result)
+         (finally
+           (reset! context [])))))))
 
 (defn tx-run!
   "Run a function in a transaction."

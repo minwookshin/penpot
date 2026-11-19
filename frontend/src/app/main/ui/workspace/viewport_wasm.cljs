@@ -11,10 +11,12 @@
    [app.common.data.macros :as dm]
    [app.common.files.helpers :as cfh]
    [app.common.geom.shapes :as gsh]
+   [app.common.render-wasm.api.select :as wselect]
    [app.common.types.color :as clr]
    [app.common.types.component :as ctk]
    [app.common.types.shape :as cts]
    [app.common.types.shape.layout :as ctl]
+   [app.main.data.event :as ev]
    [app.main.data.modal :as modal]
    [app.main.data.workspace :as dw]
    [app.main.data.workspace.transforms :as dwt]
@@ -25,6 +27,7 @@
    [app.main.ui.context :as ctx]
    [app.main.ui.flex-controls :as mfc]
    [app.main.ui.hooks :as ui-hooks]
+   [app.main.ui.hooks.wasm-effect :refer [with-wasm-effect]]
    [app.main.ui.measurements :as msr]
    [app.main.ui.workspace.shapes.path.editor :refer [path-editor*]]
    [app.main.ui.workspace.shapes.text.editor :as editor-v1]
@@ -57,6 +60,7 @@
    [app.main.ui.workspace.viewport.viewport-ref :as vp-ref :refer [create-viewport-ref]]
    [app.main.ui.workspace.viewport.widgets :as widgets]
    [app.render-wasm.api :as wasm.api]
+   [app.render-wasm.api.webgl :as webgl]
    [app.render-wasm.rulers-state :as rs]
    [app.util.debug :as dbg]
    [app.util.text-editor :as ted]
@@ -68,6 +72,10 @@
    [rumext.v2 :as mf]))
 
 ;; --- Viewport
+
+;; Retries after the first failed WebGL context init before showing the
+;; "WebGL unavailable" modal.
+(def ^:private ^:const max-init-retries 3)
 
 (defn- apply-modifiers-to-objects
   [objects modifiers]
@@ -201,9 +209,21 @@
           [base-objects wasm-modifiers]
           (apply-modifiers-to-selected selected base-objects wasm-modifiers))
 
-        selected-shapes   (->> selected
-                               (into [] (keep (d/getf objects-modified)))
-                               (not-empty))
+        selected-shapes   (mf/with-memo [selected objects-modified]
+                            (->> selected
+                                 (into [] (keep (d/getf objects-modified)))
+                                 (not-empty)))
+
+        ;; True when at least one selected shape can be alt-duplicated.
+        ;; Inner shapes of component copies are excluded by ctk/allow-duplicate?
+        can-alt-duplicate? (mf/with-memo [selected base-objects]
+                             (some #(ctk/allow-duplicate? base-objects %)
+                                   (map (d/getf base-objects) selected)))
+
+        selected-shapes'  (ui-hooks/use-throttle 100 selected-shapes)
+        badge-shapes      (if (= transform :resize)
+                            selected-shapes'
+                            selected-shapes)
         ;; STATE
         alt?                 (mf/use-state false)
         shift?               (mf/use-state false)
@@ -442,26 +462,33 @@
     ;;       canvas, even though we are not using `page-id` inside the hook.
     ;;       We think moving this out to a handler will make the render code
     ;;       harder to follow through.
-    (mf/with-effect [page-id]
+    (with-wasm-effect [page-id]
       (when-let [canvas (mf/ref-val canvas-ref)]
         (let [timeout-id-ref   (volatile! nil)
               unmounted?       (volatile! false)
               modal-shown?     (volatile! false)
+              init-error       (volatile! nil)
 
               show-unavailable
               (fn []
                 (when-not (or @unmounted? @modal-shown?)
                   (vreset! modal-shown? true)
                   (reset! canvas-init? false)
-                  (st/emit! (modal/show {:type :webgl-unavailable}))))
+                  (st/emit! (modal/show {:type :webgl-unavailable})
+                            (ev/event (assoc (webgl/get-environment)
+                                             ::ev/name "webgl-unavailable"
+                                             ::ev/origin "workspace"
+                                             :hint (or @init-error "no webgl2 context"))))))
 
               try-init
               (fn try-init [retries]
                 (when-not @unmounted?
+                  (vreset! init-error nil)
                   (let [init? (try
                                 (wasm.api/init-canvas-context canvas)
                                 (catch :default e
                                   (js/console.error "Error initializing canvas context:" e)
+                                  (vreset! init-error (ex-message e))
                                   false))]
                     (cond
                       init?
@@ -477,20 +504,20 @@
           (->> @wasm.api/module
                (p/fmap (fn [ready?]
                          (when ready?
-                           (try-init 3)))))
+                           (try-init max-init-retries)))))
           (fn []
             (vreset! unmounted? true)
             (when-let [timeout-id @timeout-id-ref]
               (js/clearTimeout timeout-id))
             (wasm.api/clear-canvas)))))
 
-    (mf/with-effect [show-text-editor? workspace-editor-state edition @canvas-init? @initialized?]
+    (with-wasm-effect [show-text-editor? workspace-editor-state edition @canvas-init? @initialized?]
       (let [active-editor-state (get workspace-editor-state edition)]
         (when (and show-text-editor? active-editor-state @canvas-init? @initialized?)
           (let [content (-> active-editor-state
                             (ted/get-editor-current-content)
                             (ted/export-content))]
-            (wasm.api/use-shape edition)
+            (wselect/use-shape edition)
             (wasm.api/set-shape-text-content edition content)
             (let [dimension (wasm.api/get-text-dimensions)]
               (st/emit! (dwt/resize-text-editor edition dimension))
@@ -506,16 +533,16 @@
                         (ts/raf (fn [_] (wasm.api/render-sync)))))]
           cancel)))
 
-    (mf/with-effect [vport]
+    (with-wasm-effect [vport]
       (when (and @canvas-init? @initialized?)
         (wasm.api/resize-canvas! (mf/ref-val canvas-ref))
         (wasm.api/set-view-box zoom vbox)))
 
-    (mf/with-effect [@canvas-init? preview-blend]
+    (with-wasm-effect [@canvas-init? preview-blend]
       (when (and @canvas-init? preview-blend)
         (wasm.api/request-render "with-effect")))
 
-    (mf/with-effect [@canvas-init? vern zoom vbox background]
+    (with-wasm-effect [@canvas-init? vern zoom vbox background]
       (when @canvas-init?
         (if (not @initialized?)
           (do
@@ -548,27 +575,27 @@
                     (wasm.api/clear-focus-mode)
                     (wasm.api/set-focus-mode focus)))))
 
-    (mf/with-effect [background]
+    (with-wasm-effect [background]
       (when (and @canvas-init? @initialized?)
         (wasm.api/set-canvas-background background)))
 
     ;; Grid overlay: `clear-grid` must run only when the overlay was shown and is now off
     ;; (e.g. leave grid frame, or `page-transition?`). Do not call it on every
     ;; `hover-top-frame-id` change while not hovering a grid frame.
-    (mf/with-effect [@canvas-init? hover-grid?]
+    (with-wasm-effect [@canvas-init? hover-grid?]
       (when @canvas-init?
         (when (and (not hover-grid?) (mf/ref-val prev-hover-grid-shown?-ref))
           (wasm.api/clear-grid))
         (mf/set-ref-val! prev-hover-grid-shown?-ref hover-grid?)))
 
-    (mf/with-effect [@canvas-init? has-grid? hover-grid?
-                     (if (and has-grid? hover-grid?) @hover-top-frame-id ::no-grid-hover-id)]
+    (with-wasm-effect [@canvas-init? has-grid? hover-grid?
+                       (if (and has-grid? hover-grid?) @hover-top-frame-id ::no-grid-hover-id)]
       (when (and @canvas-init? hover-grid?)
         (wasm.api/show-grid @hover-top-frame-id)))
 
     ;; Rulers-wasm: push visibility / offsets / selection band into the
     ;; render-wasm overlay (always active, no feature flag).
-    (mf/with-effect [@canvas-init?]
+    (with-wasm-effect [@canvas-init?]
       (when @canvas-init?
         (wasm.api/push-ruler-theme-colors!)
         (theme/add-color-scheme-listener!
@@ -579,7 +606,7 @@
     ;; Text-editor-wasm: push the theme colors (selection background, caret)
     ;; into the WASM text editor so the selection follows the design tokens per
     ;; theme (purple on light, teal on dark) instead of a hardcoded default.
-    (mf/with-effect [@canvas-init?]
+    (with-wasm-effect [@canvas-init?]
       (when @canvas-init?
         (wasm.api/text-editor-apply-theme)
         (theme/add-color-scheme-listener!
@@ -594,57 +621,57 @@
     ;; off a progressive tile-by-tile re-render that flashes) or a cached-atlas
     ;; blit (whose scale-capped atlas flashes crisp->blurry on zoomed-in views,
     ;; e.g. when the text editor opens at high zoom).
-    (mf/with-effect [@canvas-init? frame-visible?]
+    (with-wasm-effect [@canvas-init? frame-visible?]
       (when @canvas-init?
         (wasm.api/set-rulers-frame-visible! frame-visible?)
         (wasm.api/render-from-backbuffer!)))
 
-    (mf/with-effect [@canvas-init? show-rulers?]
+    (with-wasm-effect [@canvas-init? show-rulers?]
       (when @canvas-init?
         (wasm.api/set-rulers-visible! show-rulers?)
         (wasm.api/render-from-backbuffer!)))
 
-    (mf/with-effect [@canvas-init? show-rulers? offset-x offset-y]
+    (with-wasm-effect [@canvas-init? show-rulers? offset-x offset-y]
       (when (and @canvas-init? show-rulers?)
         (wasm.api/set-rulers-offsets! offset-x offset-y)))
 
-    (mf/with-effect [@canvas-init? show-rulers?
-                     (some-> ruler-selection :x) (some-> ruler-selection :y)
-                     (some-> ruler-selection :width) (some-> ruler-selection :height)]
+    (with-wasm-effect [@canvas-init? show-rulers?
+                       (some-> ruler-selection :x) (some-> ruler-selection :y)
+                       (some-> ruler-selection :width) (some-> ruler-selection :height)]
       (when (and @canvas-init? show-rulers?)
         (wasm.api/set-rulers-selection! ruler-selection)
         (wasm.api/render-from-backbuffer!)))
 
     ;; Paint background + rulers instantly, before shapes finish loading. Runs
     ;; after the ruler push effects so the WASM ruler state is already set.
-    (mf/with-effect [@canvas-init? page-id]
+    (with-wasm-effect [@canvas-init? page-id]
       (when @canvas-init?
         (wasm.api/render-ui-only)))
 
     ;; Ruler guides: push the WASM-visible guide set to the render engine.
     ;; `wasm-guides` is also passed to the SVG overlay for index-based hit
     ;; testing — it must stay in sync with what we serialize here.
-    (mf/with-effect [@canvas-init? wasm-guides objects]
+    (with-wasm-effect [@canvas-init? wasm-guides objects]
       (when @canvas-init?
         (wasm.api/set-guides wasm-guides objects)))
 
     (hooks/setup-dom-events zoom disable-paste-ref in-viewport-ref read-only? drawing-tool path-drawing?)
     (hooks/setup-viewport-size vport viewport-ref)
-    (hooks/setup-cursor cursor alt? mod? space? panning drawing-tool path-drawing? path-editing? (get path-bar-state :drag-cursor) z? read-only?)
+    (hooks/setup-cursor cursor alt? mod? space? panning drawing-tool path-drawing? path-editing? (get path-bar-state :drag-cursor) z? read-only? can-alt-duplicate?)
     (hooks/setup-keyboard alt? mod? space? z? shift?)
     (hooks/setup-hover-shapes page-id move-stream base-objects selected mod? hover measure-hover
                               hover-ids hover-top-frame-id @hover-disabled? focus zoom show-measures? read-only? transform)
     (hooks/setup-shortcuts path-editing? path-drawing? text-editing? grid-editing?)
     (hooks/setup-active-frames base-objects hover-ids selected active-frames zoom transform vbox)
 
-    (mf/with-effect [path-editing? edition @initialized?]
+    (with-wasm-effect [path-editing? edition @initialized?]
       (when (and path-editing? edition @initialized?)
-        (wasm.api/use-shape edition)
+        (wselect/use-shape edition)
         (wasm.api/set-shape-hidden true)
         (wasm.api/request-render "start-path-edition")
         (fn []
           (when (wasm.api/initialized?)
-            (wasm.api/use-shape edition)
+            (wselect/use-shape edition)
             (wasm.api/set-shape-hidden false)
             (wasm.api/request-render "stop-path-edition")))))
 
@@ -806,22 +833,25 @@
            :zoom zoom}])
 
        (when (and (seq selected-shapes)
-                  (not transform)
+                  (or (not transform) (contains? #{:resize :move} transform))
                   (not text-editing?)
                   (not edition)
                   (not read-only?)
                   (not mode-inspect?)
                   (not page-transition?))
          [:> msr/selection-size-badge*
-          {:shapes selected-shapes
-           :zoom zoom}])
+          {:shapes badge-shapes
+           :zoom zoom
+           :vbox vbox}])
 
        (when show-measures?
          [:> msr/measurement*
           {:bounds vbox
            :selected-shapes selected-shapes
            :frame selected-frame
-           :hover-shape @measure-hover
+           ;; The current shape: a rollback may have removed or changed it
+           ;; since the pointer last moved
+           :hover-shape (some->> @measure-hover :id (get base-objects))
            :zoom zoom}])
 
        (when show-padding?
@@ -856,6 +886,7 @@
        (when-not shapes-loading?
          [:> widgets/frame-titles*
           {:objects objects-modified
+           :base-objects base-objects
            :selected selected
            :zoom zoom
            :is-show-artboard-names show-artboard-names?
@@ -904,6 +935,7 @@
            :page-id page-id
            :selected selected
            :objects objects-modified
+           :base-objects base-objects
            :focus focus}])
 
        (when show-snap-distance?

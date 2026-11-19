@@ -177,48 +177,42 @@
        (filter #(= (dm/get-in % [:organization :id]) organization-id))))
 
 (defn organization-leave-info
-  "Splits the teams of an organization into what is needed to leave it:
-  the organization's own default team id, the teams owned by the
-  current user (whose membership decides whether they get deleted or
-  offered for transfer), and the teams the user does not own (which
-  are simply left)."
+  "The default team id and the not-owned teams of an organization.
+  Owned teams come from `::get-leave-organization-summary`."
   [org-teams]
-  (let [non-default-teams (remove :is-default org-teams)]
-    {:default-team-id (->> org-teams (filter :is-default) first :id)
-     :owned-teams (filter #(dm/get-in % [:permissions :is-owner]) non-default-teams)
-     :not-owned-teams (remove #(dm/get-in % [:permissions :is-owner]) non-default-teams)}))
+  {:default-team-id (->> org-teams (filter :is-default) first :id)
+   :not-owned-teams (->> org-teams
+                         (remove :is-default)
+                         (remove #(dm/get-in % [:permissions :is-owner])))})
 
-(defn transferable-teams
-  "Owned teams with more than one member: the ones the user can offer
-  to transfer to another owner instead of leaving/deleting them."
-  [owned-teams]
-  (filter #(> (count (:members %)) 1) owned-teams))
-
-(def ^:private team-leave-error-messages
-  {:only-owner-can-delete-team "errors.team-leave.only-owner-can-delete"
-   :no-enough-members-for-leave "errors.team-leave.insufficient-members"
-   :member-does-not-exist "errors.team-leave.member-does-not-exists"
-   :owner-cant-leave-team "errors.team-leave.owner-cant-leave"})
+(defn- team-leave-message
+  [code]
+  (case code
+    :only-owner-can-delete-team (tr "errors.team-leave.only-owner-can-delete")
+    :no-enough-members-for-leave (tr "errors.team-leave.insufficient-members")
+    :member-does-not-exist (tr "errors.team-leave.member-does-not-exists")
+    :owner-cant-leave-team (tr "errors.team-leave.owner-cant-leave")
+    nil))
 
 (defn team-leave-on-error
   [error]
   (let [code (-> error ex-data :code)]
-    (if-let [tr-key (get team-leave-error-messages code)]
-      (rx/of (ntf/error (tr tr-key)))
+    (if-let [message (team-leave-message code)]
+      (rx/of (ntf/error message))
       (rx/throw error))))
-
-(def ^:private organization-leave-error-messages
-  (merge team-leave-error-messages
-         {:not-valid-teams "errors.organization-leave.no-valid-teams"
-          :organization-owner-cannot-leave "errors.organization-leave.organization-owner-cannot-leave"}))
 
 (defn org-leave-on-error
   [error]
-  (let [code (-> error ex-data :code)]
-    (if-let [tr-key (get organization-leave-error-messages code)]
+  (let [code (-> error ex-data :code)
+        message (or (team-leave-message code)
+                    (case code
+                      :not-valid-teams (tr "errors.organization-leave.no-valid-teams")
+                      :organization-owner-cannot-leave (tr "errors.organization-leave.organization-owner-cannot-leave")
+                      nil))]
+    (if (some? message)
       (rx/of (dt/fetch-teams)
              (modal/hide)
-             (ntf/error (tr tr-key)))
+             (ntf/error message))
       (rx/throw error))))
 
 (defn leave-organization
@@ -268,21 +262,15 @@
               (rx/catch on-error)))))))
 
 (defn leave-organization-fn
-  "Builds the accept callback used by `show-leave-organization-modal`: it
-  folds any teams the user chose to transfer into `:teams-to-leave`,
-  computes `:teams-to-delete` from the owned teams left with a single
-  member, then emits `leave-organization`."
-  [{:keys [organization default-team-id owned-teams not-owned-teams on-error]}]
-  (fn [{:keys [teams-to-transfer member-added-at organization-member-count-before]}]
+  "Builds the accept callback used by `show-leave-organization-modal`:
+  folds transferred teams into `:teams-to-leave` and emits
+  `leave-organization`."
+  [{:keys [organization default-team-id not-owned-teams on-error]}]
+  (fn [{:keys [teams-to-transfer teams-to-delete member-added-at organization-member-count-before]}]
     (let [teams-to-leave
           (cond->> not-owned-teams
             :always (map #(select-keys % [:id]))
-            (seq teams-to-transfer) (concat teams-to-transfer))
-
-          teams-to-delete
-          (->> owned-teams
-               (filter #(= (count (:members %)) 1))
-               (map :id))]
+            (seq teams-to-transfer) (concat teams-to-transfer))]
       (st/emit! (leave-organization {:id (:id organization)
                                      :name (:name organization)
                                      :default-team-id default-team-id
@@ -293,7 +281,7 @@
                                      :on-error on-error})))))
 
 (defn show-leave-organization-modal
-  [{:keys [organization profile default-team-id leave-fn teams-to-transfer on-error]}]
+  [{:keys [organization profile default-team-id leave-fn on-error]}]
   (ptk/reify ::show-leave-organization-modal
     ptk/WatchEvent
     (watch [_ _ _]
@@ -309,6 +297,7 @@
                     (fn [params]
                       (leave-fn
                        (assoc params
+                              :teams-to-delete (:team-ids-to-delete summary)
                               :member-added-at (:member-added-at summary)
                               :organization-member-count-before
                               (:organization-member-count-before summary))))]
@@ -318,7 +307,7 @@
                    (modal/show
                     {:type :leave-and-reassign-organization
                      :profile profile
-                     :teams-to-transfer teams-to-transfer
+                     :teams-to-transfer (:transferable-teams summary)
                      :num-teams-to-delete num-teams-to-delete
                      :accept leave-fn}))
 
@@ -373,8 +362,7 @@
             (let [source-organization (:organization team)
                   can-move?  (cto/allowed?
                               :move-team
-                              {:organization-perms {:owner-id    (:owner-id source-organization)
-                                                    :permissions (:permissions source-organization)}
+                              {:organization-perms source-organization
                                :profile-id profile-id
                                :team-perms (:permissions team)
                                :target-organization-same-owner? false})]
@@ -424,17 +412,33 @@
               :add-method "move-existing-team-to-organization"
               :subscription-status subscription-status})
             pending-id   (str (uuid/next))
-            callback-url (dom/append-query-param (rt/get-current-href)
-                                                 :pending-action-id pending-id)]
+            ;; The callback travels as a query string; the token is kept in
+            ;; its own shape because `append-query-param` works on URLs.
+            callback-query-string (-> (rt/get-current-token)
+                                      (dom/append-query-param :pending-action-id pending-id)
+                                      rt/token->query-string)
+            ;; The permissions may have changed in Nitrate since the modal
+            ;; was opened: refresh them and explain why the action failed.
+            on-error
+            (fn [cause]
+              (if (= :not-allowed (-> cause ex-data :code))
+                (rx/of (dt/fetch-teams)
+                       (modal/show :no-permission-modal
+                                   {:type (if (= team-previous-organization-status "other-organization")
+                                            :no-organizations-change
+                                            :no-organizations-create)}))
+                (rx/throw cause)))]
         (rx/concat
          (when-not skip-audit?
            (rx/of audit-event))
-         (->> (rp/cmd! :check-nitrate-sso {:organization-id organization-id :url callback-url})
+         (->> (rp/cmd! :check-nitrate-sso {:organization-id organization-id
+                                           :query-string callback-query-string})
               (rx/mapcat
                (fn [{:keys [authorized redirect-uri]}]
                  (if authorized
                    (->> (rp/cmd! ::add-team-to-organization {:team-id team-id :organization-id organization-id})
-                        (rx/map (fn [_] (modal/hide))))
+                        (rx/map (fn [_] (modal/hide)))
+                        (rx/catch on-error))
                    (if redirect-uri
                      (do
                        (ss/save-pending-action! pending-id {:type            :add-team-to-organization
@@ -446,32 +450,35 @@
 
 (defn check-organization-sso
   "Asks the backend whether the organization SSO gate can be satisfied for
-  `dest-url`, returning an observable of the raw `:check-nitrate-sso`
-  result: `:authorized` with a `:reason` of `:sso-satisfied` or
-  `:no-team-access`, or `:authorized false` with a `:redirect-uri` (nil
-  when SSO is required but the provider is unusable). Failures are not
-  caught, so a network blip stays a network error for the caller to
-  handle instead of masquerading as an answer."
-  [{:keys [team-id organization-id dest-url]}]
+  `query-string` (the route params of the client, `screen=…&params`, without
+  the separator), returning an observable of the raw `:check-nitrate-sso`
+  result: `:authorized` with a `:reason` of `:sso-satisfied`,
+  `:no-team-access` or `:no-organization-access`, or `:authorized false` with
+  a `:redirect-uri` (nil when SSO is required but the provider is unusable).
+  Failures are not caught, so a network blip stays a network error for the
+  caller to handle instead of masquerading as an answer."
+  [{:keys [team-id organization-id query-string]}]
   (rp/cmd! :check-nitrate-sso (d/without-nils {:team-id team-id
                                                :organization-id organization-id
-                                               :url dest-url})))
+                                               :query-string query-string})))
 
 (defn retry-organization-sso
   "Retries the organization SSO login flow after a failed attempt, reusing
   the same check-nitrate-sso RPC used elsewhere to move the user through
   the organization's identity provider. Passing `team-id` enables the
   backend's non-member short-circuit. Falls back to navigating straight
-  to `dest-url` when no fresh SSO redirect is needed or available."
-  [{:keys [dest-url] :as params}]
-  (ptk/reify ::retry-organization-sso
-    ptk/WatchEvent
-    (watch [_ _ _]
-      (->> (check-organization-sso params)
-           (rx/map (fn [{:keys [redirect-uri]}]
-                     (rt/nav-raw :uri (or redirect-uri dest-url))))
-           (rx/catch (fn [_]
-                       (rx/of (rt/nav-raw :uri dest-url))))))))
+  to the route of `query-string` when no fresh SSO redirect is needed or
+  available."
+  [{:keys [query-string] :as params}]
+  (let [dest-url (rt/token->url query-string)]
+    (ptk/reify ::retry-organization-sso
+      ptk/WatchEvent
+      (watch [_ _ _]
+        (->> (check-organization-sso params)
+             (rx/map (fn [{:keys [redirect-uri]}]
+                       (rt/nav-raw :uri (or redirect-uri dest-url))))
+             (rx/catch (fn [_]
+                         (rx/of (rt/nav-raw :uri dest-url)))))))))
 
 (defn- fetch-organizations-allowed
   "Returns an rx observable of an `organizations-allowed` map (organization-id -> boolean).
@@ -502,10 +509,9 @@
               (fn [teams]
                 (let [all-organizations (map dt/team->organization
                                              (filter #(and (:is-default %) (:organization %)) teams))
-                      organizations     (filter (fn [organization]
-                                                  (let [perm    (dm/get-in organization [:permissions :create-teams])
-                                                        is-own? (= profile-id (:owner-id organization))]
-                                                    (or (= perm "any") is-own?))) all-organizations)
+                      organizations     (filter #(cto/allowed? :create-team
+                                                               {:organization-perms %
+                                                                :profile-id profile-id}) all-organizations)
                       team     (first (filter #(= (:id %) team-id) teams))
                       current-organization (:organization team)
                       on-confirm (fn [organization-id]
@@ -515,18 +521,18 @@
                       (fn [organizations-allowed]
                         (let [has-filtered? (< (count organizations) (count all-organizations))
                               extra-props   (when has-filtered?
-                                              {:info-message-key "dashboard.select-organization-modal.permission-info-add"})]
+                                              {:info-message (tr "dashboard.select-organization-modal.permission-info-add")})]
                           (modal/show :select-organization-modal
                                       (merge {:organizations organizations
                                               :organizations-allowed organizations-allowed
                                               :current-organization current-organization
                                               :on-confirm on-confirm
                                               :team-id team-id
-                                              :title-key "dashboard.select-organization-modal.title"
-                                              :choose-key "dashboard.select-organization-modal.choose"
-                                              :placeholder-key "dashboard.select-organization-modal.select"
-                                              :accept-key "dashboard.select-organization-modal.accept"
-                                              :cancel-key "labels.cancel"}
+                                              :title (tr "dashboard.select-organization-modal.title")
+                                              :choose (tr "dashboard.select-organization-modal.choose")
+                                              :placeholder (tr "dashboard.select-organization-modal.select")
+                                              :accept (tr "dashboard.select-organization-modal.accept")
+                                              :cancel (tr "labels.cancel")}
                                              extra-props))))]
                   (if (empty? organizations)
                     (rx/of (dt/teams-fetched teams)
@@ -562,22 +568,17 @@
                       team         (first (filter #(= (:id %) team-id) teams))
                       source-organization   (:organization team)
                       current-organization-id (:id source-organization)
-                      move-perm    (dm/get-in source-organization [:permissions :move-teams])
                       source-owner-id (:owner-id source-organization)
+                      can-move?    (fn [organization]
+                                     (cto/allowed? :move-team
+                                                   {:organization-perms source-organization
+                                                    :profile-id profile-id
+                                                    :target-organization-same-owner? (= source-owner-id (:owner-id organization))}))
                       can-create?  (fn [organization]
-                                     (let [perm    (dm/get-in organization [:permissions :create-teams])
-                                           is-own? (= profile-id (:owner-id organization))]
-                                       (or (= perm "any") is-own?)))
-                      organizations-by-move (case move-perm
-                                              "never"
-                                              []
-
-                                              "myOrganizations"
-                                              (filter #(= source-owner-id (:owner-id %)) all-organizations)
-
-                                              ;; Default to always-allowed behavior.
-                                              all-organizations)
-                      organizations         (filter can-create? organizations-by-move)
+                                     (cto/allowed? :create-team
+                                                   {:organization-perms organization
+                                                    :profile-id profile-id}))
+                      organizations         (filter #(and (can-move? %) (can-create? %)) all-organizations)
                       selectable-organizations (remove #(= current-organization-id (:id %)) organizations)
                       on-confirm (fn [organization-id]
                                    (st/emit! (add-team-to-organization {:team-id team-id
@@ -591,7 +592,7 @@
                             (let [valid-organizations    (filterv #(true? (get organizations-allowed (:id %))) selectable-organizations)
                                   has-filtered? (< (count organizations) (count all-organizations))
                                   extra-props   (when has-filtered?
-                                                  {:info-message-key "dashboard.select-organization-modal.permission-info"})]
+                                                  {:info-message (tr "dashboard.select-organization-modal.permission-info")})]
                               (rx/of
                                (dt/teams-fetched teams)
                                (if (empty? valid-organizations)
@@ -606,10 +607,10 @@
                                                      :current-organization    source-organization
                                                      :on-confirm              on-confirm
                                                      :team-id                 team-id
-                                                     :title-key               "dashboard.change-organization-modal.title"
-                                                     :description-key         "dashboard.change-organization-modal.description"
-                                                     :choose-key              "dashboard.change-organization-modal.choose"
-                                                     :placeholder-key         "dashboard.change-organization-modal.select"
-                                                     :accept-key              "dashboard.change-organization-modal.accept"
-                                                     :cancel-key              "labels.cancel"}
+                                                     :title                 (tr "dashboard.change-organization-modal.title")
+                                                     :description           (tr "dashboard.change-organization-modal.description")
+                                                     :choose                (tr "dashboard.change-organization-modal.choose")
+                                                     :placeholder           (tr "dashboard.change-organization-modal.select")
+                                                     :accept                (tr "dashboard.change-organization-modal.accept")
+                                                     :cancel                (tr "labels.cancel")}
                                                     extra-props)))))))))))))))))

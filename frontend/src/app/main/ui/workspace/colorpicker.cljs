@@ -27,11 +27,11 @@
    [app.main.refs :as refs]
    [app.main.store :as st]
    [app.main.ui.components.file-uploader :refer [file-uploader]]
-   [app.main.ui.components.radio-buttons :refer [radio-buttons radio-button]]
    [app.main.ui.components.select :refer [select]]
    [app.main.ui.ds.buttons.button :refer [button*]]
    [app.main.ui.ds.buttons.icon-button :refer [icon-button*]]
    [app.main.ui.ds.controls.checkbox :refer [checkbox*]]
+   [app.main.ui.ds.controls.radio-buttons :refer [radio-buttons*]]
    [app.main.ui.ds.foundations.assets.icon :as i]
    [app.main.ui.ds.layout.tab-switcher :refer [tab-switcher*]]
    [app.main.ui.hooks :as hooks]
@@ -39,6 +39,7 @@
    [app.main.ui.workspace.colorpicker.color-tokens :refer [token-section*]]
    [app.main.ui.workspace.colorpicker.gradients :refer [gradients*]]
    [app.main.ui.workspace.colorpicker.harmony :refer [harmony-selector*]]
+   [app.main.ui.workspace.colorpicker.hsl :as hsl]
    [app.main.ui.workspace.colorpicker.hsva :refer [hsva-selector*]]
    [app.main.ui.workspace.colorpicker.libraries :refer [libraries*]]
    [app.main.ui.workspace.colorpicker.ramp :refer [ramp-selector*]]
@@ -88,10 +89,10 @@
           ;; saturation 0 → 1. For L: fix current saturation, sweep
           ;; lightness 0 → 0.5 (pure hue) → 1. All computed at the
           ;; current hue.
-          [_ cur-hsl-s cur-hsl-l] (cc/rgb->hsl rgb)
-          hsl-sat-from  [h 0.0 cur-hsl-l]
-          hsl-sat-to    [h 1.0 cur-hsl-l]
-          lightness-mid [h cur-hsl-s 0.5]
+          [hsl-h cur-hsl-s cur-hsl-l] (hsl/components current-color)
+          hsl-sat-from  [hsl-h 0.0 cur-hsl-l]
+          hsl-sat-to    [hsl-h 1.0 cur-hsl-l]
+          lightness-mid [hsl-h cur-hsl-s 0.5]
 
           format-hsl (fn [[h s l]]
                        (str/fmt "hsl(%s, %s, %s)"
@@ -107,20 +108,22 @@
       (dom/set-css-property! node "--lightness-grad-mid" (format-hsl lightness-mid)))))
 
 (mf/defc colorpicker*
-  [{:keys [data disable-gradient disable-opacity disable-image on-change on-accept origin combined-tokens color-origin on-token-change tab applied-token]}]
+  [{:keys [data disable-gradient disable-opacity disable-image on-change on-accept origin combined-tokens color-origin on-token-change tab applied-token token-disabled]}]
   (let [state                  (mf/deref refs/colorpicker)
         node-ref               (mf/use-ref)
 
         should-update?         (mf/use-var true)
         token-color            (contains? cfg/flags :token-color)
-        color-style*           (mf/use-state (d/nilv tab :direct-color))
+        color-style*           (mf/use-state (if ^boolean token-disabled
+                                               :direct-color
+                                               (d/nilv tab :direct-color)))
         color-style            (deref color-style*)
-        toggle-token-color
+
+        handle-color-style-change
         (mf/use-fn
-         (mf/deps color-style)
-         (fn []
-           (let [new-style (if (= :direct-color color-style) :token-color :direct-color)]
-             (reset! color-style* new-style))))
+         (mf/deps color-style*)
+         (fn [value]
+           (reset! color-style* (keyword value))))
 
         ;; TODO: I think we need to put all this picking state under
         ;; the same object for avoid creating adhoc refs for each
@@ -212,7 +215,7 @@
         (mf/use-fn
          (mf/deps current-color drag?)
          (fn [color]
-           (let [color (merge current-color color)
+           (let [color (dc/merge-color-components current-color color)
                  color (dc/materialize-color-components color)]
              (st/emit! (dc/update-colorpicker-color color (not drag?))))))
 
@@ -374,7 +377,8 @@
             :icon i/hsva
             :id "hsva"}])
 
-        show-tokens? (contains? #{:fill :stroke-color :color-selection} color-origin)]
+        show-tokens? (or (contains? #{:fill :stroke-color :color-selection} color-origin)
+                         (and (= color-origin :canvas) (seq combined-tokens)))]
 
     ;; Initialize colorpicker state
     (mf/with-effect []
@@ -422,17 +426,20 @@
              :on-change handle-change-mode}]])
 
         (when (and (= origin :sidebar) show-tokens? token-color)
-          [:& radio-buttons {:selected color-style
-                             :on-change toggle-token-color
-                             :name "color-style"}
-           [:& radio-button {:icon i/swatches
-                             :value :direct-color
-                             :title (tr "labels.color")
-                             :id "opt-color"}]
-           [:& radio-button {:icon i/tokens
-                             :value :token-color
-                             :title (tr "workspace.colorpicker.color-tokens")
-                             :id "opt-token-color"}]])]
+          [:> radio-buttons* {:selected (name color-style)
+                              :on-change handle-color-style-change
+                              :name "color-style"
+                              :options [{:id "opt-color"
+                                         :icon i/swatches
+                                         :label (tr "labels.color")
+                                         :value "direct-color"}
+                                        {:id "opt-token-color"
+                                         :icon i/tokens
+                                         :label (if ^boolean token-disabled
+                                                  (tr "workspace.tokens.only-first-fill-or-stroke")
+                                                  (tr "workspace.colorpicker.color-tokens"))
+                                         :value "token-color"
+                                         :disabled token-disabled}]}])]
 
        (when (and (not= selected-mode :image)
                   (= color-style :direct-color))
@@ -735,6 +742,7 @@
            on-token-change
            on-close
            tab
+           token-disabled
            applied-token
            on-accept]}]
   (let [vport       (mf/deref viewport)
@@ -808,6 +816,7 @@
                        :disable-image disable-image
                        :on-token-change on-token-change
                        :applied-token applied-token
+                       :token-disabled token-disabled
                        :on-change on-change'
                        :origin origin
                        :tab tab

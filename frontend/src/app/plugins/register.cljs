@@ -16,11 +16,57 @@
    [app.main.store :as st]
    [app.util.object :as obj]
    [beicon.v2.core :as rx]
+   [cuerdas.core :as str]
    [promesa.core :as p]))
 
 ;; Needs to be here because moving it to `app.main.data.workspace.mcp` will
 ;; cause a circular dependency
 (def mcp-plugin-id "96dfa740-005d-8020-8007-55ede24a2bae")
+
+(def mcp-permissions
+  #{"user:read" "library:read" "library:write"
+    "comment:read" "comment:write" "content:read" "content:write"
+    "allow:global" "manage:projects" "manage:teams" "manage:delete"
+    ;; Keeps the rollbacks not reported yet across reloads
+    "allow:localstorage"})
+
+;; Permissions only granted to plugins that pass `global-allowed?`
+(def global-permissions
+  #{"allow:global" "manage:projects" "manage:teams" "manage:delete"})
+
+;; Loopback hosts that may serve global plugins over any scheme
+(def ^:private trusted-hosts
+  #{"localhost" "127.0.0.1" "[::1]" "::1"})
+
+;; Domains whose https subdomains may serve global plugins
+(def ^:private trusted-domains
+  #{"penpot.dev" "penpot.app"})
+
+(defn- trusted-url?
+  "True when the url host is one of `trusted-hosts`, or the url uses
+  https and its host is a subdomain of one of `trusted-domains`. Hosts
+  are compared ignoring case and a trailing dot."
+  [url]
+  (let [uri  (some-> url u/uri)
+        host (some-> uri :host str/lower (str/rtrim "."))]
+    (or (contains? trusted-hosts host)
+        (and (= "https" (some-> uri :scheme str/lower))
+             (some? host)
+             (boolean (some #(str/ends-with? host (str "." %)) trusted-domains))))))
+
+(defn global-requested?
+  "True when the plugin asks for global scope or a management permission."
+  [{:keys [scope permissions]}]
+  (or (= "global" scope)
+      (boolean (some global-permissions permissions))))
+
+(defn global-allowed?
+  "True when the plugin may run with global scope and use the management
+  API. The feature is still in progress, so only the bundled MCP plugin
+  and plugins served from a trusted url get it."
+  [{:keys [plugin-id host]}]
+  (or (= plugin-id mcp-plugin-id)
+      (trusted-url? host)))
 
 ;; Promise that resolves when plugins runtime is initialized.
 ;; Lives here to avoid circular dependency: workspace.mcp -> app.plugins -> app.plugins.api -> workspace
@@ -54,15 +100,20 @@
   "Read the manifest.json defined by the plugins definition and transforms it into an
   object that will be stored in the register."
   [plugin-url ^js manifest]
-  (let [name (obj/get manifest "name")
-        desc (obj/get manifest "description")
-        code (obj/get manifest "code")
-        icon (obj/get manifest "icon")
-        vers (d/nilv (obj/get manifest "version") 1)
+  (let [name  (obj/get manifest "name")
+        desc  (obj/get manifest "description")
+        code  (obj/get manifest "code")
+        icon  (obj/get manifest "icon")
+        vers  (d/nilv (obj/get manifest "version") 1)
+        scope (obj/get manifest "scope")
 
         permissions (into #{} (obj/get manifest "permissions" []))
         permissions
         (cond-> permissions
+          ;; Global plugins must be explicitly allowed by the user
+          (= "global" scope)
+          (conj "allow:global")
+
           (contains? permissions "content:write")
           (conj "content:read")
 
@@ -102,15 +153,39 @@
          {:plugin-id plugin-id
           :url (str plugin-url)
           :version vers
+          :scope scope
           :name name
           :description desc
           :host origin
           :code code
           :icon icon
           :permissions (into #{} (map str) permissions)})]
-    (if (sm/validate ctp/schema:registry-entry manifest)
-      manifest
-      (.error js/console (clj->js (sm/explain ctp/schema:registry-entry manifest))))))
+    (cond
+      (not (sm/validate ctp/schema:registry-entry manifest))
+      (.error js/console (clj->js (sm/explain ctp/schema:registry-entry manifest)))
+
+      (and (global-requested? manifest)
+           (not (global-allowed? manifest)))
+      (throw (ex-info "Global plugins are not allowed from this host"
+                      {:type ::global-not-allowed
+                       :host origin}))
+
+      :else
+      manifest)))
+
+(defn subscribe-registry!
+  "Subscribes f, called with no arguments on every registry change.
+  Returns f."
+  [f]
+  (add-watch registry f (fn [_ _ old new]
+                          (when-not (identical? old new)
+                            (f))))
+  f)
+
+(defn unsubscribe-registry!
+  [f]
+  (remove-watch registry f)
+  nil)
 
 (defn load-from-store
   []
@@ -122,43 +197,180 @@
 
 (declare remove-plugin!)
 
+;; Plugin ids with a persist in flight; install/remove calls on them are skipped
+(defonce ^:private in-flight (atom #{}))
+
+(defonce ^:private in-flight-listeners (atom #{}))
+
+(defn subscribe-in-flight!
+  "Subscribes f, called with the in-flight id set on every change.
+  Calls f immediately with the current set. Returns f."
+  [f]
+  (swap! in-flight-listeners conj f)
+  (f @in-flight)
+  f)
+
+(defn unsubscribe-in-flight!
+  [f]
+  (swap! in-flight-listeners disj f)
+  nil)
+
+(defn- notify-in-flight!
+  []
+  (let [ids @in-flight]
+    (doseq [f @in-flight-listeners]
+      (f ids))))
+
+(defn- track!
+  [plugin-id]
+  (swap! in-flight conj plugin-id)
+  (notify-in-flight!))
+
+(defn- release!
+  [plugin-id]
+  (swap! in-flight disj plugin-id)
+  (notify-in-flight!))
+
+(defn- validation-error?
+  [err]
+  (= :validation (:type (ex-data err))))
+
+(defn- drop-local!
+  [{:keys [plugin-id]}]
+  (swap! registry #(-> %
+                       (update :ids (fn [ids] (vec (remove (partial = plugin-id) ids))))
+                       (update :data dissoc plugin-id))))
+
+(defn- insert-at
+  [ids idx id]
+  (let [v   (vec ids)
+        idx (max 0 (min idx (count v)))]
+    (vec (concat (subvec v 0 idx) [id] (subvec v idx)))))
+
+(defn- restore-local!
+  "Puts the stored plugin back into the registry at position idx."
+  [{:keys [plugin-id] :as plugin} idx]
+  (swap! registry #(-> %
+                       (update :ids (fn [ids]
+                                      (insert-at (remove (partial = plugin-id) ids)
+                                                 idx
+                                                 plugin-id)))
+                       (assoc-in [:data plugin-id] plugin))))
+
 (defn install-plugin!
   [plugin]
-  (letfn [(update-ids [ids]
-            (conj
-             (->> ids (remove #(= % (:plugin-id plugin))))
-             (:plugin-id plugin)))]
-    (swap! registry #(-> %
-                         (update :ids update-ids)
-                         (update :data assoc (:plugin-id plugin) plugin)))
-    (->> (rp/cmd! :add-profile-plugin {:plugin plugin})
-         (rx/subs! identity
-                   (fn [err]
-                     (remove-plugin! plugin)
-                     (.error js/console "Failed to install plugin:" err))))))
+  (let [plugin-id (:plugin-id plugin)
+        previous  (get-plugin plugin-id)
+        prev-idx  (.indexOf (vec (:ids @registry)) plugin-id)]
+    (when-not (contains? @in-flight plugin-id)
+      (track! plugin-id)
+      (letfn [(update-ids [ids]
+                (conj
+                 (->> ids (remove #(= % (:plugin-id plugin))))
+                 (:plugin-id plugin)))]
+        (swap! registry #(-> %
+                             (update :ids update-ids)
+                             (update :data assoc (:plugin-id plugin) plugin)))
+        (->> (rp/cmd! :add-profile-plugin {:plugin plugin})
+             (rx/subs! (fn [_]
+                         (release! plugin-id))
+                       (fn [err]
+                         (release! plugin-id)
+                         ;; Restore the previous version in place, else drop it
+                         (if previous
+                           (restore-local! previous prev-idx)
+                           (drop-local! plugin))
+                         ;; Other failures may have reached the server: undo it
+                         ;; once by re-saving the previous version or removing
+                         ;; the new entry, without further rollback.
+                         (when-not (validation-error? err)
+                           (->> (if previous
+                                  (rp/cmd! :add-profile-plugin {:plugin previous})
+                                  (rp/cmd! :remove-profile-plugin {:plugin-id plugin-id}))
+                                (rx/subs! (fn [_] nil)
+                                          (fn [err2]
+                                            (.error js/console "Rollback failed:" err2)))))
+                         (.error js/console "Failed to install plugin:" err))))))))
 
 (defn remove-plugin!
   [{:keys [plugin-id]}]
-  (let [plugin (get-plugin plugin-id)]
-    (letfn [(update-ids [ids]
-              (->> ids
-                   (remove #(= % plugin-id))))]
-      (swap! registry #(-> %
-                           (update :ids update-ids)
-                           (update :data dissoc plugin-id)))
-      (->> (rp/cmd! :remove-profile-plugin {:plugin-id plugin-id})
-           (rx/subs! identity
-                     (fn [err]
-                       (when plugin
-                         (install-plugin! plugin))
-                       (.error js/console "Failed to remove plugin:" err)))))))
+  (let [stored   (get-plugin plugin-id)
+        prev-idx (.indexOf (vec (:ids @registry)) plugin-id)]
+    (when-not (contains? @in-flight plugin-id)
+      (track! plugin-id)
+      (letfn [(update-ids [ids]
+                (->> ids
+                     (remove #(= % plugin-id))))]
+        (swap! registry #(-> %
+                             (update :ids update-ids)
+                             (update :data dissoc plugin-id)))
+        (->> (rp/cmd! :remove-profile-plugin {:plugin-id plugin-id})
+             (rx/subs! (fn [_]
+                         (release! plugin-id))
+                       (fn [err]
+                         (release! plugin-id)
+                         (when stored
+                           ;; Restore in place; validation errors keep it server-side
+                           (restore-local! stored prev-idx)
+                           ;; Other failures: re-save it once, without further rollback
+                           (when-not (validation-error? err)
+                             (->> (rp/cmd! :add-profile-plugin {:plugin stored})
+                                  (rx/subs! (fn [_] nil)
+                                            (fn [err2]
+                                              (.error js/console "Rollback install failed:" err2))))))
+                         (.error js/console "Failed to remove plugin:" err))))))))
+
+(defn has-permission?
+  "True when the plugin was granted `permission`. The permissions in
+  `global-permissions` also need the plugin to pass `global-allowed?`."
+  [plugin-id permission]
+  (cond
+    (= plugin-id "00000000-0000-0000-0000-000000000000") true
+    (= plugin-id mcp-plugin-id) (contains? mcp-permissions permission)
+    :else (let [{:keys [permissions] :as plugin} (dm/get-in @registry [:data plugin-id])]
+            (and (contains? permissions permission)
+                 (or (not (contains? global-permissions permission))
+                     (global-allowed? plugin))))))
+
+(defn- read-only-reason
+  "Why plugin writes must fail in `state`, or nil when they can go ahead.
+  The read-only flag alone is not a reason: the Inspect tab sets it too,
+  and it only hides the editing tools."
+  [state]
+  (let [wglobal (:workspace-global state)]
+    (cond
+      (some? (:persistence-lock wglobal))
+      "because changes cannot be saved right now"
+
+      (not (dm/get-in state [:permissions :can-edit]))
+      "because you cannot edit this file"
+
+      (some? (:preview-id wglobal))
+      "while a version is being previewed"
+
+      (dm/get-in state [:render-state :lost])
+      "because the canvas stopped rendering")))
+
+(defn check-writable
+  "Throws while saves are failing, the user cannot edit, a version is
+  being previewed or the render context is lost. A write made then would
+  be lost or edit the wrong data, so it fails whatever the plugin's
+  validation flag."
+  []
+  (when-let [reason (read-only-reason @st/state)]
+    (throw (ex-info (str "[PENPOT PLUGIN] The workspace is read-only " reason)
+                    {:type ::read-only}))))
+
+(def ^:private write-permissions
+  #{"content:write" "library:write"})
 
 (defn check-permission
+  "True when the plugin was granted `permission`. A write permission also
+  runs `check-writable`, which throws while the workspace is read-only."
   [plugin-id permission]
-  (or (= plugin-id "00000000-0000-0000-0000-000000000000")
-      (= plugin-id mcp-plugin-id)
-      (let [{:keys [permissions]} (dm/get-in @registry [:data plugin-id])]
-        (contains? permissions permission))))
+  (when (contains? write-permissions permission)
+    (check-writable))
+  (has-permission? plugin-id permission))
 
 (defn get-plugin-data
   [state plugin-id]

@@ -7,6 +7,7 @@
 (ns app.rpc.commands.auth
   (:require
    [app.auth :as auth]
+   [app.auth.login-lockout :as login-lockout]
    [app.auth.oidc :as oidc]
    [app.auth.passwords :as passwords]
    [app.common.data :as d]
@@ -30,6 +31,7 @@
    [app.rpc.climit :as-alias climit]
    [app.rpc.commands.profile :as profile]
    [app.rpc.commands.teams :as teams]
+   [app.rpc.commands.teams-invitations :as teams-invitations]
    [app.rpc.doc :as-alias doc]
    [app.rpc.helpers :as rph]
    [app.setup :as-alias setup]
@@ -43,6 +45,10 @@
 
 (def schema:token
   [::sm/word-string {:max 6000}])
+
+(def ^:private penpot-backend
+  "Auth backend identifier for the password flow."
+  "penpot")
 
 (defn- elapsed-verify-threshold?
   [profile]
@@ -85,9 +91,21 @@
               (ex/raise :type :restriction
                         :code :profile-blocked
                         :hint "profile is marked as blocked"))
+            (let [result (login-lockout/locked? cfg (:id profile))]
+              (when (:locked? result)
+                (ex/raise :type :rate-limit
+                          :code :account-locked
+                          :hint "account locked due to too many failed login attempts"
+                          :ttl (:ttl result))))
             (when-not (check-password cfg profile password)
-              (ex/raise :type :validation
-                        :code :wrong-credentials))
+              (let [result (login-lockout/record-failed-attempt! cfg (:id profile))]
+                (if (and result (:locked? result))
+                  (ex/raise :type :rate-limit
+                            :code :account-locked
+                            :hint "account locked due to too many failed login attempts"
+                            :ttl (:ttl result))
+                  (ex/raise :type :validation
+                            :code :wrong-credentials))))
             (when-let [deleted-at (:deleted-at profile)]
               (when (ct/is-after? (ct/now) deleted-at)
                 (ex/raise :type :validation
@@ -111,6 +129,7 @@
                                {:invitation-token (:invitation-token params)}
                                (assoc profile :is-admin (let [admins (cf/get :admins)]
                                                           (contains? admins (:email profile)))))]
+              (login-lockout/clear-attempts! cfg (:id profile))
               (-> response
                   (rph/with-transform (session/create-fn cfg profile))
                   (rph/with-meta {::audit/props (audit/profile->props profile)
@@ -179,11 +198,24 @@
           (update-password [conn profile-id]
             (let [pwd (auth/derive-password password)]
               (db/update! conn :profile {:password pwd :is-active true} {:id profile-id})
-              nil))]
+              (db/get-by-id conn :profile profile-id)))]
 
     (passwords/validate-password password)
-    (->> (validate-token token)
-         (update-password conn))
+
+    (let [profile (some->> (validate-token token)
+                           (update-password conn))]
+      (when profile
+        ;; Recovery must revoke every existing session: a previously
+        ;; captured cookie otherwise keeps working after the password
+        ;; change (GHSA-3j2p-qr45-q365). Runs inside the same transaction
+        ;; as the password update (::db/transaction true).
+        (session/invalidate-all cfg (:id profile))
+        (login-lockout/clear-attempts! cfg (:id profile))
+        (eml/send-template cfg {::eml/reuse-conn true
+                                ::eml/template "password-changed"
+                                :public-uri (cf/get :public-uri)
+                                :to (:email profile)
+                                :name (:fullname profile)})))
 
     nil))
 
@@ -203,23 +235,82 @@
 
 ;; ---- COMMAND: Prepare Register
 
+(defn- check-registration-flags
+  "The `:backend` is the one embedded in the verified
+  `:prepared-register` token: the password flow backend, one of the
+  `oidc/oidc-provider-types` backends for SSO flows, or any other
+  value, which is rejected loudly."
+  [backend invitation]
+  (cond
+    (= backend penpot-backend)
+    (do
+      (when-not (contains? cf/flags :login-with-password)
+        (ex/raise :type :restriction
+                  :code :registration-disabled
+                  :hint "registration disabled"))
+
+      (when-not (or (contains? cf/flags :registration)
+                    (some? invitation))
+        (ex/raise :type :restriction
+                  :code :registration-disabled
+                  :hint "registration disabled")))
+
+    (contains? oidc/oidc-provider-types backend)
+    ;; SSO backends share the OIDC callback gate
+    ;; (`oidc/sso-registration-allowed?`): registration is allowed with
+    ;; `:registration` or `:oidc-registration`, without requiring
+    ;; password login. An invitation token is a substitute for the
+    ;; flags, as in the password flow.
+    (when-not (or (oidc/sso-registration-allowed?)
+                  (some? invitation))
+      (ex/raise :type :restriction
+                :code :registration-disabled
+                :hint "registration disabled"))
+
+    :else
+    (ex/raise :type :validation
+              :code :invalid-token
+              :hint "unsupported registration backend")))
+
+(defn- check-registration-invitation
+  "Verifies that the invitation is still active. No-op unless a live
+  invitation is required: a backend whose registration flags do not
+  allow public registration, with an invitation at hand."
+  [cfg backend invitation lock-invitation?]
+  (let [flag-allows? (if (= backend penpot-backend)
+                       (contains? cf/flags :registration)
+                       (oidc/sso-registration-allowed?))]
+    (when (and (some? invitation)
+               (not flag-allows?))
+      (let [opts (when lock-invitation? {::db/for-update true})]
+        (when (nil? (teams-invitations/active-invitation cfg invitation opts))
+          (ex/raise :type :validation
+                    :code :invalid-token
+                    :hint "no active invitation associated with the token"))))))
+
+(defn- check-registration
+  "Shared registration gate (register-profile and prepare-register):
+  validates the flags, the invitation email and the team invitation
+  row in order."
+  [cfg backend invitation email lock-invitation?]
+  (check-registration-flags backend invitation)
+  (when (and (some? invitation)
+             (not= (profile/clean-email (:member-email invitation))
+                   (profile/clean-email email)))
+    (ex/raise :type :restriction
+              :code :email-does-not-match-invitation
+              :hint "email should match the invitation"))
+  (check-registration-invitation cfg backend invitation lock-invitation?))
+
 (defn- validate-register-attempt!
   [cfg params]
-
-  (when (or (not (contains? cf/flags :registration))
-            (not (contains? cf/flags :login-with-password)))
-    (ex/raise :type :restriction
-              :code :registration-disabled
-              :hint "registration disabled"))
-
-  (when (contains? params :invitation-token)
-    (let [invitation (tokens/verify cfg
+  (let [invitation? (contains? params :invitation-token)
+        invitation (when invitation?
+                     (tokens/verify cfg
                                     {:token (:invitation-token params)
-                                     :iss :team-invitation})]
-      (when-not (= (:email params) (:member-email invitation))
-        (ex/raise :type :restriction
-                  :code :email-does-not-match-invitation
-                  :hint "email should match the invitation"))))
+                                     :iss :team-invitation}))]
+
+    (check-registration cfg penpot-backend invitation (:email params) false))
 
   (when (and (email.blacklist/enabled? cfg)
              (email.blacklist/contains? cfg (:email params)))
@@ -291,7 +382,7 @@
                   :fullname fullname
                   :password (:password params)
                   :invitation-token (:invitation-token params)
-                  :backend "penpot"
+                  :backend penpot-backend
                   :iss :prepared-register
                   :exp (ct/in-future {:days 7})
                   :props props}
@@ -322,21 +413,32 @@
   [cfg uri]
   (try
     (let [storage (sto/resolve cfg)
-          input   (media/download-image cfg uri)
-          input   (media/run cfg {:cmd :info :input input})
-          hash    (sto/calculate-hash (:path input))
-          content (-> (sto/content (:path input) (:size input))
-                      (sto/wrap-with-hash hash))
-          sobject (sto/put-object! storage {::sto/content content
-                                            ::sto/deduplicate? true
-                                            :bucket "profile"
-                                            :content-type (:mtype input)})]
-      (:id sobject))
+          input   (media/download-image cfg uri)]
+      (if (= "image/svg+xml" (:mtype input))
+        ;; The avatar is always rendered as an image, so an SVG would only
+        ;; add the risk of storing live markup: it is not allowed here.
+        (do
+          (l/wrn :hint "ignoring svg profile picture" :uri uri)
+          nil)
+
+        (let [input   (media/run cfg {:cmd :info :input input})
+              hash    (sto/calculate-hash (:path input))
+              content (-> (sto/content (:path input) (:size input))
+                          (sto/wrap-with-hash hash))
+              sobject (sto/put-object! storage {::sto/content content
+                                                ::sto/deduplicate? true
+                                                :bucket "profile"
+                                                :content-type (:mtype input)})]
+          (:id sobject))))
     (catch Throwable cause
       (l/wrn :hint "unable to import profile picture"
              :uri uri
              :cause cause)
       nil)))
+
+(def ^:private default-renderer-new-profiles
+  "Renderer stored on new profiles. Profiles without one fall back to SVG."
+  :wasm)
 
 (defn create-profile
   "Create the profile entry on the database with limited set of input
@@ -344,6 +446,7 @@
   [{:keys [::db/conn] :as cfg} {:keys [email] :as params}]
   (let [id        (or (:id params) (uuid/next))
         props     (-> (:props params)
+                      (update :renderer d/nilv default-renderer-new-profiles)
                       (merge {:viewed-tutorial? false
                               :viewed-walkthrough? false
                               :nudge {:big 10 :small 1}
@@ -356,7 +459,7 @@
         locale    (when (and (string? locale) (not (str/blank? locale)))
                     locale)
 
-        backend   (:backend params "penpot")
+        backend   (:backend params penpot-backend)
         is-demo   (:is-demo params false)
         is-muted  (:is-muted params false)
         is-active (:is-active params false)
@@ -416,7 +519,7 @@
 
 (defn send-email-verification!
   ([cfg profile] (send-email-verification! cfg profile nil))
-  ([{:keys [::db/conn] :as cfg} profile invitation-token]
+  ([cfg profile invitation-token]
    (let [vclaims (cond-> {:iss :verify-email
                           :exp (ct/in-future "72h")
                           :profile-id (:id profile)
@@ -434,17 +537,33 @@
                                   {:iss :profile-identity
                                    :profile-id (:id profile)
                                    :exp (ct/in-future {:days 30})})]
-     (eml/send! {::eml/conn conn
-                 ::eml/factory eml/register
-                 :public-uri (cf/get :public-uri)
-                 :to (:email profile)
-                 :name (:fullname profile)
-                 :token vtoken
-                 :extra-data ptoken}))))
+     (eml/send-template cfg {::eml/reuse-conn true
+                             ::eml/template "register"
+                             :public-uri (cf/get :public-uri)
+                             :to (:email profile)
+                             :name (:fullname profile)
+                             :token vtoken
+                             :extra-data ptoken}))))
+
+(def ^:private schema:prepared-register-claims
+  [:map {:title "PreparedRegisterClaims"}
+   [:backend ::sm/text]
+   [:email ::sm/email]])
+
+(def ^:private valid-prepared-register-claims?
+  (sm/lazy-validator schema:prepared-register-claims))
 
 (defn register-profile
   [{:keys [::db/conn] :as cfg} {:keys [token] :as params}]
   (let [claims     (tokens/verify cfg {:token token :iss :prepared-register})
+        _          (when-not (valid-prepared-register-claims? claims)
+                     (ex/raise :type :validation
+                               :code :invalid-token
+                               :hint "prepared-register token contains unexpected data"))
+        backend    (:backend claims)
+        invitation (when-let [token (:invitation-token claims)]
+                     (tokens/verify cfg {:token token :iss :team-invitation}))
+        _          (check-registration cfg backend invitation (:email claims) true)
         params     (cond-> claims
                      (:accept-newsletter-updates params)
                      (update :props assoc :newsletter-updates true))
@@ -462,11 +581,9 @@
 
         created?   (-> profile meta :created true?)
 
-        invitation (when-let [token (:invitation-token params)]
-                     (tokens/verify cfg {:token token :iss :team-invitation}))
-
-        props      (-> (audit/profile->props profile)
-                       (assoc :from-invitation (some? invitation)))]
+        props      (cond-> (audit/profile->props profile)
+                     :always  (assoc :from-invitation (some? invitation))
+                     created? (assoc :renderer-default (-> profile :props :renderer)))]
 
     (cond
       ;; When profile is blocked, we just ignore it and return plain data
@@ -492,8 +609,8 @@
       ;;     return :invitation-token. The frontend redirects to
       ;;     :auth-verify-token, which immediately accepts the
       ;;     invitation.
-      ;;   - active     + no/mismatched invitation → mint session
-      ;;     ("login" action). New profile, no further action.
+      ;;   - active     + no/mismatched invitation → mint session.
+      ;;     New profile, no further action.
       ;;   - not-active + matching invitation → send the
       ;;     verify-email mail with the invitation token EMBEDDED
       ;;     into the verify-email JWE. No session yet. When the
@@ -506,7 +623,11 @@
       created?
       (let [accept-invitation? (and (some? invitation)
                                     (= (:email profile)
-                                       (:member-email invitation)))]
+                                       (:member-email invitation)))
+            props             (assoc props :activation
+                                     (if (:is-active profile)
+                                       "immediate"
+                                       "email-verification"))]
         (cond
           (and (:is-active profile) accept-invitation?)
           (let [invitation (assoc invitation :member-id (:id profile))
@@ -516,7 +637,6 @@
                  :invitation-token token}
                 (rph/with-transform (session/create-fn cfg profile claims))
                 (rph/with-meta {::audit/replace-props props
-                                ::audit/context {:action "accept-invitation"}
                                 ::audit/profile-id (:id profile)})))
 
           (:is-active profile)
@@ -524,7 +644,6 @@
               (rph/with-transform (session/create-fn cfg profile claims))
               (rph/with-meta
                 {::audit/replace-props props
-                 ::audit/context {:action "login"}
                  ::audit/profile-id (:id profile)}))
 
           :else
@@ -538,7 +657,6 @@
                  :email (:email profile)}
                 (rph/with-meta
                   {::audit/replace-props props
-                   ::audit/context {:action "email-verification"}
                    ::audit/profile-id (:id profile)})))))
 
       ;; When email verification is disabled and an inactive profile already
@@ -598,18 +716,18 @@
                                           :profile-id id})]
               (assoc profile :token token)))
 
-          (send-email-notification [conn profile]
+          (send-email-notification [profile]
             (let [ptoken (tokens/generate cfg
                                           {:iss :profile-identity
                                            :profile-id (:id profile)
                                            :exp (ct/in-future {:days 30})})]
-              (eml/send! {::eml/conn conn
-                          ::eml/factory eml/password-recovery
-                          :public-uri (cf/get :public-uri)
-                          :to (:email profile)
-                          :token (:token profile)
-                          :name (:fullname profile)
-                          :extra-data ptoken})
+              (eml/send-template cfg {::eml/reuse-conn true
+                                      ::eml/template "password-recovery"
+                                      :public-uri (cf/get :public-uri)
+                                      :to (:email profile)
+                                      :token (:token profile)
+                                      :name (:fullname profile)
+                                      :extra-data ptoken})
               nil))]
 
     (let [profile (->> (profile/clean-email email)
@@ -647,7 +765,7 @@
                       {:id (:id profile)})
           (->> profile
                (create-recovery-token)
-               (send-email-notification conn)))))))
+               (send-email-notification)))))))
 
 (def schema:request-profile-recovery
   [:map {:title "request-profile-recovery"}

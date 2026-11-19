@@ -1,9 +1,11 @@
 use skia_safe::{self as skia, Paint};
 
-use crate::shapes::{radius_to_sigma, Shadow, Shape, Type};
+use crate::error::Result;
+use crate::shapes::{radius_to_sigma, Fill, Shadow, Shape, Type};
 use crate::state::ShapesPoolRef;
 
 use crate::render::vector::draw_shape_geometry;
+use crate::render::RenderState;
 
 // Skia's SVG backend (`SkSVGDevice`) silently drops everything drawn inside a
 // `save_layer`, so composite effects rendered with `save_layer` (opacity,
@@ -36,6 +38,10 @@ pub(crate) struct SvgLayerCanvas {
     /// container silhouette (GPU `pre_translate` before rotation). The SVG
     /// filter itself uses a zero offset so rotated shadows stay correct.
     pub(super) silhouette_offset: (f32, f32),
+    /// Stack of group fills inherited by empty-fill children (GPU `nested_fills`).
+    /// Frames push an empty vec to break inheritance. SVG-imported groups often
+    /// carry a default black fill that paths without own fills must paint.
+    pub(super) nested_fills: Vec<Vec<Fill>>,
 }
 
 impl SvgLayerCanvas {
@@ -53,6 +59,17 @@ impl SvgLayerCanvas {
             suppress_filters: false,
             silhouette_spread: 0.0,
             silhouette_offset: (0.0, 0.0),
+            nested_fills: Vec::new(),
+        }
+    }
+
+    /// Fills to paint for a leaf: own fills, else inherited group fills.
+    /// Owned so callers can still mutably borrow `self` afterward.
+    pub(super) fn effective_fills_owned(&self, element: &Shape) -> Vec<Fill> {
+        if element.inherits_fills() {
+            self.nested_fills.last().cloned().unwrap_or_default()
+        } else {
+            element.fills.clone()
         }
     }
 
@@ -110,6 +127,24 @@ impl SvgLayerCanvas {
             .push_str(&sanitize_skia_svg_fragment(&remap_ids(inner, &prefix)));
     }
 
+    /// Runs `f` while diverting body markup into a temporary buffer.
+    ///
+    /// Pending Skia fragments are flushed before/after. Defs (filters, clips,
+    /// nested masks) still append to `self.defs`. Used to build `<mask>` bodies
+    /// from a full mask subtree render.
+    pub(super) fn capture_body<F>(&mut self, f: F) -> Result<String>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        self.flush();
+        let saved = std::mem::take(&mut self.out);
+        let result = f(self);
+        self.flush();
+        let captured = std::mem::replace(&mut self.out, saved);
+        result?;
+        Ok(captured)
+    }
+
     pub(super) fn open_group(&mut self, attrs: &str) {
         self.flush();
         self.out.push_str("<g ");
@@ -144,6 +179,31 @@ impl SvgLayerCanvas {
         )
     }
 
+    /// Maps a shape-local rect through the page CTM into SVG user space.
+    pub(super) fn map_selrect_to_page(
+        &self,
+        local: &skia::Rect,
+        draw_matrix: &skia::Matrix,
+    ) -> skia::Rect {
+        self.page_ctm(draw_matrix).map_rect(*local).0
+    }
+
+    /// Maps a shape-local path through the page CTM into SVG user space.
+    pub(super) fn map_path_to_page(
+        &self,
+        path: &skia::Path,
+        draw_matrix: &skia::Matrix,
+    ) -> skia::Path {
+        path.make_transform(&self.page_ctm(draw_matrix))
+    }
+
+    /// Scale × translate × `draw_matrix` (same CTM as SVG fragment canvases).
+    fn page_ctm(&self, draw_matrix: &skia::Matrix) -> skia::Matrix {
+        let mut ctm = skia::Matrix::scale((self.scale, self.scale));
+        ctm = ctm * skia::Matrix::translate((self.tx, self.ty));
+        ctm * *draw_matrix
+    }
+
     /// Emits a `<clipPath>` from a shape's geometry (in device/page space).
     ///
     /// A mask can be a group too. Since a group has no geometry of its own, we
@@ -161,6 +221,35 @@ impl SvgLayerCanvas {
             draw_clip_geometry(cv, shape, tree, &paint, self.silhouette_offset);
         }
         self.finish_clip_path_fragment(id, canvas);
+    }
+
+    /// Opens a group whose mask hides `element`'s outline, so its drop shadows
+    /// never show under it (CSS `box-shadow`). Returns whether it opened one.
+    pub(super) fn open_drop_shadow_clear_group(&mut self, element: &Shape) -> bool {
+        if !element.clears_drop_shadow_underneath() {
+            return false;
+        }
+        let id = self.unique("dsmask");
+        let canvas = self.new_fragment();
+        {
+            let cv: &skia::Canvas = &canvas;
+            let mut paint = Paint::default();
+            paint.set_color(skia::Color::WHITE);
+            cv.save();
+            cv.reset_matrix();
+            cv.draw_rect(
+                skia::Rect::from_wh(self.page_rect.width(), self.page_rect.height()),
+                &paint,
+            );
+            cv.restore();
+            paint.set_anti_alias(true);
+            paint.set_color(skia::Color::BLACK);
+            cv.concat(&element.centered_transform());
+            cv.draw_path(&RenderState::drop_shadow_clear_path(element), &paint);
+        }
+        self.finish_mask_fragment(&id, canvas);
+        self.open_group(&format!("mask=\"url(#{id})\""));
+        true
     }
 
     /// Finalizes a fragment canvas as a `<clipPath>` def.

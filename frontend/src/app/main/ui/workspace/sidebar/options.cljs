@@ -100,6 +100,21 @@
   (when (= (:type panel) :component-swap)
     [:> component-menu* {:shapes (:shapes panel) :is-swap-opened true}]))
 
+(defn- get-shapes-with-children
+  "Returns the shapes of `selected` together with all their descendants."
+  [objects selected]
+  (loop [queue   (into #queue [] selected)
+         visited selected]
+    (if-let [id (peek queue)]
+      (let [shape    (get objects id)
+            children (:shapes shape)]
+        (if (seq children)
+          (let [new-children (remove visited children)]
+            (recur (into (pop queue) new-children)
+                   (into visited new-children)))
+          (recur (pop queue) visited)))
+      (sequence (keep (d/getf objects)) visited))))
+
 (mf/defc design-menu*
   {::mf/private true}
   [{:keys [selected objects page-id file-id shapes]}]
@@ -145,29 +160,16 @@
         (->> (dm/get-in grid-edition [edition :selected])
              (map #(dm/get-in objects [edition :layout-grid-cells %])))
 
-        shapes-with-children*
-        (mf/use-state nil)
+        ;; Deferred, so the subtree walk runs in a background render
+        deferred-selected
+        (mf/use-deferred selected)
 
-        _ (mf/use-effect
-           (mf/deps selected objects shapes)
-           (fn []
-             (reset! shapes-with-children* nil)
-             (let [result
-                   (loop [queue   (into #queue [] selected)
-                          visited selected]
-                     (if-let [id (peek queue)]
-                       (let [shape    (get objects id)
-                             children (:shapes shape)]
-                         (if (seq children)
-                           (let [new-children (remove visited children)]
-                             (recur (into (pop queue) new-children)
-                                    (into visited new-children)))
-                           (recur (pop queue) visited)))
-                       (sequence (keep (d/getf objects)) visited)))]
-               (reset! shapes-with-children* result))))
+        deferred-objects
+        (mf/use-deferred objects)
 
         shapes-with-children
-        (deref shapes-with-children*)
+        (mf/with-memo [deferred-selected deferred-objects]
+          (get-shapes-with-children deferred-objects deferred-selected))
 
         total-selected
         (count selected)]
@@ -260,6 +262,10 @@
         (mf/use-ctx ctx/permissions)
         render-context-lost? (mf/deref refs/render-context-lost?)
 
+        ;; While saves fail the workspace is locked and nothing may be edited
+        save-locked?
+        (some? (mf/deref refs/persistence-lock))
+
         options-mode
         (mf/deref refs/options-mode-global)
 
@@ -287,7 +293,7 @@
            (on-option-tab-change "design")))))
 
     [:div {:class (stl/css :tool-window)}
-     (if (and (:can-edit permissions) (not render-context-lost?))
+     (if (and (:can-edit permissions) (not render-context-lost?) (not save-locked?))
        [:> tab-switcher* {:tabs options-tabs
                           :on-change on-option-tab-change
                           :selected (name options-mode)

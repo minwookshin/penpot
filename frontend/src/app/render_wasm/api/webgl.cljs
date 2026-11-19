@@ -5,11 +5,142 @@
 ;; Copyright (c) KALEIDOS SUBSIDIARY SL
 
 (ns app.render-wasm.api.webgl
-  "WebGL utilities for pixel capture and rendering"
+  "WebGL context creation and utilities for pixel capture and rendering"
   (:require
    [app.common.logging :as log]
+   [app.common.math :as mth]
+   [app.common.render-wasm.helpers :as h]
    [app.common.render-wasm.wasm :as wasm]
+   [cuerdas.core :as str]
    [promesa.core :as p]))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Context
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(def default-context-options
+  "Shared WebGL2 context attributes"
+  #js {:antialias false
+       :depth true
+       :stencil true
+       :alpha true
+       :preserveDrawingBuffer true})
+
+(def ^:const ^:private max-surface-size
+  ;; Must match `gpu_state::MAX_SURFACE_SIZE`.
+  8192)
+
+(defn canvas-css-size
+  "Return canvas size in CSS pixels.
+
+  - For DOM canvases: use `clientWidth/clientHeight`.
+  - For OffscreenCanvas: fall back to `width/height` (physical px) converted by DPR."
+  [canvas dpr]
+  (let [cw (.-clientWidth ^js canvas)
+        ch (.-clientHeight ^js canvas)]
+    (if (and (number? cw) (pos? cw)
+             (number? ch) (pos? ch))
+      [cw ch]
+      [(/ (.-width ^js canvas) dpr)
+       (/ (.-height ^js canvas) dpr)])))
+
+(defn clamp-physical-size
+  "Clamp physical pixel dimensions before assigning `canvas.width/height`.
+  Rust `resize` applies the same cap and syncs the effective DPR from the
+  real drawing buffer."
+  [w h]
+  (let [w     (mth/max 1 w)
+        h     (mth/max 1 h)
+        scale (mth/min 1 (/ max-surface-size w) (/ max-surface-size h))]
+    [(mth/max 1 (mth/floor (* scale w)))
+     (mth/max 1 (mth/floor (* scale h)))]))
+
+(defn delete-context!
+  "Deletes an Emscripten GL context by handle.Never throws."
+  [module handle]
+  (when (some? handle)
+    (try
+      ;; We look the method up by string key bc dot access would let `:advanced`
+      ;; builds rename the Emscripten method
+      (let [gl             (unchecked-get module "GL")
+            delete-context (unchecked-get gl "deleteContext")]
+        (when (fn? delete-context)
+          (.call ^js delete-context gl handle)))
+      (catch :default _))))
+
+(defn release-context!
+  "Releases renderer state and a WebGL context owned by the caller.
+  `handle` may be nil if Emscripten registration failed. Each release is
+  attempted even when an earlier one throws; cleanup must preserve the
+  original initialization failure. Writes no global lifecycle state."
+  [module context handle]
+  (when (some? handle)
+    (try
+      (h/call module "_clean_up")
+      (catch :default _)))
+  (try
+    (when-let [ext (.getExtension ^js context "WEBGL_lose_context")]
+      (.loseContext ^js ext))
+    (catch :default _))
+  (delete-context! module handle))
+
+(defn init-context
+  "Create a WebGL2 context on `canvas` and run the WASM renderer init sequence.
+
+  Expects all values resolved by the caller. Writes no `wasm/` atoms and installs
+  no listeners.
+
+  - `opts` has keys `module`, `context-id`, `css-width`, `css-height`, `dpr`,
+     `flags`, `browser`, and `params`.
+  - `module` is the Emscripten module object holding `GL`, `_init`,
+    `_set_render_options`, and `_set_browser`. `context-id` is `\"webgl2\"`
+    (or `\"fail\"` to force the debug failure path).
+  - `css-width` and `css-height` are CSS pixel sizes already probed and clamped
+    to at least 1.
+  - `params` maps tunable keywords to values (which pass to `_set_*` unchecked):
+      - `:antialias_threshold`
+      - `:viewport_interest_area_threshold`
+      - `:max_blocking_time_ms`
+      - `:node_batch_threshold`
+      - `:blur_downscale_threshold`
+
+  Returns `{:context :handle}` or nil when `getContext` returns nil.
+  On failure, releases acquired resources before rethrowing. On success,
+  ownership transfers to the caller."
+  [canvas {:keys [module context-id css-width css-height dpr flags browser params]}]
+  (let [gl      (unchecked-get module "GL")
+        context (.getContext ^js canvas context-id default-context-options)]
+    (when-not (nil? context)
+      (let [handle (volatile! nil)]
+        (try
+          (vreset! handle (.registerContext ^js gl context #js {"majorVersion" 2}))
+          (.makeContextCurrent ^js gl @handle)
+
+          ;; Force the WEBGL_debug_renderer_info extension as emscripten does not enable it
+          (.getExtension context "WEBGL_debug_renderer_info")
+
+          ;; Initialize Wasm Render Engine
+          (h/call module "_init" css-width css-height)
+          (h/call module "_set_render_options" flags dpr)
+
+          ;; Configurable parameters, fixed order to match the editor path.
+          (when-let [value (:antialias_threshold params)]
+            (h/call module "_set_antialias_threshold" value))
+          (when-let [value (:viewport_interest_area_threshold params)]
+            (h/call module "_set_viewport_interest_area_threshold" value))
+          (when-let [value (:max_blocking_time_ms params)]
+            (h/call module "_set_max_blocking_time_ms" value))
+          (when-let [value (:node_batch_threshold params)]
+            (h/call module "_set_node_batch_threshold" value))
+          (when-let [value (:blur_downscale_threshold params)]
+            (h/call module "_set_blur_downscale_threshold" value))
+
+          (h/call module "_set_browser" browser)
+          {:context context
+           :handle  @handle}
+          (catch :default cause
+            (release-context! module context @handle)
+            (throw cause)))))))
 
 (defn get-webgl-context
   "Gets the WebGL context from the WASM module"
@@ -22,6 +153,10 @@
         (let [current-ctx (.-currentContext ^js gl-obj)]
           (when current-ctx
             (.-GLctx ^js current-ctx)))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Bitmap rendering
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 
 (defn create-webgl-texture-from-image
   "Creates a WebGL texture from an HTMLImageElement or ImageBitmap and returns the texture object"
@@ -180,3 +315,73 @@ void main() {
                  (resolve false)))
          (set! (.-src img) uri))))
     (p/resolved false)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Environment
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+(defn- get-gpu-family
+  "Normalize a GPU renderer string to a GPU family. Telemetry sends the
+  family, not the full string, which can help fingerprint a device."
+  [renderer]
+  (let [renderer (str/lower renderer)
+        has?     (fn [& parts] (some #(str/includes? renderer %) parts))]
+    (cond
+      (has? "swiftshader")                   "swiftshader"
+      (has? "llvmpipe" "softpipe")           "llvmpipe"
+      (has? "microsoft basic render")        "microsoft-basic-render"
+      (has? "apple")                         "apple"
+      (has? "nvidia" "geforce" "quadro")     "nvidia"
+      (has? "amd" "radeon")                  "amd"
+      (has? "intel")                         "intel"
+      (has? "adreno")                        "adreno"
+      (has? "mali")                          "mali"
+      (has? "powervr")                       "powervr"
+      :else                                  "other")))
+
+(defn- get-gpu-backend
+  "Graphics API behind the WebGL implementation (ANGLE names it in the
+  renderer string), or nil when the string does not say."
+  [renderer]
+  (let [renderer (str/lower renderer)
+        has?     (fn [& parts] (some #(str/includes? renderer %) parts))]
+    (cond
+      (has? "direct3d11" "d3d11") "d3d11"
+      (has? "direct3d9" "d3d9")   "d3d9"
+      (has? "metal")              "metal"
+      (has? "vulkan")             "vulkan"
+      (has? "opengl")             "opengl")))
+
+(defn- read-gpu-info
+  "GPU details of a live WebGL context, or nil when it is lost."
+  [^js gl]
+  (when-not (.isContextLost gl)
+    (let [^js ext  (.getExtension gl "WEBGL_debug_renderer_info")
+          renderer (or (when ext
+                         (.getParameter gl (.-UNMASKED_RENDERER_WEBGL ext)))
+                       (.getParameter gl (.-RENDERER gl)))]
+      (when (string? renderer)
+        {:gpu-family       (get-gpu-family renderer)
+         :gpu-backend      (get-gpu-backend renderer)
+         :max-texture-size (.getParameter gl (.-MAX_TEXTURE_SIZE gl))}))))
+
+(defonce ^:private gpu-info
+  (volatile! nil))
+
+(defn remember-gpu-info
+  "Keep the GPU details of `gl`, a context the renderer just created, so
+  later events can send them after that context is lost."
+  [gl]
+  (when-let [info (try (read-gpu-info gl) (catch :default _ nil))]
+    (vreset! gpu-info info)))
+
+(defn get-environment
+  "Environment details for WebGL telemetry: GPU family, GPU backend and max
+  texture size when already remembered, device memory, CPU cores and
+  whether the app runs inside Electron. Never creates a WebGL context."
+  []
+  (let [^js navigator js/navigator]
+    (assoc @gpu-info
+           :device-memory (.-deviceMemory navigator)
+           :cpu-cores     (.-hardwareConcurrency navigator)
+           :electron      (str/includes? (.-userAgent navigator) "Electron/"))))

@@ -187,7 +187,8 @@
   (assert (check-changes changes)
           "expected valid changes")
 
-  (if-let [file-data (::file-data (meta changes))]
+  (if-let [file-data (and (not (::skip-local? (meta changes)))
+                          (::file-data (meta changes)))]
     (let [library-data  (::library-data (meta changes))
           index         (::applied-changes-count (meta changes))
           redo-changes  (:redo-changes changes)
@@ -205,6 +206,11 @@
                  ::library-data new-library-data
                  ::applied-changes-count (count redo-changes)))
     changes))
+
+(defn skip-local
+  "Stop applying changes to the builder objects."
+  [changes skip?]
+  (vary-meta changes assoc ::skip-local? skip?))
 
 (defn- without-changes-local
   "Append changes through `f` without applying them to the mounted page's
@@ -242,7 +248,7 @@
    (let [page (::page (meta changes))]
      (mod-page changes page options)))
 
-  ([changes page {:keys [name background pixel-grid-color pixel-grid-opacity]}]
+  ([changes page {:keys [name background pixel-grid-color pixel-grid-opacity] :as options}]
    (let [change {:type :mod-page :id (:id page)}
          redo   (cond-> change
                   (some? name)
@@ -250,6 +256,9 @@
 
                   (some? background)
                   (assoc :background background)
+
+                  (contains? options :background-token)
+                  (assoc :background-token (:background-token options))
 
                   (some? pixel-grid-color)
                   (assoc :pixel-grid-color pixel-grid-color)
@@ -263,6 +272,9 @@
 
                   (some? background)
                   (assoc :background (:background page))
+
+                  (contains? options :background-token)
+                  (assoc :background-token (:background-token page))
 
                   (some? pixel-grid-color)
                   (assoc :pixel-grid-color (:pixel-grid-color page))
@@ -918,7 +930,14 @@
          (apply-changes-local {:apply-to-library? apply-changes-local-library?})))))
 
 (defn update-component
-  [changes id update-fn & {:keys [apply-changes-local-library?]}]
+  "Update a component record.
+
+   By default the change carries only component metadata. Shapes stored inside
+   the component (deleted components keep them in `:objects`) travel as
+   `:mod-obj` changes scoped with `:component-id`, which is what the component
+   sync emits. Pass `:objects? true` to put the whole `:objects` map in the
+   change: it replaces the stored shapes, or drops them when the map is nil."
+  [changes id update-fn & {:keys [apply-changes-local-library? objects?]}]
   (assert-library! changes)
   (let [library-data   (::library-data (meta changes))
         prev-component (get-in library-data [:components id])
@@ -932,8 +951,10 @@
                                               :main-instance-id (:main-instance-id new-component)
                                               :main-instance-page (:main-instance-page new-component)
                                               :annotation (:annotation new-component)
-                                              :objects (:objects new-component) ;; for deleted components
                                               :modified-at (:modified-at new-component)}
+
+                                       objects? (assoc :objects (:objects new-component))
+
                                        (some? (:variant-id new-component))
                                        (assoc :variant-id (:variant-id new-component))
                                        (nil? (:variant-id new-component))
@@ -948,8 +969,10 @@
                                               :path (:path prev-component)
                                               :main-instance-id (:main-instance-id prev-component)
                                               :main-instance-page (:main-instance-page prev-component)
-                                              :annotation (:annotation prev-component)
-                                              :objects (:objects prev-component)}
+                                              :annotation (:annotation prev-component)}
+
+                                       objects? (assoc :objects (:objects prev-component))
+
                                        (some? (:variant-id prev-component))
                                        (assoc :variant-id (:variant-id prev-component))
                                        (nil? (:variant-id prev-component))
@@ -1070,6 +1093,24 @@
          (update :redo-changes conj {:type :set-tokens-status :theme-ids theme-ids :set-ids set-ids})
          (update :undo-changes conj {:type :set-tokens-status :theme-ids prev-theme-ids :set-ids prev-set-ids})
          (apply-changes-local)))))
+
+(defn set-own-tokens-status
+  "Keep aside the tokens status of the file's own tokens-lib, or remove it
+   when `tokens-status` is nil."
+  [changes tokens-status]
+  (assert-library! changes)
+  (assert (or (ctos/tokens-status? tokens-status)
+              (nil? tokens-status)))
+  (let [library-data       (::library-data (meta changes))
+        prev-tokens-status (cfo/get-own-tokens-status library-data)
+        ->change           (fn [tokens-status]
+                             {:type :set-own-tokens-status
+                              :theme-ids (some-> tokens-status ctos/get-active-theme-ids)
+                              :set-ids (some-> tokens-status ctos/get-active-set-ids)})]
+    (-> changes
+        (update :redo-changes conj (->change tokens-status))
+        (update :undo-changes conj (->change prev-tokens-status))
+        (apply-changes-local))))
 
 (defn rename-token-set-group
   [changes set-group-path set-group-fname]

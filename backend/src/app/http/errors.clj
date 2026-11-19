@@ -17,6 +17,7 @@
    [app.http.session :as-alias session]
    [app.util.inet :as inet]
    [clojure.spec.alpha :as s]
+   [cuerdas.core :as str]
    [yetti.request :as yreq]
    [yetti.response :as yres]))
 
@@ -77,9 +78,16 @@
 
 (defmethod handle-error :rate-limit
   [err _ _]
-  (let [headers (-> err ex-data ::http/headers)]
-    {::yres/status 429
-     ::yres/headers headers}))
+  (let [data    (ex-data err)
+        headers (cond-> (::http/headers data)
+                  (some? (:ttl data))
+                  (assoc "retry-after" (str (:ttl data))))]
+    {::yres/status  429
+     ::yres/headers headers
+     ::yres/body    {:type :rate-limit
+                     :code (:code data)
+                     :hint (:hint data)
+                     :ttl  (:ttl data)}}))
 
 (defmethod handle-error :concurrency-limit
   [err _ _]
@@ -115,7 +123,11 @@
           {::yres/status 400 ::yres/body data}))
 
       :else
-      {::yres/status 400 ::yres/body data})))
+      (let [explain (ex/explain data)]
+        {::yres/status 400
+         ::yres/body   (-> data
+                           (dissoc ::sm/explain)
+                           (cond-> explain (assoc :explain explain)))}))))
 
 (defmethod handle-error :assertion
   [error request parent-cause]
@@ -212,6 +224,25 @@
     "25P03" "The transaction was idle too long and was cancelled"
     "A database error occurred"))
 
+(defn- transient-sql-state?
+  "True for SQLSTATE codes of failures that pass on their own: lost or
+  refused connections, lack of resources, a server shutting down, and
+  serialization failures or deadlocks of concurrent transactions."
+  [state]
+  (and (string? state)
+       (or (str/starts-with? state "08")
+           (str/starts-with? state "53")
+           (contains? #{"57P01" "57P02" "57P03" "40001" "40P01"} state))))
+
+(defn- unavailable
+  "Response for a failure that passes on its own: the request can be sent
+  again."
+  [code hint]
+  {::yres/status 503
+   ::yres/body {:type :server-error
+                :code code
+                :hint hint}})
+
 (defmethod handle-exception org.postgresql.util.PSQLException
   [error request parent-cause]
   (let [state (.getSQLState ^java.sql.SQLException error)
@@ -220,6 +251,9 @@
       (l/error :hint "postgresql error"
                :cause cause)
       (cond
+        (transient-sql-state? state)
+        (unavailable :database-unavailable "The database is not available right now")
+
         (= state "57014")
         {::yres/status 504
          ::yres/body {:type :server-error
@@ -260,13 +294,37 @@
                          (assoc :type :server-error)
                          (update :code #(or % :unhandled)))}))))
 
+(defmethod handle-exception java.sql.SQLTransientException
+  [cause request _]
+  (binding [l/*context* (request->context request)]
+    (l/wrn :hint "transient database error" :cause cause)
+    (unavailable :database-unavailable "The database is not available right now")))
+
+(defn- transient-io-exception?
+  "True for I/O failures that pass on their own: a lost, refused or timed
+  out connection, or a host name that did not resolve. A parse error or
+  data that cannot be read fails again on every attempt."
+  [cause]
+  (or (instance? java.net.SocketException cause)
+      (instance? java.io.InterruptedIOException cause)
+      (instance? java.net.UnknownHostException cause)
+      (instance? java.net.http.HttpTimeoutException cause)))
+
 (defmethod handle-exception java.io.IOException
   [cause request _]
   (binding [l/*context* (request->context request)]
     (l/wrn :hint "io exception" :cause cause)
-    {::yres/status 500
-     ::yres/body {:type :server-error
-                  :code :io-exception}}))
+    (if (transient-io-exception? cause)
+      (unavailable :io-exception "An input/output operation failed")
+      {::yres/status 500
+       ::yres/body {:type :server-error
+                    :code :io-exception}})))
+
+(defmethod handle-exception InterruptedException
+  [cause request _]
+  (binding [l/*context* (request->context request)]
+    (l/wrn :hint "interrupted request" :cause cause)
+    (unavailable :interrupted "The request was interrupted")))
 
 (defmethod handle-exception java.util.concurrent.CompletionException
   [cause request _]

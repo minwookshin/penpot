@@ -21,10 +21,12 @@
 Dense agent notes, not prose docs. Prefer invariants, terse bullets.
 Avoid obvious context, rationale, and examples unless they prevent likely mistakes.
 Keep guidance durable and generalizable, not task-local.
+No manual line wrapping: one line per bullet or paragraph, however long. Memories render adapting to the viewport; hard-wrapped lines degrade rendering and diffs.
 
 ## Add/update threshold
 
 Add or update memories only with stable, non-obvious project conventions that avoid complex rediscovery in the future.
+Do not restate what the code already says (comments included): keep only what code cannot represent — decisions and their reasons, cross-file invariants, ordering constraints, environment and tool behavior, and traps that break builds.
 Do not add: quick-read facts; generic language/framework knowledge; one-off task notes; volatile line-level details; behavior likely to change soon.
 
 ## Maintenance Actions

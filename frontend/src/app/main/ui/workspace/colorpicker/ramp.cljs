@@ -97,6 +97,7 @@
          (mf/deps internal-color on-change)
          (fn [saturation value]
            (let [color (-> internal-color
+                           (dissoc :hsl)
                            (assoc :s saturation)
                            (assoc :v value)
                            (enrich-color-map))]
@@ -108,6 +109,7 @@
          (mf/deps internal-color on-change)
          (fn [hue]
            (let [color (-> internal-color
+                           (dissoc :hsl)
                            (assoc :h hue)
                            enrich-color-map)]
              (reset! internal-color* color)
@@ -121,10 +123,15 @@
              (reset! internal-color* color)
              (on-change color))))]
 
+    ;; Syncs with color changes made outside the ramp; the colors the ramp
+    ;; emits come back with the same components and are skipped
     (mf/use-effect
      (mf/deps color)
      (fn []
-       (reset! internal-color* (enrich-color-map color))))
+       (let [color (enrich-color-map color)]
+         (when (not= (select-keys color [:h :s :v :alpha])
+                     (select-keys internal-color [:h :s :v :alpha]))
+           (reset! internal-color* color)))))
 
     [:*
      [:> value-saturation-selector*

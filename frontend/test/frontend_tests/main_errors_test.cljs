@@ -11,13 +11,21 @@
     - stale-asset-error?          – pure predicate
     - exception->error-data       – pure transformer
     - on-error re-entrancy guard  – prevents recursive invocations
-    - flash schedules async emit  – ntf/show is not emitted synchronously
+    - events in flight            – the full report lists the events the
+      store was processing when it caught the exception; a failing stream
+      pipeline lists the emitters of the value, not its own event
+    - on-update-loop              – never throws into the scheduler's caller;
+      reports the throttled loop as unhandled, with the events in flight
+    - flash schedules async report and toast – neither the report nor
+      ntf/show is emitted synchronously
     - organization SSO recovery   – expired SSO sessions go back to the provider
     - invalid-sso-config handler  – requires :organization-id to promote to :sso-error
     - save failure notification   – sticky toast carrying the error report
     - delegated save failures     – causes handled by the handler for their type"
   (:require
+   [app.common.exceptions :as ex]
    [app.common.uuid :as uuid]
+   [app.main.data.event :as ev]
    [app.main.data.persistence :as dps]
    [app.main.data.workspace :as-alias dw]
    [app.main.errors :as errors]
@@ -31,8 +39,19 @@
    [app.util.webapi :as wapi]
    [beicon.v2.core :as rx]
    [cljs.test :as t :include-macros true]
+   [cuerdas.core :as str]
+   [frontend-tests.helpers.async :as async]
    [frontend-tests.helpers.mock :as mock]
    [potok.v2.core :as ptk]))
+
+(defn- quiet-throwable
+  "Console stub for the tests that run a real error handler end to end.
+  Those handlers print the cause with `ex/print-throwable` before notifying,
+  which is what a developer wants in the app; in a test it only floods the
+  run log, and one of them replays the same error thousands of times. No
+  test asserts the printed text, so the stub changes nothing but the noise."
+  [& _]
+  nil)
 
 ;; ---------------------------------------------------------------------------
 ;; stale-asset-error?
@@ -97,6 +116,264 @@
           data (errors/exception->error-data err)]
       (t/is (= "fallback message" (:hint data))))))
 
+;; Shared report-test helpers (copied from the governor suite so each
+;; namespace stays self-contained).
+(t/use-fixtures :each {:before #(errors/reset-report-governor!)})
+
+(defn- error-cause
+  [& {:keys [type code hint]}]
+  (ex-info (or hint "boom")
+           (cond-> {}
+             (some? type) (assoc :type type)
+             (some? code) (assoc :code code)
+             (some? hint) (assoc :hint hint))))
+
+(defn- capture-reports!
+  "Run `f` capturing the events emitted through `st/emit!`."
+  [f]
+  (let [events (atom [])]
+    (with-redefs [st/emit!            (mock/stub (fn [& emitted] (swap! events into emitted)))
+                  rt/get-current-href (constantly "https://penpot.example.com/#/workspace")]
+      (f)
+      @events)))
+
+(defn- report-events
+  "The audit events (report emissions) out of everything collected through
+  the `st/emit!` double. Toasts are ungoverned by design — one per `flash`
+  call — so only the events typed as audit events count for emission
+  bounds. Discriminates by `ptk/type`, which is total (never throws),
+  because toasts are not derefable."
+  [events]
+  (filter #(= ::ev/event (ptk/type %)) events))
+
+(defn- ^:async report-names
+  "Drives `flash-persistence` with an `ex-data` map of `cause-data` and
+  returns the audit event names it emitted, in order.
+
+  The report generator is stubbed and the scheduler runs its callback
+  inline, so the whole flash body completes before returning. The emitter
+  is the only observable."
+  [cause-data]
+  (let [events (atom [])
+        cause  (ex-info "Save failed" (assoc cause-data :hint "Save failed"))]
+    ;; The governor is global and remembers fingerprints for two minutes, so
+    ;; a second identical report would be suppressed. Clear it per case.
+    (errors/reset-report-governor!)
+    (await
+     (mock/with-mocks*
+       {errors/generate-report (fn [_ & _] "generated error report")
+        st/emit!               (mock/stub (fn [& emitted]
+                                            (swap! events into emitted)))
+        ;; `schedule` is multi-arity, so the mock needs every arity the
+        ;; flash body may call it with.
+        tm/schedule            (mock/stub (fn
+                                            ([] nil)
+                                            ([callback] (callback))
+                                            ([_ms callback] (callback))))}
+       (errors/flash-persistence cause)))
+    (mapv #(-> % deref ::ev/name) (report-events @events))))
+
+;; ---------------------------------------------------------------------------
+;; Environment failures
+;;
+;; Connectivity and service failures are not application defects: they are
+;; audit-only telemetry with a compact report and a dedicated toast.
+;; ---------------------------------------------------------------------------
+
+(t/deftest environment-error-classification
+  (t/testing "environment failures are recognised"
+    (doseq [type [:network :offline :bad-gateway :service-unavailable
+                  :gateway-error :nitrate-unavailable :nitrate-not-configured]]
+      (t/is (true? (errors/environment-error? (error-cause :type type)))
+            (str "expected environment error: " type))))
+  (t/testing "application defects are not environment failures"
+    (doseq [type [:internal :assertion :persistence :validation :authentication]]
+      (t/is (false? (errors/environment-error? (error-cause :type type)))
+            (str "did not expect environment error: " type))))
+  (t/testing "causes without ex-data are not environment failures"
+    (t/is (false? (errors/environment-error? (js/Error. "plain failure"))))
+    (t/is (false? (errors/environment-error? nil)))))
+
+(t/deftest ^:async generate-report-compact-omits-stack-data-and-last-events
+  (await
+   (mock/with-mocks*
+     {st/format-last-events (mock/stub (fn [& _] (throw (ex-info "must not be called" {}))))
+      rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")}
+     (let [cause  (ex-info "http error" {:type :offline
+                                         :hint "http error"
+                                         :uri "/api/rpc/command/update-file"
+                                         :headers {"x-session-id" "secret"}})
+           report (errors/generate-report cause {:format :compact})]
+       (t/is (string? report))
+       (t/is (str/includes? report "Hint:"))
+       (t/is (str/includes? report "http error"))
+       (t/is (str/includes? report ":offline"))
+       (t/is (str/includes? report "/api/rpc/command/update-file"))
+       (t/is (not (str/includes? report "Last events:")))
+       (t/is (not (str/includes? report "Data:")))
+       (t/is (not (str/includes? report "====")))
+       (t/is (not (str/includes? report "secret")))
+       ;; Trailing settle: the body is synchronous, but `with-mocks*`
+       ;; evaluates to a promise, so the body must settle one.
+       (await (async/settle))))))
+
+(t/deftest ^:async generate-report-defaults-to-the-full-format
+  (await
+   (mock/with-mocks*
+     {st/format-last-events (mock/stub (fn [& _] "(stub last events)"))
+      rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")}
+     (let [report (errors/generate-report (error-cause :type :internal :hint "boom"))]
+       (t/is (str/includes? report "Last events:"))
+       (t/is (str/includes? report "(stub last events)"))
+       ;; Trailing settle: the body is synchronous, but `with-mocks*`
+       ;; evaluates to a promise, so the body must settle one.
+       (await (async/settle))))))
+
+(t/deftest ^:async generate-report-bounds-a-huge-exception-message
+  ;; A message can embed a whole payload (a serialized file) and reach
+  ;; megabytes. The report must keep a bounded head in both the context and
+  ;; the trace, so the audit event built from it can never bloat.
+  (await
+   (mock/with-mocks*
+     {st/format-last-events (mock/stub (fn [& _] "(stub last events)"))
+      rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")}
+     (let [huge   (apply str (repeat 200000 "z"))
+           report (errors/generate-report (js/Error. huge))]
+       (t/is (string? report))
+       (t/is (< (count report) 50000))
+       (t/is (not (str/includes? report (subs huge 0 1500))))
+       ;; Trailing settle: the body is synchronous, but `with-mocks*`
+       ;; evaluates to a promise, so the body must settle one.
+       (await (async/settle))))))
+
+(t/deftest ^:async connectivity-handlers-report-governed-compact-audit-events
+  ;; Scenario: a network failure and an offline status through the global
+  ;; handler. Each is reported as a governed compact audit event plus its
+  ;; connection toast. Proves: per type, report first and toast right after,
+  ;; with no stack in the report and the dedicated toast message.
+  (doseq [type [:network :offline :gateway-error]]
+    (errors/reset-report-governor!)
+    (let [events (atom [])
+          cause  (ex-info "http error" {:type type :hint "http error"})]
+      (await
+       (mock/with-mocks*
+         {ex/print-throwable    quiet-throwable
+          st/emit!              (mock/stub (fn [& emitted] (swap! events into emitted)))
+          rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")
+          tm/schedule           (mock/stub (fn [f] (f)))
+          st/format-last-events (mock/stub (fn [& _] (throw (ex-info "must not be called" {}))))}
+         (errors/on-error cause)
+         (await (async/settle))
+         ;; `flash` emits the report first and schedules the toast right after.
+         (t/is (= 2 (count @events)) (str "unexpected event count for " type))
+         (let [report-event (first @events)
+               toast-event  (second @events)
+               props        (deref report-event)]
+           (t/is (= "handled-exception" (::ev/name props)))
+           (t/is (not (str/includes? (:report props) "Last events:")))
+           (t/is (= (i18n/tr "errors.connection-error")
+                    (get-in (ptk/update toast-event {}) [:notification :content])))))))))
+
+(t/deftest ^:async flash-keeps-the-canonical-event-name-and-derives-the-format
+  ;; Scenario: an environment failure flashed as `:handled` and as
+  ;; `:unhandled`. The audit event name is the canonical one requested by
+  ;; the caller while only the payload format derives from the cause
+  ;; (compact, with no stack and no header dump). Proves: per type, one
+  ;; compact audit event under the requested name, with the `flash`
+  ;; awaited to completion.
+  (let [cause (ex-info "http error" {:type :network
+                                     :hint "http error"
+                                     :headers {"x-session-id" "secret"}})]
+    (doseq [[type event-name] [[:handled "handled-exception"]
+                               [:unhandled "unhandled-exception"]]]
+      (errors/reset-report-governor!)
+      (let [events (atom [])]
+        (await
+         (mock/with-mocks*
+           {st/emit!              (mock/stub (fn [& emitted] (swap! events into emitted)))
+            rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")
+            tm/schedule           (mock/stub (fn [f] (mock/asap f)))
+            st/format-last-events (mock/stub (fn [& _] (throw (ex-info "must not be called" {}))))}
+           ;; The event name is the canonical one requested by the caller;
+           ;; only the payload format is derived from the cause.
+           (await (errors/flash :cause cause :type type))
+           (let [reports (report-events @events)]
+             (t/is (= 1 (count reports)) (str "unexpected event count for " type))
+             (let [props  (deref (first reports))
+                   report (:report props)]
+               (t/is (= event-name (::ev/name props)) (str "event name for " type))
+               (t/is (not (str/includes? report "Last events:")))
+               (t/is (not (str/includes? report "secret")))))))))))
+
+(t/deftest ^:async offline-loop-is-governed-and-never-unhandled
+  ;; Scenario: 10 000 offline errors through the global handler, replaying
+  ;; a connectivity outage. Every occurrence is handled (never unhandled)
+  ;; and the governor emits only the first. Proves: one `handled-exception`
+  ;; audit event for the whole loop, observed after timers drain.
+  (let [events (atom [])
+        cause  (ex-info "http error" {:type :offline :hint "http error"})]
+    (await
+     (mock/with-mocks*
+       {ex/print-throwable    quiet-throwable
+        st/emit!              (mock/stub (fn [& emitted] (swap! events into emitted)))
+        rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")
+        tm/schedule           (mock/stub (fn [f] (mock/asap f)))
+        st/format-last-events (mock/stub (fn [& _] (throw (ex-info "must not be called" {}))))}
+       (dotimes [_ 10000]
+         (errors/on-error cause))
+       (await (async/settle))
+       (t/is (= 1 (count (report-events @events))))
+       (t/is (= "handled-exception" (::ev/name (deref (first (report-events @events))))))))))
+
+(t/deftest ^:async flash-persistence-uses-compact-reports-for-environment-failures
+  ;; Scenario: a save failure caused by the environment. `flash-persistence`
+  ;; delegates to `flash`, so the audit event carries a compact report
+  ;; (context only: no stack, no header dump). Proves: one
+  ;; `handled-exception` with a compact payload, observed after timers
+  ;; drain.
+  (let [events (atom [])]
+    (await
+     (mock/with-mocks*
+       {st/emit!              (mock/stub (fn [& emitted] (swap! events into emitted)))
+        rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")
+        tm/schedule           (mock/stub (fn [f] (mock/asap f)))
+        st/format-last-events (mock/stub (fn [& _] (throw (ex-info "must not be called" {}))))}
+       (errors/flash-persistence (ex-info "http error" {:type :offline
+                                                        :hint "http error"
+                                                        :headers {"x-session-id" "secret"}}))
+       (await (async/settle))
+       (let [reports (report-events @events)]
+         (t/is (= 1 (count reports)))
+         (let [props (deref (first reports))]
+           (t/is (= "handled-exception" (::ev/name props)))
+           (t/is (not (str/includes? (:report props) "Last events:")))
+           (t/is (not (str/includes? (:report props) "secret")))))))))
+
+(t/deftest exception-page-reports-dedup-by-cause
+  (let [cause-a (error-cause :type :internal :code :unable-to-process-repository-response :hint "boom")
+        cause-b (error-cause :type :internal :code :other :hint "other")
+        events  (capture-reports!
+                 (fn []
+                   (errors/submit-report :event-name "exception-page"
+                                         :report "report" :hint "boom" :cause cause-a)
+                   (errors/submit-report :event-name "exception-page"
+                                         :report "report" :hint "different hint" :cause cause-a)
+                   (errors/submit-report :event-name "exception-page"
+                                         :report "report" :hint "other" :cause cause-b)))]
+    (t/is (= 2 (count events)))))
+
+(t/deftest reports-of-the-same-cause-under-different-names-do-not-coalesce
+  (let [cause  (error-cause :type :internal :hint "boom")
+        events (capture-reports!
+                (fn []
+                  (errors/submit-report :event-name "handled-exception"
+                                        :report "report" :hint "boom" :cause cause)
+                  (errors/submit-report :event-name "unhandled-exception"
+                                        :report "report" :hint "boom" :cause cause)
+                  (errors/submit-report :event-name "exception-page"
+                                        :report "report" :hint "boom" :cause cause)))]
+    (t/is (= 3 (count events)))))
+
 ;; ---------------------------------------------------------------------------
 ;; on-error dispatches to ptk/handle-error
 ;;
@@ -153,6 +430,168 @@
     (t/is (= 1 @reentrant-call-count))))
 
 ;; ---------------------------------------------------------------------------
+;; Events in flight
+;;
+;; on-error records the events the store is processing when it catches an
+;; exception; the full report lists them, outermost first.
+;; ---------------------------------------------------------------------------
+
+(def ^:private in-flight-cause (atom nil))
+
+(defmethod ptk/handle-error ::test-in-flight
+  [err]
+  (reset! in-flight-cause (::errors/instance err))
+  nil)
+
+(def ^:private in-flight-heading
+  "Events in flight when the error was caught (outermost first):")
+
+(defn- in-flight-failure
+  []
+  (ex-info "in-flight failure" {:type ::test-in-flight :hint "in-flight failure"}))
+
+(defn- recursive-event
+  [n]
+  (ptk/reify ::test-in-flight-recursive
+    ptk/WatchEvent
+    (watch [_ _ _]
+      (if (pos? n)
+        (rx/of (recursive-event (dec n)))
+        (throw (in-flight-failure))))))
+
+(t/deftest ^:async report-lists-the-events-in-flight-of-a-failing-event
+  (let [store (ptk/store {:state {} :on-error errors/on-error})]
+    (try
+      (await
+       (mock/with-mocks*
+         {st/state              store
+          st/format-last-events (mock/stub (fn [& _] "(stub last events)"))
+          rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")}
+         (reset! in-flight-cause nil)
+         (st/emit!
+          (ptk/reify ::test-in-flight-outer
+            ptk/WatchEvent
+            (watch [_ _ _]
+              (rx/of (ptk/reify ::test-in-flight-inner
+                       ptk/UpdateEvent
+                       (update [_ _] (throw (in-flight-failure))))))))
+         (await (async/wait-for #(some? @in-flight-cause) "the failure reaches the handler"))
+         (let [report (errors/generate-report @in-flight-cause)
+               outer  (.indexOf report "typ:(:frontend-tests.main-errors-test/test-in-flight-outer)")
+               inner  (.indexOf report "typ:(:frontend-tests.main-errors-test/test-in-flight-inner)")]
+           (t/is (str/includes? report in-flight-heading))
+           (t/is (< -1 outer inner) "outer event listed before the failing one"))))
+      (finally
+        (rx/dispose! store)))))
+
+(t/deftest ^:async report-keeps-both-ends-of-a-long-in-flight-list
+  (let [store (ptk/store {:state {} :on-error errors/on-error})]
+    (try
+      (await
+       (mock/with-mocks*
+         {st/state              store
+          st/format-last-events (mock/stub (fn [& _] "(stub last events)"))
+          rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")}
+         (reset! in-flight-cause nil)
+         ;; 25 nested events: 10 from each end are kept
+         (st/emit! (recursive-event 24))
+         (await (async/wait-for #(some? @in-flight-cause) "the failure reaches the handler"))
+         (let [report (errors/generate-report @in-flight-cause)]
+           (t/is (str/includes? report "... 5 more ..."))
+           (t/is (= 20 (count (re-seq #"test-in-flight-recursive" report)))))))
+      (finally
+        (rx/dispose! store)))))
+
+(defn- in-flight-section
+  "The in-flight section of `report`, or nil when absent."
+  [report]
+  (let [start (.indexOf report in-flight-heading)]
+    (when (<= 0 start)
+      (subs report start (.indexOf report "Last events:" start)))))
+
+(t/deftest ^:async stream-pipeline-failure-lists-the-emitters-of-the-value
+  (let [store (ptk/store {:state {} :on-error errors/on-error})]
+    (try
+      (await
+       (mock/with-mocks*
+         {st/state              store
+          st/format-last-events (mock/stub (fn [& _] "(stub last events)"))
+          rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")}
+         (reset! in-flight-cause nil)
+         ;; The listener's pipeline fails on the trigger that the emitter emits
+         (st/emit!
+          (ptk/reify ::test-in-flight-listener
+            ptk/WatchEvent
+            (watch [_ _ stream]
+              (->> stream
+                   (rx/filter (ptk/type? ::test-in-flight-trigger))
+                   (rx/take 1)
+                   (rx/map (fn [_] (throw (in-flight-failure)))))))
+          (ptk/reify ::test-in-flight-emitter
+            ptk/WatchEvent
+            (watch [_ _ _]
+              (rx/of (ptk/data-event ::test-in-flight-trigger {})))))
+         (await (async/wait-for #(some? @in-flight-cause) "the failure reaches the handler"))
+         (let [section (in-flight-section (errors/generate-report @in-flight-cause))]
+           (t/is (str/includes? section "test-in-flight-emitter"))
+           (t/is (not (str/includes? section "test-in-flight-trigger")))
+           (t/is (not (str/includes? section "test-in-flight-listener"))))))
+      (finally
+        (rx/dispose! store)))))
+
+(t/deftest ^:async delayed-watch-failure-has-no-in-flight-section
+  (let [store (ptk/store {:state {} :on-error errors/on-error})]
+    (try
+      (await
+       (mock/with-mocks*
+         {st/state              store
+          st/format-last-events (mock/stub (fn [& _] "(stub last events)"))
+          rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")}
+         (reset! in-flight-cause nil)
+         (st/emit!
+          (ptk/reify ::test-in-flight-delayed
+            ptk/WatchEvent
+            (watch [_ _ _]
+              (->> (rx/timer 0)
+                   (rx/map (fn [_] (throw (in-flight-failure))))))))
+         (await (async/wait-for #(some? @in-flight-cause) "the failure reaches the handler"))
+         (let [report (errors/generate-report @in-flight-cause)]
+           (t/is (not (str/includes? report in-flight-heading)))
+           (t/is (str/includes? report "Last events:")))))
+      (finally
+        (rx/dispose! store)))))
+
+(t/deftest ^:async update-loop-handler-never-throws
+  (await
+   (mock/with-mocks*
+     {ptk/in-flight-events (fn [_] (throw (js/Error. "in-flight read failure")))}
+     (t/is (nil? (errors/on-update-loop {:rounds 26}))))))
+
+(t/deftest ^:async update-loop-is-reported-with-the-events-in-flight
+  (errors/reset-report-governor!)
+  (vreset! @#'errors/update-loop-warned-at 0)
+  (let [events (atom [])
+        loop-ev (ptk/reify ::test-update-loop-source)]
+    (await
+     (mock/with-mocks*
+       {st/emit!              (mock/stub (fn [& emitted] (swap! events into emitted)))
+        ptk/in-flight-events  (fn [_] [loop-ev])
+        st/format-last-events (mock/stub (fn [& _] "(stub last events)"))
+        rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")
+        tm/schedule           (mock/stub (fn [f] (f)))}
+       (errors/on-update-loop {:rounds 26})
+       ;; A second trip within the window is not reported again
+       (errors/on-update-loop {:rounds 26})
+       (t/is (= 1 (count @events)))
+       (let [props (deref (first @events))]
+         ;; An unhandled report: it reaches the error reports and alerts,
+         ;; not only the audit log.
+         (t/is (= "unhandled-exception" (::ev/name props)))
+         (t/is (= "update loop throttled" (:hint props)))
+         (t/is (str/includes? (in-flight-section (:report props))
+                              "test-update-loop-source")))))))
+
+;; ---------------------------------------------------------------------------
 ;; Expired organization SSO session
 ;;
 ;; The backend rejects SSO-guarded requests with an :authentication error
@@ -160,6 +599,9 @@
 ;; The user must be sent back through the identity provider instead of
 ;; being told they have no access to the file.
 ;; ---------------------------------------------------------------------------
+
+(def ^:private workspace-query-string
+  "screen=workspace&team-id=b8f8bb52-8b70-8144-8004-4a5085f0bdc9")
 
 (def ^:private workspace-href
   "https://penpot.example.com/#/workspace?team-id=b8f8bb52-8b70-8144-8004-4a5085f0bdc9")
@@ -173,152 +615,144 @@
    :organization-id organization-id
    :team-id "b8f8bb52-8b70-8144-8004-4a5085f0bdc9"})
 
-(t/deftest expired-organization-sso-navigates-to-identity-provider
-  (t/async done
-    (t/testing "the browser is sent to the identity provider instead of an error page"
-      (let [events (atom [])]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub
-                             (fn [_command _params]
-                               (rx/of {:authorized false
-                                       :redirect-uri "https://idp.example.com/authorize"})))
-           rt/get-current-href (constantly workspace-href)
-           st/emit!         (mock/stub (fn [& emitted] (swap! events into emitted)))}
-          (fn [done']
-            (errors/on-error (sso-required-error))
-            (t/is (= [::rt/nav-raw] (mapv ptk/type @events)))
-            (done'))
-          done)))))
+(t/deftest ^:async expired-organization-sso-navigates-to-identity-provider
+  (t/testing "the browser is sent to the identity provider instead of an error page"
+    (let [events (atom [])]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub
+                            (fn [_command _params]
+                              (rx/of {:authorized false
+                                      :redirect-uri "https://idp.example.com/authorize"})))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          st/emit!         (mock/stub (fn [& emitted] (swap! events into emitted)))}
+         (errors/on-error (sso-required-error))
+         (await (async/settle))
+         (t/is (= [::rt/nav-raw] (mapv ptk/type @events))))))))
 
-(t/deftest expired-organization-sso-comes-back-to-the-current-location
-  (t/async done
-    (t/testing "the SSO check asks the provider to return the user where they were"
-      (let [rpc-calls (atom [])]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub
-                             (fn [command params]
-                               (swap! rpc-calls conj {:command command :params params})
-                               (rx/of {:authorized false
-                                       :redirect-uri "https://idp.example.com/authorize"})))
-           rt/get-current-href (constantly workspace-href)
-           st/emit!         mock/noop}
-          (fn [done']
-            (errors/on-error (sso-required-error))
-            (t/is (= [{:command :check-nitrate-sso
-                       :params {:team-id "b8f8bb52-8b70-8144-8004-4a5085f0bdc9"
-                                :organization-id organization-id
-                                :url workspace-href}}]
-                     @rpc-calls))
-            (done'))
-          done)))))
+(t/deftest ^:async expired-organization-sso-comes-back-to-the-current-location
+  (t/testing "the SSO check asks the provider to return the user where they were"
+    (let [rpc-calls (atom [])]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub
+                            (fn [command params]
+                              (swap! rpc-calls conj {:command command :params params})
+                              (rx/of {:authorized false
+                                      :redirect-uri "https://idp.example.com/authorize"})))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          st/emit!         mock/noop}
+         (errors/on-error (sso-required-error))
+         (await (async/settle))
+         (t/is (= [{:command :check-nitrate-sso
+                    :params {:team-id "b8f8bb52-8b70-8144-8004-4a5085f0bdc9"
+                             :organization-id organization-id
+                             :query-string workspace-query-string}}]
+                  @rpc-calls)))))))
 
-(t/deftest already-satisfied-organization-sso-retries-the-location
-  (t/async done
-    (t/testing "a session renewed meanwhile (e.g. in another tab) reloads instead of erroring"
-      (let [events (atom [])]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub
-                             (fn [_command _params]
-                               (rx/of {:authorized true :reason :sso-satisfied})))
-           rt/get-current-href (constantly workspace-href)
-           st/emit!         (mock/stub (fn [& emitted] (swap! events into emitted)))}
-          (fn [done']
-            (errors/on-error (sso-required-error))
-            (t/is (= [::rt/reload] (mapv ptk/type @events)))
-            (done'))
-          done)))))
+(t/deftest ^:async already-satisfied-organization-sso-retries-the-location
+  (t/testing "a session renewed meanwhile (e.g. in another tab) reloads instead of erroring"
+    (let [events (atom [])]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub
+                            (fn [_command _params]
+                              (rx/of {:authorized true :reason :sso-satisfied})))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          st/emit!         (mock/stub (fn [& emitted] (swap! events into emitted)))}
+         (errors/on-error (sso-required-error))
+         (await (async/settle))
+         (t/is (= [::rt/reload] (mapv ptk/type @events))))))))
 
-(t/deftest organization-sso-without-usable-provider-shows-the-sso-error-dialog
-  (t/async done
-    (t/testing "SSO is required but there is nowhere to go: offer a retry, not a permission error"
-      (let [assigned* (atom nil)]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub
-                             (fn [_command _params]
-                               (rx/of {:authorized false :redirect-uri nil})))
-           rt/get-current-href (constantly workspace-href)
-           rt/assign-exception (fn [error]
-                                 (reset! assigned* error)
-                                 (ptk/data-event ::assigned error))}
-          (fn [done']
-            (errors/on-error (sso-required-error))
-            (t/is (= :sso-error (:type @assigned*)))
-            (t/is (= organization-id (:organization-id @assigned*)))
-            (t/is (true? (:is-workspace @assigned*)))
-            (done'))
-          done)))))
+(t/deftest ^:async organization-sso-without-usable-provider-shows-the-sso-error-dialog
+  (t/testing "SSO is required but there is nowhere to go: offer a retry, not a permission error"
+    (let [assigned* (atom nil)]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub
+                            (fn [_command _params]
+                              (rx/of {:authorized false :redirect-uri nil})))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          rt/assign-exception (fn [error]
+                                (reset! assigned* error)
+                                (ptk/data-event ::assigned error))}
+         (errors/on-error (sso-required-error))
+         (await (async/settle))
+         (t/is (= :sso-error (:type @assigned*)))
+         (t/is (= organization-id (:organization-id @assigned*)))
+         (t/is (true? (:is-workspace @assigned*))))))))
 
-(t/deftest organization-sso-without-team-access-reports-a-permission-failure
-  (t/async done
-    (t/testing "a user who cannot reach the team keeps getting the authentication error"
-      (let [assigned* (atom nil)]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub
-                             (fn [_command _params]
-                               (rx/of {:authorized true :reason :no-team-access})))
-           rt/get-current-href (constantly workspace-href)
-           rt/assign-exception (fn [error]
-                                 (reset! assigned* error)
-                                 (ptk/data-event ::assigned error))}
-          (fn [done']
-            (errors/on-error (sso-required-error))
-            (t/is (= :authentication (:type @assigned*)))
-            (t/is (= :nitrate-sso-required (:code @assigned*)))
-            (done'))
-          done)))))
+(t/deftest ^:async organization-sso-without-team-access-reports-a-permission-failure
+  (t/testing "a user who cannot reach the team keeps getting the authentication error"
+    (let [assigned* (atom nil)]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub
+                            (fn [_command _params]
+                              (rx/of {:authorized true :reason :no-team-access})))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          rt/assign-exception (fn [error]
+                                (reset! assigned* error)
+                                (ptk/data-event ::assigned error))}
+         (errors/on-error (sso-required-error))
+         (await (async/settle))
+         (t/is (= :authentication (:type @assigned*)))
+         (t/is (= :nitrate-sso-required (:code @assigned*))))))))
 
-(t/deftest organization-sso-does-not-retry-on-an-unexplained-authorization
-  (t/async done
-    (t/testing "reloading on an answer we don't understand would spin on the same rejection"
-      (let [events (atom [])]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub (fn [_command _params] (rx/of {:authorized true})))
-           rt/get-current-href (constantly workspace-href)
-           rt/assign-exception (fn [error] (ptk/data-event ::assigned error))
-           st/async-emit!   (fn [& emitted] (swap! events into emitted))}
-          (fn [done']
-            (errors/on-error (sso-required-error))
-            (t/is (= [::assigned] (mapv ptk/type @events)))
-            (done'))
-          done)))))
+(t/deftest ^:async organization-sso-does-not-retry-on-an-unexplained-authorization
+  (t/testing "reloading on an answer we don't understand would spin on the same rejection"
+    (let [events (atom [])]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub (fn [_command _params] (rx/of {:authorized true})))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          rt/assign-exception (fn [error] (ptk/data-event ::assigned error))
+          st/async-emit!   (fn [& emitted] (swap! events into emitted))}
+         (errors/on-error (sso-required-error))
+         (await (async/settle))
+         (t/is (= [::assigned] (mapv ptk/type @events))))))))
 
-(t/deftest organization-sso-error-without-context-is-reported-as-it-arrives
-  (t/async done
-    (t/testing "with no organization and no team there is nothing to check"
-      (let [rpc-calls (atom 0)
-            assigned* (atom nil)]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub (fn [_command _params]
-                                         (swap! rpc-calls inc)
-                                         (rx/empty)))
-           rt/get-current-href (constantly workspace-href)
-           rt/assign-exception (fn [error]
-                                 (reset! assigned* error)
-                                 (ptk/data-event ::assigned error))}
-          (fn [done']
-            (errors/on-error {:type :authentication
-                              :code :nitrate-sso-required})
-            (t/is (zero? @rpc-calls))
-            (t/is (= :nitrate-sso-required (:code @assigned*)))
-            (done'))
-          done)))))
+(t/deftest ^:async organization-sso-error-without-context-is-reported-as-it-arrives
+  (t/testing "with no organization and no team there is nothing to check"
+    (let [rpc-calls (atom 0)
+          assigned* (atom nil)]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub (fn [_command _params]
+                                        (swap! rpc-calls inc)
+                                        (rx/empty)))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          rt/assign-exception (fn [error]
+                                (reset! assigned* error)
+                                (ptk/data-event ::assigned error))}
+         (errors/on-error {:type :authentication
+                           :code :nitrate-sso-required})
+         (await (async/settle))
+         (t/is (zero? @rpc-calls))
+         (t/is (= :nitrate-sso-required (:code @assigned*))))))))
 
-(t/deftest a-resultless-organization-sso-check-does-not-wedge-later-rejections
-  (t/async done
-    (t/testing "the one-in-flight guard is released even when no answer arrives"
-      (let [rpc-calls (atom 0)]
-        (mock/with-mocks
-          {rp/cmd!          (mock/stub (fn [_command _params]
-                                         (swap! rpc-calls inc)
-                                         (rx/empty)))
-           rt/get-current-href (constantly workspace-href)
-           st/emit!         mock/noop}
-          (fn [done']
-            (errors/on-error (sso-required-error))
-            (errors/on-error (sso-required-error))
-            (t/is (= 2 @rpc-calls))
-            (done'))
-          done)))))
+(t/deftest ^:async a-resultless-organization-sso-check-does-not-wedge-later-rejections
+  (t/testing "the one-in-flight guard is released even when no answer arrives"
+    (let [rpc-calls (atom 0)]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!          (mock/stub (fn [_command _params]
+                                        (swap! rpc-calls inc)
+                                        (rx/empty)))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          st/emit!         mock/noop}
+         (errors/on-error (sso-required-error))
+         (errors/on-error (sso-required-error))
+         (await (async/settle))
+         (t/is (= 2 @rpc-calls)))))))
 
 ;; A failing check must stay a failing check: the generic handling turns it
 ;; into a toast, whereas swallowing it would show a permission error for
@@ -332,35 +766,33 @@
   [error]
   (swap! check-failures conj error))
 
-(t/deftest failing-organization-sso-check-is-not-reported-as-missing-access
-  (t/async done
+(t/deftest ^:async failing-organization-sso-check-is-not-reported-as-missing-access
+  (t/testing "the SSO check fails like a real request (later tick) and the failure stays a failure"
     (reset! check-failures [])
     (let [assigned* (atom nil)]
-      (mock/with-mocks
-        {rp/cmd!
-         (mock/stub
-          (fn [_command _params]
-            (->> (rx/timer 0)
-                 (rx/mapcat (fn [_]
-                              (rx/throw (ex-info "boom" {:type ::test-check-failure})))))))
+      (await
+       (mock/with-mocks*
+         {rp/cmd!
+          (mock/stub
+           (fn [_command _params]
+             (->> (rx/timer 0)
+                  (rx/mapcat (fn [_]
+                               (rx/throw (ex-info "boom" {:type ::test-check-failure})))))))
 
-         rt/get-current-href
-         (constantly workspace-href)
+          rt/get-current-href
+          (constantly workspace-href)
+          rt/get-current-query-string
+          (constantly workspace-query-string)
 
-         rt/assign-exception
-         (fn [error]
-           (reset! assigned* error)
-           (ptk/data-event ::assigned error))}
-
-        (fn [done']
-          (errors/on-error (sso-required-error))
-          (tm/schedule
-           50
-           (fn []
-             (t/is (= [::test-check-failure] (mapv :type @check-failures)))
-             (t/is (nil? @assigned*))
-             (done'))))
-        done))))
+          rt/assign-exception
+          (fn [error]
+            (reset! assigned* error)
+            (ptk/data-event ::assigned error))}
+         (errors/on-error (sso-required-error))
+         (await (async/wait-for #(= 1 (count @check-failures))
+                                "sso check failure observed"))
+         (t/is (= [::test-check-failure] (mapv :type @check-failures)))
+         (t/is (nil? @assigned*)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; :validation / :invalid-sso-config
@@ -422,7 +854,18 @@
           (t/is (= timeout (get-in state [:notification :timeout])))
           (t/is (= :visible (get-in state [:notification :status]))))))))
 
-(t/deftest persistence-notifications-include-an-error-report-download
+(t/deftest flash-shows-errors-unless-asked-for-another-level
+  (doseq [[notify level] [[#(errors/flash :hint "Ordinary error") :error]
+                          [#(errors/flash :hint "Undone changes" :level :warning) :warning]]]
+    (let [scheduled (atom [])
+          events    (atom [])]
+      (with-redefs [tm/schedule (mock/stub #(swap! scheduled conj %))
+                    st/emit! (mock/stub (fn [& emitted] (swap! events into emitted)))]
+        (notify)
+        (doseq [callback @scheduled] (callback))
+        (t/is (= level (get-in (ptk/update (first @events) {}) [:notification :level])))))))
+
+(t/deftest ^:async persistence-notifications-include-an-error-report-download
   (let [scheduled      (atom [])
         idle-callbacks (atom [])
         events         (atom [])
@@ -430,66 +873,142 @@
         revoked        (atom [])
         report         "generated error report"
         cause          (ex-info "Save failed" {:type :validation})]
-    (with-redefs [dom/prevent-default         (fn [_])
-                  dom/trigger-download-uri    (fn [& params]
-                                                (swap! downloads conj params))
-                  errors/generate-report      (fn [_] report)
-                  errors/submit-report        (fn [& _])
-                  ;; `tr` is called with one and with two arguments, and its
-                  ;; two-argument arity is variadic: the stub exposes both
-                  ;; shapes so the compiled static calls resolve.
-                  i18n/tr                     (fn ([key] (str key ":"))
-                                                ([key & args]
-                                                 (str key ":" (first args))))
-                  st/emit!                    (mock/stub (fn [& emitted]
-                                                           (swap! events into emitted)))
-                  tm/schedule                 (mock/stub (fn [callback]
-                                                           (swap! scheduled conj callback)))
-                  tm/schedule-on-idle         (mock/stub (fn [callback]
-                                                           (swap! idle-callbacks conj callback)))
-                  wapi/create-blob            (mock/stub (fn [content media-type]
-                                                           {:content content :media-type media-type}))
-                  wapi/create-uri             (fn [_] "blob:report")
-                  wapi/revoke-uri             (fn [uri]
-                                                (swap! revoked conj uri))]
-      (errors/flash-persistence cause)
-      (doseq [callback @scheduled] (callback))
-      (let [state    (ptk/update (first @events) {})
-            download (get-in state [:notification :links 0])]
-        (t/is (= "labels.download:report.txt" (:label download)))
-        ((:callback download) nil)
-        (t/is (= [["report" "text/plain" "blob:report"]] @downloads))
-        (doseq [callback @idle-callbacks] (callback))
-        (t/is (= ["blob:report"] @revoked))))))
+    (await
+     (mock/with-mocks*
+       {dom/prevent-default         (fn [_])
+        dom/trigger-download-uri    (fn [& params]
+                                      (swap! downloads conj params))
+        errors/generate-report      (fn [_ & _] report)
+        errors/submit-report        (fn [& _])
+        ;; `tr` is called with one and with two arguments, and its
+        ;; two-argument arity is variadic: the stub exposes both
+        ;; shapes so the compiled static calls resolve.
+        i18n/tr                     (fn ([key] (str key ":"))
+                                      ([key & args]
+                                       (str key ":" (first args))))
+        st/emit!                    (mock/stub (fn [& emitted]
+                                                 (swap! events into emitted)))
+        tm/schedule                 (mock/stub (fn [callback]
+                                                 (swap! scheduled conj callback)))
+        tm/schedule-on-idle         (mock/stub (fn [callback]
+                                                 (swap! idle-callbacks conj callback)))
+        wapi/create-blob            (mock/stub (fn [content media-type]
+                                                 {:content content :media-type media-type}))
+        wapi/create-uri             (fn [_] "blob:report")
+        wapi/revoke-uri             (fn [uri]
+                                      (swap! revoked conj uri))}
+       (errors/flash-persistence cause)
+       (doseq [callback @scheduled] (callback))
+       (await (async/settle))
+       ;; The report is emitted first and the toast right after, so the
+       ;; toast carrying the download link is the last event collected.
+       (let [state    (ptk/update (last @events) {})
+             download (get-in state [:notification :links 0])]
+         (t/is (= "labels.download:report.txt" (:label download)))
+         ((:callback download) nil)
+         (t/is (= [["report" "text/plain" "blob:report"]] @downloads))
+         (doseq [callback @idle-callbacks] (callback))
+         (t/is (= ["blob:report"] @revoked))
+         ;; Autosave is stopped for the whole session, so the toast also
+         ;; offers the only action that restarts it without the user having
+         ;; to know they could leave the file and come back.
+         (let [reload (get-in state [:notification :links 1])]
+           (t/is (= "labels.reload-page:" (:label reload))
+                 "the `tr` stub renders a one-argument key with a trailing colon")
+           (t/is (fn? (:callback reload)) "the reload link has a callback")))))))
 
-(t/deftest persistence-waiters-do-not-report-an-already-handled-failure
+;; Scenario: a save fails terminally. The toast offers the report download
+;; and a reload. Proves: the recovery action reaches the user.
+;;
+;; The reload callback itself is not invoked here: `js/location` does not
+;; exist under the test runner, so the link is verified by its label and by
+;; being a callable, not by calling it.
+(t/deftest ^:async save-failure-toast-offers-a-reload-action
+  (let [events (atom [])]
+    (await
+     (mock/with-mocks*
+       {errors/generate-report (fn [_ & _] "generated error report")
+        st/emit!               (mock/stub (fn [& emitted]
+                                            (swap! events into emitted)))
+        tm/schedule            (mock/stub (fn [callback] (callback)))}
+       (errors/flash-persistence (ex-info "Save failed"
+                                          {:type :validation :hint "Save failed"}))
+       (await (async/settle))
+       ;; The report is emitted first and the toast right after, so the toast
+       ;; is the last event collected.
+       (let [state (ptk/update (last @events) {})
+             links (get-in state [:notification :links])]
+         ;; `tr` is not stubbed here, and the test runner does not load the
+         ;; catalogue, so a key comes back verbatim without its arguments.
+         (t/is (= ["labels.download" "labels.reload-page"] (mapv :label links))
+               "the toast carries the report and a reload, download first")
+         (t/is (every? #(fn? (:callback %)) links)
+               "both actions are callable")
+         (t/is (nil? (get-in state [:notification :timeout]))
+               "the toast stays until the user acts on it"))))))
+
+;; Scenario: a save fails on the transport and the queue keeps trying on
+;; the slow cycle. The toast says the changes are kept and offers no reload,
+;; which would lose them. Proves: the retrying variant tells the truth.
+(t/deftest ^:async retrying-save-failure-toast-offers-no-reload
+  (let [events (atom [])]
+    (await
+     (mock/with-mocks*
+       {errors/generate-report (fn [_ & _] "generated error report")
+        st/emit!               (mock/stub (fn [& emitted]
+                                            (swap! events into emitted)))
+        tm/schedule            (mock/stub (fn [callback] (callback)))}
+       (errors/flash-persistence (ex-info "Save failed"
+                                          {:type :gateway-error :hint "Save failed"})
+                                 :retrying true)
+       (await (async/settle))
+       (let [state (ptk/update (last @events) {})]
+         (t/is (= "errors.save-still-retrying" (get-in state [:notification :content])))
+         (t/is (= ["labels.download"] (mapv :label (get-in state [:notification :links])))
+               "the toast carries the report and no reload")
+         (t/is (= errors/persistence-failed-tag (get-in state [:notification :tag]))
+               "a save that lands can hide it")
+         (t/is (nil? (get-in state [:notification :timeout]))))))))
+
+(t/deftest ^:async persistence-waiters-do-not-report-an-already-handled-failure
   (let [reports  (atom [])
         rejected (atom [])
         pstate   (atom {:status :saving})
         store    (ptk/store {:state {} :on-error errors/on-error})
         cause    (ex-info "Save failed" {:type :network})]
-    (with-redefs [refs/persistence pstate
-                  errors/submit-report (fn [& params]
-                                         (swap! reports conj (apply hash-map params)))
-                  tm/schedule (mock/stub (fn [_]))]
-      (try
-        (ptk/emit! store (#'dps/persistence-failed (uuid/next) cause))
-        (reset! pstate (:persistence @store))
-        (dotimes [_ 2]
-          (->> (dps/wait-persisted-or-error)
-               (rx/subs! (fn [_] (t/is false "A failed save must still reject"))
-                         (fn [error]
-                           (swap! rejected conj error)
-                           (errors/on-error error)))))
-        (t/is (= 2 (count @rejected)))
-        (t/is (= 1 (count @reports)))
-        ;; A standalone timeout and a later save failure are new incidents.
-        (errors/on-error (ex-info "Save timed out" {:type :persistence :code :save-timeout}))
-        (t/is (= 2 (count @reports)))
-        (ptk/emit! store (#'dps/persistence-failed (uuid/next) cause))
-        (t/is (= 3 (count @reports)))
-        (finally
-          (rx/dispose! store))))))
+    (await
+     (mock/with-mocks*
+       {refs/persistence pstate
+        st/emit!         (mock/stub (fn [& emitted]
+                                      (swap! reports into
+                                             (report-events emitted))))
+        ;; Run the scheduled `flash` body synchronously: the whole flow
+        ;; under test is synchronous except for the deferral.
+        tm/schedule      (mock/stub (fn [f] (f)))}
+       (try
+         (ptk/emit! store (#'dps/persistence-failed (uuid/next) cause))
+         (reset! pstate (:persistence @store))
+         (dotimes [_ 2]
+           (->> (dps/wait-persisted-or-error)
+                (rx/subs! (fn [_] (t/is false "A failed save must still reject"))
+                          (fn [error]
+                            (swap! rejected conj error)
+                            (errors/on-error error)))))
+         (await (async/settle))
+         (t/is (= 2 (count @rejected)))
+         (t/is (= 1 (count @reports)))
+         ;; A standalone timeout and a later save failure are new incidents.
+         ;; The later failure carries a distinct signature: repeating the same
+         ;; one inside the governor window is coalesced by design.
+         (errors/on-error (ex-info "Save timed out" {:type :persistence :code :save-timeout}))
+         (await (async/settle))
+         (t/is (= 2 (count @reports)))
+         (ptk/emit! store (#'dps/persistence-failed (uuid/next)
+                                                    (ex-info "Save failed again" {:type :network})))
+         (await (async/settle))
+         (t/is (= 3 (count @reports)))
+         (finally
+           (rx/dispose! store)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Save failures that belong to their own handler
@@ -512,25 +1031,31 @@
         (t/is (= :authentication (:type @assigned)))
         (t/is (empty? @scheduled) "An expired session shows no save notification")))))
 
-(t/deftest expired-organization-sso-during-save-renews-the-session
-  (t/async done
-    (t/testing "an SSO-guarded save failure goes back through the identity provider"
-      (let [events (atom [])]
-        (mock/with-mocks
-          {rp/cmd!             (mock/stub
-                                (fn [_command _params]
-                                  (rx/of {:authorized false
-                                          :redirect-uri "https://idp.example.com/authorize"})))
-           rt/get-current-href (constantly workspace-href)
-           st/emit!            (mock/stub (fn [& emitted] (swap! events into emitted)))}
-          (fn [done']
-            (errors/flash-persistence (ex-info "SSO required" (sso-required-error)))
-            (t/is (= [::rt/nav-raw] (mapv ptk/type @events)))
-            (done'))
-          done)))))
+(t/deftest ^:async expired-organization-sso-during-save-renews-the-session
+  (t/testing "an SSO-guarded save failure goes back through the identity provider"
+    (let [events (atom [])]
+      (await
+       (mock/with-mocks*
+         {rp/cmd!             (mock/stub
+                               (fn [_command _params]
+                                 (rx/of {:authorized false
+                                         :redirect-uri "https://idp.example.com/authorize"})))
+          rt/get-current-href   (constantly workspace-href)
+          rt/get-current-query-string (constantly workspace-query-string)
+          st/emit!            (mock/stub (fn [& emitted] (swap! events into emitted)))}
+         (errors/flash-persistence (ex-info "SSO required" (sso-required-error)))
+         (await (async/settle))
+         (t/is (= [::rt/nav-raw] (mapv ptk/type @events))))))))
 
-(t/deftest a-deleted-file-during-save-shows-the-exception-page
-  (t/testing "a file that no longer exists shows its page, not the save notification"
+(defn- shown-notifications
+  "Notifications the scheduled callbacks of a flash put on screen."
+  [events]
+  (keep #(when (implements? ptk/UpdateEvent %)
+           (get-in (ptk/update % {}) [:notification :content]))
+        events))
+
+(t/deftest a-not-found-save-keeps-the-workspace
+  (t/testing "a save answered not-found notifies instead of leaving the workspace"
     (let [events    (atom [])
           scheduled (atom [])]
       (with-redefs [rt/assign-exception (fn [error] error)
@@ -538,15 +1063,31 @@
                                                      (swap! events into emitted)))
                     tm/schedule         (mock/stub (fn [callback]
                                                      (swap! scheduled conj callback)))]
-        (errors/flash-persistence (ex-info "File not found" {:type :not-found}))
+        (errors/flash-persistence (ex-info "Save failed" {:type :persistence
+                                                          :cause-type :not-found
+                                                          :code :object-not-found}))
         (doseq [callback @scheduled] (callback))
-        (t/is (= [:not-found] (mapv :type @events)))))))
+        (t/is (not-any? #(= :not-found (:type %)) @events) "no exception page")
+        (t/is (= [(i18n/tr "errors.save-failed")] (shown-notifications @events)))))))
+
+(t/deftest lost-edit-permission-tells-how-many-changes-were-not-saved
+  (let [events    (atom [])
+        scheduled (atom [])]
+    (with-redefs [st/emit!    (mock/stub (fn [& emitted] (swap! events into emitted)))
+                  tm/schedule (mock/stub (fn [callback] (swap! scheduled conj callback)))]
+      (errors/flash-persistence (ex-info "Edit permission was lost"
+                                         {:type :persistence
+                                          :code :save-permission-denied
+                                          :unsaved-commits 3}))
+      (doseq [callback @scheduled] (callback))
+      (t/is (= [(i18n/tr "errors.save-permission-lost" (i18n/c 3))] (shown-notifications @events))))))
 
 (t/deftest a-restored-version-during-save-reloads-the-file
   (t/testing "a version restored elsewhere reloads the file instead of notifying"
     (let [events    (atom [])
           scheduled (atom [])]
-      (with-redefs [st/emit!    (mock/stub (fn [& emitted] (swap! events into emitted)))
+      (with-redefs [ex/print-throwable quiet-throwable
+                    st/emit!    (mock/stub (fn [& emitted] (swap! events into emitted)))
                     tm/schedule (mock/stub (fn [callback]
                                              (swap! scheduled conj callback)))]
         (errors/flash-persistence (ex-info "A different version has been restored"
@@ -554,20 +1095,199 @@
         (t/is (= [::dw/reload-current-file] (mapv ptk/type @events)))
         (t/is (empty? @scheduled) "A restored version shows no save notification")))))
 
-(t/deftest other-validation-failures-during-save-keep-the-notification
-  (t/testing "a validation failure without a recovery of its own is still notified"
-    (let [events    (atom [])
-          scheduled (atom [])]
-      (with-redefs [errors/generate-report (fn [_] "generated error report")
-                    errors/submit-report   (fn [& _])
-                    st/emit!               (mock/stub (fn [& emitted]
-                                                        (swap! events into emitted)))
-                    tm/schedule            (mock/stub (fn [callback]
-                                                        (swap! scheduled conj callback)))]
-        (errors/flash-persistence (ex-info "Invalid data" {:type :validation
-                                                           :code :invalid-data}))
-        (doseq [callback @scheduled] (callback))
-        (t/is (= 1 (count @events)))
-        (let [state (ptk/update (first @events) {})]
-          (t/is (nil? (get-in state [:notification :timeout])))
-          (t/is (some? (get-in state [:notification :links 0]))))))))
+(t/deftest ^:async save-failure-report-type-follows-the-cause
+  ;; The user still gets the same sticky toast and report link; only the audit
+  ;; event name changes, and that is what decides whether the incident reaches
+  ;; the internal reports and the alerts.
+  (t/testing "a validation failure is a defect, so it reports unhandled"
+    (t/is (= ["unhandled-exception"]
+             (await (report-names {:type :validation :code :invalid-data})))))
+
+  (t/testing "the wrapped shape reads the cause, not the wrapper"
+    ;; This is the shape that actually reaches flash-persistence:
+    ;; persistence-failed sets :type :persistence and keeps the real type
+    ;; under :cause-type. Reading :type alone would match the wrapper and
+    ;; leave the cause as handled.
+    (t/is (= ["unhandled-exception"]
+             (await (report-names {:type :persistence
+                                   :cause-type :validation
+                                   :code :invalid-data})))))
+
+  (t/testing "environment failures stay handled after the retry budget"
+    ;; They land here once the backoff is spent, and the user's connection is
+    ;; not our bug, so they must not alert.
+    (doseq [cause-type [:network :offline :bad-gateway :service-unavailable
+                        :gateway-error]]
+      (t/is (= ["handled-exception"]
+               (await (report-names {:type :persistence
+                                     :cause-type cause-type})))
+            (str cause-type " is an environment failure, not a defect"))))
+
+  (t/testing "responses the backend never wrote stay handled"
+    (doseq [cause-type [:rate-limit :unexpected-response]]
+      (t/is (= ["handled-exception"]
+               (await (report-names {:type :persistence
+                                     :cause-type cause-type})))
+            (str cause-type " comes from a proxy, not from our code"))))
+
+  (t/testing "an unclassified failure keeps the handled path"
+    (t/is (= ["handled-exception"]
+             (await (report-names {:type :persistence
+                                   :cause-type :unknown-thing})))))
+
+  (t/testing "a bare :type still classifies, without a wrapper"
+    (t/is (= ["unhandled-exception"]
+             (await (report-names {:type :validation})))))
+
+  (t/testing "a server-side or internal defect reports unhandled"
+    (doseq [cause-type [:server-error :internal]]
+      (t/is (= ["unhandled-exception"]
+               (await (report-names {:type :persistence
+                                     :cause-type cause-type})))
+            (str cause-type " is our bug")))))
+
+;; ---------------------------------------------------------------------------
+;; transport errors
+;; ---------------------------------------------------------------------------
+
+(t/deftest ^:async transport-errors-are-handled-without-replacing-the-page
+  ;; Scenario: a rate limit and an error page the backend did not write,
+  ;; through the global handler. Proves: neither replaces the page, each is
+  ;; a handled report followed by one toast.
+  (doseq [type [:rate-limit :unexpected-response]]
+    (errors/reset-report-governor!)
+    (let [events   (atom [])
+          assigned (atom [])
+          cause    (ex-info "http error"
+                            {:type type
+                             :hint "http error"
+                             :status 429
+                             :uri "https://design.penpot.app/api/main/methods/get-teams"})]
+      (await
+       (mock/with-mocks*
+         {ex/print-throwable    quiet-throwable
+          st/emit!              (mock/stub (fn [& emitted] (swap! events into emitted)))
+          rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")
+          rt/assign-exception   (fn [error] (swap! assigned conj error) error)
+          tm/schedule           (mock/stub (fn [f] (f)))
+          st/format-last-events (mock/stub (fn [& _] "(stub last events)"))}
+         (errors/on-error cause)
+         (await (async/settle))
+         (t/is (empty? @assigned)
+               (str type " must not replace the page with an error screen"))
+         (t/is (= ["handled-exception"]
+                  (map (comp ::ev/name deref) (report-events @events)))
+               (str type " is reported as handled, not unhandled"))
+         (t/is (= 2 (count @events)) (str type " must show one notification")))))))
+
+;; ---------------------------------------------------------------------------
+;; WASM errors
+;; ---------------------------------------------------------------------------
+
+(defn- ^:async handle-wasm-error
+  "Sends a `:wasm-error` with `code` through `on-error`. Resolves to the
+  errors assigned to the error page and the events emitted."
+  [code]
+  (let [events   (atom [])
+        assigned (atom [])
+        cause    (ex-info "WASM Error" {:type :wasm-error :code code :hint "WASM Error"})]
+    (await
+     (mock/with-mocks*
+       {st/emit!              (mock/stub (fn [& emitted] (swap! events into emitted)))
+        rt/get-current-href   (constantly "https://penpot.example.com/#/workspace")
+        rt/assign-exception   (fn [error] (swap! assigned conj error) error)
+        tm/schedule           (mock/stub (fn [f] (f)))
+        st/format-last-events (mock/stub (fn [& _] "(stub last events)"))}
+       (errors/on-error cause)
+       (await (async/settle))))
+    {:assigned @assigned :events @events}))
+
+(t/deftest ^:async non-recoverable-wasm-errors-show-the-error-page
+  ;; Scenario: a panic, a trap with no code and an unknown code.
+  ;; Proves: each shows the error page and no toast.
+  (doseq [code [:panic :wasm-critical :unknown-code]]
+    (errors/reset-report-governor!)
+    (let [{:keys [assigned events]} (await (handle-wasm-error code))]
+      (t/is (= [code] (map :code assigned))
+            (str code " must show the error page"))
+      (t/is (empty? (report-events events))
+            (str code " must not show a toast")))))
+
+(t/deftest ^:async recoverable-wasm-errors-show-a-toast
+  ;; Scenario: WASM errors with a recoverable code. Proves: each shows a
+  ;; handled report and a toast, and keeps the page.
+  (doseq [code [:non-blocking :wasm-reload-context-failure :viewer-canvas-failed]]
+    (errors/reset-report-governor!)
+    (let [{:keys [assigned events]} (await (handle-wasm-error code))]
+      (t/is (empty? assigned)
+            (str code " must not show the error page"))
+      (t/is (= ["handled-exception"]
+               (map (comp ::ev/name deref) (report-events events)))
+            (str code " must show a toast")))))
+
+;; ---------------------------------------------------------------------------
+;; wrap-wasm-effect
+;; ---------------------------------------------------------------------------
+
+(defn- wasm-error
+  [code]
+  (ex-info "WASM Error" {:type :wasm-error :code code}))
+
+(defn- run-wasm-effect
+  "Runs `f` through `wrap-wasm-effect` with `on-error` captured. Returns the
+  effect result, or the thrown error under `:thrown`, and the errors handled."
+  [f]
+  (let [handled (atom [])]
+    (with-redefs [errors/on-error (mock/stub #(swap! handled conj %))]
+      (let [result (try
+                     {:value (errors/wrap-wasm-effect f)}
+                     (catch :default cause
+                       {:thrown cause}))]
+        (assoc result :handled @handled)))))
+
+(t/deftest wrap-wasm-effect-returns-the-effect-value
+  (t/testing "an effect that does not throw keeps its return value"
+    (let [{:keys [value handled]} (run-wasm-effect (constantly :done))]
+      (t/is (= :done value))
+      (t/is (empty? handled)))))
+
+(t/deftest wrap-wasm-effect-keeps-the-cleanup
+  (t/testing "a returned cleanup fn still runs the original cleanup"
+    (let [cleaned (atom false)
+          {:keys [value]} (run-wasm-effect (fn [] #(reset! cleaned true)))]
+      (t/is (fn? value))
+      (value)
+      (t/is (true? @cleaned)))))
+
+(t/deftest wrap-wasm-effect-handles-recoverable-errors
+  (t/testing "a recoverable WASM error goes to on-error and is not rethrown"
+    (doseq [code errors/recoverable-wasm-codes]
+      (let [cause (wasm-error code)
+            {:keys [value thrown handled]} (run-wasm-effect #(throw cause))]
+        (t/is (nil? value) (str code))
+        (t/is (nil? thrown) (str code " must not be rethrown"))
+        (t/is (= [cause] handled) (str code " must go to on-error"))))))
+
+(t/deftest wrap-wasm-effect-rethrows-other-errors
+  (t/testing "critical WASM errors and other errors are rethrown unchanged"
+    (doseq [cause [(wasm-error :panic)
+                   (wasm-error :wasm-critical)
+                   (ex-info "other" {:type :validation})
+                   (js/Error. "plain")]]
+      (let [{:keys [thrown handled]} (run-wasm-effect #(throw cause))]
+        (t/is (identical? cause thrown) (ex-message cause))
+        (t/is (empty? handled) (str (ex-message cause) " must not go to on-error"))))))
+
+(t/deftest wrap-wasm-effect-guards-the-cleanup
+  (t/testing "a recoverable error in the cleanup goes to on-error"
+    (let [cause   (wasm-error :non-blocking)
+          handled (atom [])
+          cleanup (:value (run-wasm-effect (fn [] #(throw cause))))]
+      (with-redefs [errors/on-error (mock/stub #(swap! handled conj %))]
+        (cleanup))
+      (t/is (= [cause] @handled))))
+
+  (t/testing "a critical error in the cleanup is rethrown"
+    (let [cause   (wasm-error :wasm-critical)
+          cleanup (:value (run-wasm-effect (fn [] #(throw cause))))]
+      (t/is (thrown? js/Error (cleanup))))))

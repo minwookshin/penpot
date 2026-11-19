@@ -12,6 +12,7 @@
    [app.common.files.helpers :as cfh]
    [app.common.geom.matrix :as gmt]
    [app.common.geom.shapes :as gsh]
+   [app.common.logging :as log]
    [app.common.types.shape.layout :as ctl]
    [app.main.ui.formats :as fmt]
    [app.util.code-gen.common :as cgc]
@@ -24,12 +25,24 @@
    :gradient fill-color-gradient
    :image fill-image})
 
+(defn- missing-parent?
+  "True when the parent of `shape` is not in `objects`, which happens in a
+  damaged file; the position, relative to the parent, cannot be computed."
+  [objects shape]
+  (let [missing? (not (contains? objects (:parent-id shape)))]
+    (when missing?
+      (log/wrn :hint "shape parent not found"
+               :shape-id (dm/str (:id shape))
+               :parent-id (dm/str (:parent-id shape))))
+    missing?))
+
 (defn get-shape-position
   [shape objects coord]
 
   (when (and (not (cfh/root-frame? shape))
              (or (not (ctl/any-layout-immediate-child? objects shape))
-                 (ctl/position-absolute? shape)))
+                 (ctl/position-absolute? shape))
+             (not (missing-parent? objects shape)))
 
     (let [parent (get objects (:parent-id shape))
 
@@ -214,17 +227,16 @@
       (fill->color (first fills)))))
 
 (defn stroke-per-side-widths
-  "Returns [top right bottom left] when the stroke has per-side widths
-  enabled and the sides actually differ; nil otherwise."
+  "Returns [top right bottom left] when the stroke sides actually
+  differ; nil otherwise."
   [stroke]
-  (when (:stroke-per-side stroke)
-    (let [width  (:stroke-width stroke)
-          top    (d/nilv (:stroke-width-top stroke) width)
-          right  (d/nilv (:stroke-width-right stroke) width)
-          bottom (d/nilv (:stroke-width-bottom stroke) width)
-          left   (d/nilv (:stroke-width-left stroke) width)]
-      (when-not (= top right bottom left)
-        [top right bottom left]))))
+  (let [width  (:stroke-width stroke)
+        top    (d/nilv (:stroke-width-top stroke) width)
+        right  (d/nilv (:stroke-width-right stroke) width)
+        bottom (d/nilv (:stroke-width-bottom stroke) width)
+        left   (d/nilv (:stroke-width-left stroke) width)]
+    (when-not (= top right bottom left)
+      [top right bottom left])))
 
 (defn- get-border
   [shape]

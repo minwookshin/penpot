@@ -10,10 +10,13 @@
    [app.common.schema :as sm]
    [app.main.data.notifications :as ntf]
    [app.main.data.profile :as du]
+   [app.main.refs :as refs]
    [app.main.router :as rt]
    [app.main.store :as st]
    [app.main.ui.components.forms :as fm]
+   [app.util.dom :as dom]
    [app.util.i18n :as i18n :refer [tr]]
+   [app.util.keyboard :as kbd]
    [rumext.v2 :as mf]))
 
 (def ^:private schema:recovery-form
@@ -22,7 +25,7 @@
     [:token ::sm/text]
     [:password-1 ::sm/password]
     [:password-2 ::sm/password]]
-   [:fn {:error/code "errors.password-invalid-confirmation"
+   [:fn {:error/fn #(tr "errors.password-invalid-confirmation")
          :error/field :password-2}
     (fn [{:keys [password-1 password-2]}]
       (= password-1 password-2))]])
@@ -32,6 +35,12 @@
   (let [{:keys [type code] :as edata} (ex-data error)]
     (if (= [:validation :weak-password] [type code])
       (let [details (:details edata)
+            ;; Execution time translation strings (keys sent by the backend):
+            ;;   (tr "errors.weak-password.too-short")
+            ;;   (tr "errors.weak-password.insufficient-digits")
+            ;;   (tr "errors.weak-password.insufficient-lowercase")
+            ;;   (tr "errors.weak-password.insufficient-uppercase")
+            ;;   (tr "errors.weak-password.insufficient-special")
             options (when (seq details)
                       (mapv tr details))]
         (swap! form assoc-in [:extra-errors :password-1]
@@ -82,16 +91,25 @@
 
 ;; --- Recovery Request Page
 
+(defn- on-go-to-login
+  [event]
+  ;; Ctrl/Cmd-click opens the href in a new tab, as any link.
+  (when-not (kbd/mod? event)
+    (dom/prevent-default event)
+    (st/emit! (rt/nav :auth-login))))
+
 (mf/defc recovery-page*
   [{:keys [params]}]
-  [:div {:class (stl/css :wrapper)}
-   [:h1 {:class (stl/css :title)} (tr "auth.recovery-request-title")]
-   [:div {:class (stl/css :subtitle)} (tr "auth.recovery-request-subtitle")]
-   [:hr {:class (stl/css :separator)}]
-   [:> recovery-form* {:params params}]
+  (let [router (mf/deref refs/router)]
+    [:div {:class (stl/css :wrapper)}
+     [:h1 {:class (stl/css :title)} (tr "auth.recovery-request-title")]
+     [:div {:class (stl/css :subtitle)} (tr "auth.recovery-request-subtitle")]
+     [:hr {:class (stl/css :separator)}]
+     [:> recovery-form* {:params params}]
 
-   [:div {:class (stl/css :links)}
-    [:div {:class (stl/css :go-back-row)}
-     [:a {:on-click #(st/emit! (rt/nav :auth-login))
-          :class (stl/css :go-back-link)}
-      (tr "profile.recovery.go-to-login")]]]])
+     [:div {:class (stl/css :links)}
+      [:div {:class (stl/css :go-back-row)}
+       [:a {:href (rt/resolve-uri router :auth-login {})
+            :on-click on-go-to-login
+            :class (stl/css :go-back-link)}
+        (tr "profile.recovery.go-to-login")]]]]))

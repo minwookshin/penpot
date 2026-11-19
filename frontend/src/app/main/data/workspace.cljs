@@ -9,6 +9,7 @@
    [app.common.attrs :as attrs]
    [app.common.data :as d]
    [app.common.data.macros :as dm]
+   [app.common.files.changes :as cpc]
    [app.common.files.changes-builder :as pcb]
    [app.common.files.helpers :as cfh]
    [app.common.files.variant :as cfv]
@@ -55,7 +56,6 @@
    [app.main.data.workspace.layers :as dwly]
    [app.main.data.workspace.layout :as layout]
    [app.main.data.workspace.libraries :as dwl]
-   [app.main.data.workspace.mcp :as mcp]
    [app.main.data.workspace.notifications :as dwn]
    [app.main.data.workspace.pages :as dwpg]
    [app.main.data.workspace.path :as dwdp]
@@ -77,7 +77,6 @@
    [app.main.refs :as refs]
    [app.main.repo :as rp]
    [app.main.router :as rt]
-   [app.plugins.register :as preg]
    [app.render-wasm :as wasm]
    [app.render-wasm.api :as wasm.api]
    [app.util.dom :as dom]
@@ -145,11 +144,11 @@
   (log/inf :hint "resolve file"
            :file-id (str (:id file))
            :features (str/join " " (:features file)))
+  ;; fpmap/resolve-file guarantees resolved data or an error; there is
+  ;; no leftover-pointer case to handle here.
   (->> (fpmap/resolve-file file)
        (rx/map :data)
-       (rx/map
-        (fn [data]
-          (assoc file :data (d/removem (comp t/pointer? val) data))))))
+       (rx/map #(assoc file :data %))))
 
 (defn- check-libraries-synchronization
   [file-id libraries]
@@ -191,15 +190,20 @@
                        (rx/merge
                         (->> (rx/from libraries)
                              (rx/merge-map
-                              (fn [{:keys [id synced-at is-indirect]}]
+                              (fn [{:keys [id synced-at is-indirect] :as library}]
                                 (->> (rp/cmd! :get-file {:id id :features features})
                                      (rx/map (fn [file]
                                                (-> file
                                                    (assoc :synced-at synced-at)
                                                    (assoc :library-of file-id)
-                                                   (assoc :is-indirect is-indirect)))))))
-                             (rx/mapcat resolve-file)
-                             (rx/map library-resolved))
+                                                   (assoc :is-indirect is-indirect))))
+                                     (rx/mapcat resolve-file)
+                                     (rx/map library-resolved)
+                                     ;; A broken library must not break the whole file
+                                     (rx/catch (fn [cause]
+                                                 (if (dwl/broken-library-error? cause)
+                                                   (rx/of (dwl/library-load-failed file-id library cause))
+                                                   (rx/throw cause))))))))
                         (->> (rx/from libraries)
                              (rx/map :id)
                              (rx/mapcat (fn [file-id]
@@ -245,7 +249,9 @@
                     :save-undo? false
                     :origin it
                     :tags #{:position-data}
-                    :skip-component-sync? true}))
+                    :skip-component-sync? true
+                    ;; Derived from the text, so it follows it while saves fail
+                    :ignore-save-lock true}))
            (rx/empty)))))))
 
 (defn- workspace-initialized
@@ -259,15 +265,8 @@
 
     ptk/WatchEvent
     (watch [_ _ _]
-      (rx/merge
-       (rx/of (dp/check-open-plugin)
-              (fdf/fix-deleted-fonts-for-local-library file-id))
-       (if (contains? cf/flags :mcp)
-         ;; We wait the plugin runtime to be ready before launch the
-         ;; mcp initialization
-         (->> (rx/from (preg/wait-for-runtime))
-              (rx/map (fn [_] (mcp/init))))
-         (rx/empty))))))
+      (rx/of (dp/check-open-plugin)
+             (fdf/fix-deleted-fonts-for-local-library file-id)))))
 
 (defn- compute-shape-stats
   "Compute shape statistics in a single pass over pages-index.
@@ -320,7 +319,24 @@
                                 ::ev/name "open-workspace-file"
                                 ::ev/origin "workspace"
                                 :file-id file-id
-                                :team-id team-id)))))))
+                                :team-id team-id
+                                :renderer (features/get-active-renderer state))))))))
+
+(defn- restore-pending-changes
+  "Applies the edits still waiting to be saved to a freshly loaded `file`.
+  An edit that no longer applies to the loaded data leaves the file as the
+  server sent it; the save queue keeps the edits either way."
+  [state file]
+  (let [changes (dps/pending-file-changes state file)]
+    (if (empty? changes)
+      file
+      (try
+        (update file :data cpc/process-changes changes false)
+        (catch :default cause
+          (log/wrn :hint "unable to restore pending changes"
+                   :file-id (dm/str (:id file))
+                   :cause cause)
+          file)))))
 
 (defn- bundle-fetched
   [{:keys [file file-id thumbnails] :as bundle}]
@@ -331,9 +347,11 @@
 
     ptk/UpdateEvent
     (update [_ state]
-      (-> state
-          (assoc :thumbnails (d/update-vals thumbnails (fn [uri] {:uri uri :rendered-at nil})))
-          (update :files assoc file-id file)))))
+      (let [file (restore-pending-changes state file)]
+        (-> state
+            (assoc :thumbnails (d/update-vals thumbnails (fn [uri] {:uri uri :rendered-at nil})))
+            (update :files assoc file-id file)
+            (dps/forget-other-versions file))))))
 
 (defn zoom-to-frame
   []
@@ -408,7 +426,10 @@
 
     ptk/WatchEvent
     (watch [_ state stream]
-      (let [stoper-s     (rx/filter (ptk/type? ::finalize-workspace) stream)
+      (let [;; A reload starts a new `initialize-workspace`, which replaces these streams
+            stoper-s     (rx/filter #(or (ptk/type? ::finalize-workspace %)
+                                         (ptk/type? ::initialize-workspace %))
+                                    stream)
             rparams      (rt/get-params state)
             features     (features/get-enabled-features state team-id)
             render-wasm-enabled? (features/active-feature? state "render-wasm/v1")
@@ -568,20 +589,23 @@
                               {:redo-changes changes :undo-changes []
                                :save-undo? false
                                :tags #{:position-data}
-                               :skip-component-sync? true})))))
+                               :skip-component-sync? true
+                               ;; Derived from commits already made, rollbacks included
+                               :ignore-save-lock true})))))
                       (rx/take-until stoper-s)))
 
                (->> stream
                     (rx/filter dch/commit?)
                     (rx/map deref)
                     (rx/mapcat
-                     (fn [{:keys [save-undo? undo-changes redo-changes undo-group tags stack-undo? selected-before]}]
+                     (fn [{:keys [save-undo? undo-changes redo-changes undo-group tags stack-undo? selected-before translation?]}]
                        (if (and save-undo? (seq undo-changes))
                          (let [entry {:undo-changes undo-changes
                                       :redo-changes redo-changes
                                       :undo-group undo-group
                                       :tags tags
-                                      :selected-before selected-before}]
+                                      :selected-before selected-before
+                                      :translation (boolean translation?)}]
                            (rx/of (dwu/append-undo entry stack-undo?)))
                          (rx/empty))))))
 
@@ -608,12 +632,14 @@
            :workspace-tokens
            :workspace-undo
            :workspace-versions)
-          (update :workspace-global dissoc :read-only? :preview-id :default-font)
+          (update :workspace-global dissoc :read-only? :preview-id :default-font
+                  :persistence-lock)
           (assoc-in [:workspace-global :options-mode] :design)
           (update :files d/update-vals #(dissoc % :data))))
 
     ptk/WatchEvent
     (watch [_ state _]
+      (t/clear-uuid-cache)
       (let [project-id (:current-project-id state)]
         (rx/of (dwn/finalize file-id)
                (dpj/finalize-project project-id)
@@ -728,6 +754,37 @@
     (update [_ state]
       (assoc-in state [:workspace-local :shape-for-rename] id))))
 
+(defn- rename-variant-main
+  "Apply a layers-panel formula to one variant main.
+
+   A valid formula updates the property names and values. Any other
+   text keeps the current malformed path: values are cleared and the
+   text is stored as the variant error."
+  [file-id shape name]
+  (ptk/reify ::rename-variant-main
+    ptk/WatchEvent
+    (watch [_ state _]
+      (let [file-data          (dsh/lookup-file-data state file-id)
+            component-id       (:component-id shape)
+            component          (ctkl/get-component file-data component-id)
+            variant-id         (:variant-id shape)
+            variant-properties (:variant-properties component)]
+        (if (ctv/valid-properties-formula? name)
+          (rx/of (dwva/update-properties-names-and-values
+                  component-id
+                  variant-id
+                  variant-properties
+                  (ctv/properties-formula->map name))
+                 (dwva/remove-empty-properties variant-id)
+                 (dwva/update-error component-id))
+          (rx/of (dwva/update-properties-names-and-values
+                  component-id
+                  variant-id
+                  variant-properties
+                  {})
+                 (dwva/remove-empty-properties variant-id)
+                 (dwva/update-error component-id name)))))))
+
 (defn end-rename-shape
   "End the ongoing shape rename process"
   ([] (end-rename-shape nil nil))
@@ -742,14 +799,17 @@
        (when-let [shape-id (d/nilv shape-id (dm/get-in state [:workspace-local :shape-for-rename]))]
          (let [shape        (dsh/lookup-shape state shape-id)
                name         (str/trim name)
-               clean-name   (cpn/clean-path name)
-               valid?       (and (not (str/ends-with? name "/"))
-                                 (string? clean-name)
-                                 (not (str/blank? clean-name)))
+               clean-name   (cpn/normalize-path-name name)
                component-id (:component-id shape)
-               undo-id (js/Symbol)]
+               undo-id      (js/Symbol)]
 
-           (when valid?
+           (cond
+             ;; Variant formula edits go through rename-shape-or-variant.
+             ;; A variant main must not fall through to a plain rename.
+             (ctc/is-variant-main? shape)
+             (rx/empty)
+
+             (some? clean-name)
              (if (ctc/is-variant-container? shape)
                ;; Rename the full variant when it is a variant container
                (rx/of (dwva/rename-variant shape-id clean-name))
@@ -773,32 +833,12 @@
      (watch [_ state _]
        (let [file-id (d/nilv file-id (:current-file-id state))
              page-id (d/nilv page-id (:current-page-id state))
-
-             file-data (dsh/lookup-file-data state file-id)
-             shape
-             (-> (dsh/lookup-page-objects state file-id page-id)
-                 (get id))
-
-             is-variant? (ctc/is-variant? shape)
-             variant-id (when is-variant? (:variant-id shape))
-             variant-name (when is-variant? (:variant-name shape))
-             component-id (:component-id shape)
-             component (ctkl/get-component file-data (:component-id shape))
-             variant-properties (:variant-properties component)]
-         (cond
-           (and variant-name (ctv/valid-properties-formula? name))
-           (rx/of (dwva/update-properties-names-and-values
-                   component-id variant-id variant-properties (ctv/properties-formula->map name))
-                  (dwva/remove-empty-properties variant-id)
-                  (dwva/update-error component-id))
-
-           variant-name
-           (rx/of (dwva/update-properties-names-and-values
-                   component-id variant-id variant-properties {})
-                  (dwva/remove-empty-properties variant-id)
-                  (dwva/update-error component-id name))
-
-           :else
+             shape   (-> (dsh/lookup-page-objects state file-id page-id)
+                         (get id))
+             name    (str/trim name)]
+         (if (ctc/variant-formula-rename? shape name)
+           ;; update-properties-names-and-values clears :shape-for-rename.
+           (rx/of (rename-variant-main file-id shape name))
            (rx/of (end-rename-shape id name))))))))
 
 ;; --- Update Selected Shapes attrs
@@ -1256,10 +1296,18 @@
 
             no-bool-shapes? (->> all-selected (some (comp #{:frame :text} :type)))]
 
-        (if (and (some? shape) (not (contains? selected (:id shape))))
+        (cond
+          ;; A shape missing from the current page can never become
+          ;; selected, so selecting it and retrying would recurse forever
+          (and (some? shape) (not (contains? objects (:id shape))))
+          (rx/empty)
+
+          (and (some? shape) (not (contains? selected (:id shape))))
           (rx/concat
            (rx/of (dws/select-shape (:id shape)))
            (rx/of (show-shape-context-menu params)))
+
+          :else
           (rx/of (show-context-menu
                   (-> params
                       (assoc
@@ -1372,7 +1420,41 @@
              page    (dsh/lookup-page state page-id)
              changes (-> (pcb/empty-changes it)
                          (pcb/with-page page)
-                         (pcb/mod-page {:background (:color color)}))]
+                         (pcb/mod-page {:background (:color color)
+                                        :background-token nil}))]
+         (rx/of (dch/commit-changes changes)))))))
+
+(defn apply-canvas-color-token
+  "Sets the canvas background to the resolved value of `token` and
+  remembers it as the applied token, so the background badge shows it."
+  ([color token-name]
+   (apply-canvas-color-token nil color token-name))
+  ([page-id color token-name]
+   (ptk/reify ::apply-canvas-color-token
+     ptk/WatchEvent
+     (watch [it state _]
+       (let [page-id (or page-id (:current-page-id state))
+             page    (dsh/lookup-page state page-id)
+             changes (-> (pcb/empty-changes it)
+                         (pcb/with-page page)
+                         (pcb/mod-page {:background color
+                                        :background-token token-name}))]
+         (rx/of (dch/commit-changes changes)))))))
+
+(defn detach-canvas-color-token
+  "Removes the applied-token link from the canvas background, keeping
+  the current background color as a plain value."
+  ([]
+   (detach-canvas-color-token nil))
+  ([page-id]
+   (ptk/reify ::detach-canvas-color-token
+     ptk/WatchEvent
+     (watch [it state _]
+       (let [page-id (or page-id (:current-page-id state))
+             page    (dsh/lookup-page state page-id)
+             changes (-> (pcb/empty-changes it)
+                         (pcb/with-page page)
+                         (pcb/mod-page {:background-token nil}))]
          (rx/of (dch/commit-changes changes)))))))
 
 (defn change-pixel-grid-color
@@ -1637,6 +1719,7 @@
 (dm/export dwt/update-positions)
 (dm/export dwt/flip-horizontal-selected)
 (dm/export dwt/flip-vertical-selected)
+(dm/export dwt/scale-selected)
 (dm/export dwly/set-opacity)
 
 ;; Common

@@ -151,6 +151,12 @@
 (def workspace-local
   (l/derived :workspace-local st/state))
 
+(def stroke-per-side
+  "Per-stroke expansion state of the design tab per-side controls, keyed by
+  `[ids index]`. This is ephemeral UI state: it survives shape and page
+  switches during the session but resets on reload."
+  (l/derived (fn [state] (get-in state [:workspace-local :stroke-per-side])) st/state))
+
 (def workspace-global
   (l/derived :workspace-global st/state))
 
@@ -328,6 +334,9 @@
 
 (def workspace-read-only?
   (l/derived :read-only? workspace-global))
+
+(def persistence-lock
+  (l/derived :persistence-lock workspace-global))
 
 (def workspace-paddings-selected
   (l/derived :paddings-selected workspace-global))
@@ -603,6 +612,8 @@
 
 (defn workspace-thumbnail-by-id
   [object-id]
+  ;; Resolving a media id builds a new map on each read; compare by
+  ;; value so subscribers do not re-render on every store change.
   (l/derived
    (fn [state]
      (when-let [entry (dm/get-in state [:thumbnails object-id])]
@@ -610,7 +621,8 @@
          (and (:uri entry)
               (not (resolved-uri? (:uri entry))))
          (update :uri cf/resolve-media))))
-   st/state))
+   st/state
+   =))
 
 (def workspace-text-modifier
   (l/derived :workspace-text-modifier st/state))

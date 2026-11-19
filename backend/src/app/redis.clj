@@ -78,6 +78,7 @@
   (-hget [_ key field])
   (-set [_ key val args])
   (-del [_ key-or-keys])
+  (-expire [_ key seconds])
   (-ping [_]))
 
 (defprotocol IPubSubConnection
@@ -233,6 +234,10 @@
   (-del [_ keys]
     (let [keys (into-array String keys)]
       (.del cmd ^String/1 keys)))
+
+  (-expire [_ key seconds]
+    (assert (string? key) "key expected to be string")
+    (.expire cmd ^String key ^long seconds))
 
   (-ping [_]
     (.ping cmd))
@@ -414,7 +419,7 @@
     (try
       (-del conn keys)
       (catch RedisCommandTimeoutException cause
-        (l/err :hint "timeout on del redis key" :key key :cause cause)
+        (l/err :hint "timeout on del redis key" :keys keys :cause cause)
         nil))))
 
 (defn ping
@@ -510,6 +515,11 @@
 (defn timeout-exception?
   [cause]
   (instance? RedisCommandTimeoutException cause))
+
+(defn expire
+  [conn key seconds]
+  (assert (string? key) "key must be string instance")
+  (-expire conn key seconds))
 
 (defn exception?
   [cause]

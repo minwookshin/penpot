@@ -17,6 +17,7 @@
    [app.main.ui.ds.buttons.icon-button :refer [icon-button*]]
    [app.main.ui.ds.foundations.assets.icon :as i]
    [app.main.ui.exports.assets]
+   [app.main.ui.exports.preview :refer [export-preview*]]
    [app.util.dom :as dom]
    [app.util.i18n :refer [c tr]]
    [app.util.keyboard :as kbd]
@@ -79,7 +80,7 @@
         scale-enabled?
         (mf/use-fn
          (fn [export]
-           (#{:png :jpeg :webp} (:type export))))
+           (contains? de/raster-export-types (:type export))))
 
         on-download
         (mf/use-fn
@@ -208,7 +209,9 @@
       [:> title-bar* {:collapsable  has-exports?
                       :collapsed    (not open?)
                       :on-collapsed toggle-content
-                      :title        (tr (if (> (count ids) 1) "workspace.options.export-multiple" "workspace.options.export"))
+                      :title        (if (> (count ids) 1)
+                                      (tr "workspace.options.export-multiple")
+                                      (tr "workspace.options.export"))
                       :class        (stl/css-case :title-spacing-export (not has-exports?))}
        [:> icon-button* {:variant "ghost"
                          :aria-label (tr "workspace.options.export.add-export")
@@ -272,4 +275,9 @@
             :disabled in-progress?}
            (if in-progress?
              (tr "workspace.options.exporting-object")
-             (tr "workspace.options.export-object" (c (count shapes-with-exports))))])])]))
+             (tr "workspace.options.export-object" (c (count shapes-with-exports))))])
+
+        (when (and (= 1 (count ids)) (vector? exports) (seq exports))
+          [:> export-preview* {:key (first ids)
+                               :object-id (first ids)
+                               :exports exports}])])]))

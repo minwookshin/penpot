@@ -86,12 +86,14 @@ Penpot:
         distributeVertical(shapes: Shape[]): void;
         flatten(shapes: Shape[]): Path[];
         createVariantFromComponents(shapes: Board[]): VariantContainer;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
+        waitForSave(timeout?: number): Promise<void>;
     }
     ```
 
     Hierarchy
 
-    * Omit<Context, "addListener" | "removeListener">
+    * Omit<Context, "addListener" | "removeListener" | "management">
       + Penpot
   members:
     Properties:
@@ -127,7 +129,8 @@ Penpot:
 
           Example
           ```
-          const size = penpot.ui.size;console.log(size);
+          const size = penpot.ui.size;
+          console.log(size);
           ```
         * resize: (width: number, height: number) => void
 
@@ -185,7 +188,8 @@ Penpot:
 
         Example
         ```
-        const rootShape = context.root;console.log(rootShape);
+        const rootShape = context.root;
+        console.log(rootShape);
         ```
       currentFile: |-
         ```
@@ -200,7 +204,8 @@ Penpot:
 
         Example
         ```
-        const fileData = context.currentFile;console.log(fileData);
+        const fileData = context.currentFile;
+        console.log(fileData);
         ```
       currentPage: |-
         ```
@@ -211,7 +216,8 @@ Penpot:
 
         Example
         ```
-        const currentPage = context.currentPage;console.log(currentPage);
+        const currentPage = context.currentPage;
+        console.log(currentPage);
         ```
       viewport: |-
         ```
@@ -222,7 +228,8 @@ Penpot:
 
         Example
         ```
-        const viewportSettings = context.viewport;console.log(viewportSettings);
+        const viewportSettings = context.viewport;
+        console.log(viewportSettings);
         ```
       flags: |-
         ```
@@ -239,7 +246,8 @@ Penpot:
 
         Example
         ```
-        const historyContext = context.history;console.log(historyContext);
+        const historyContext = context.history;
+        console.log(historyContext);
         ```
       library: |-
         ```
@@ -250,7 +258,8 @@ Penpot:
 
         Example
         ```
-        const libraryContext = context.library;console.log(libraryContext);
+        const libraryContext = context.library;
+        console.log(libraryContext);
         ```
       fonts: |-
         ```
@@ -261,7 +270,8 @@ Penpot:
 
         Example
         ```
-        const fontsContext = context.fonts;console.log(fontsContext);
+        const fontsContext = context.fonts;
+        console.log(fontsContext);
         ```
       currentUser: |-
         ```
@@ -272,7 +282,8 @@ Penpot:
 
         Example
         ```
-        const currentUser = context.currentUser;console.log(currentUser);
+        const currentUser = context.currentUser;
+        console.log(currentUser);
         ```
       activeUsers: |-
         ```
@@ -283,7 +294,8 @@ Penpot:
 
         Example
         ```
-        const activeUsers = context.activeUsers;console.log(activeUsers);
+        const activeUsers = context.activeUsers;
+        console.log(activeUsers);
         ```
       theme: |-
         ```
@@ -294,7 +306,8 @@ Penpot:
 
         Example
         ```
-        const currentTheme = context.theme;console.log(currentTheme);
+        const currentTheme = context.theme;
+        console.log(currentTheme);
         ```
       localStorage: |-
         ```
@@ -311,7 +324,8 @@ Penpot:
 
         Example
         ```
-        const selectedShapes = context.selection;console.log(selectedShapes);
+        const selectedShapes = context.selection;
+        console.log(selectedShapes);
         ```
     Methods:
       on: |-
@@ -333,13 +347,15 @@ Penpot:
           that will be observed. For example:
 
         ```
-        // Observe the current selected shapepenpot.on('shapechange', (shape) => console.log(shape.name), { shapeId: penpot.selection[0].id });
+        // Observe the current selected shape
+        penpot.on('shapechange', (shape) => console.log(shape.name), { shapeId: penpot.selection[0].id });
         ```
 
         * selectionchange: event emitted when the current selection changes. The callback will receive the list of ids for the new selection
         * themechange: event emitted when the user changes its theme. The callback will receive the new theme (currently: either `dark` or `light`)
         * filechange: event emitted when a different file is opened. The callback will receive the new file.
         * contentsave: event emitted after the file content is saved in the backend. The callback receives no arguments.
+        * contentrollback: event emitted after the backend rejected some changes and they were undone in the workspace. The callback receives a `ContentRollback` with the files, pages and shapes affected.
         * finish: event emitted when the current file is closed. The callback will receive the id of the closed file.
 
         Type Parameters
@@ -383,7 +399,8 @@ Penpot:
 
         Example
         ```
-        const listenerId = penpot.on('contentsave', () => console.log("Changed"));penpot.off(listenerId);
+        const listenerId = penpot.on('contentsave', () => console.log("Changed"));
+        penpot.off(listenerId);
         ```
       shapesColors: |-
         ```
@@ -402,7 +419,8 @@ Penpot:
 
         Example
         ```
-        const colors = context.shapesColors(shapes);console.log(colors);
+        const colors = context.shapesColors(shapes);
+        console.log(colors);
         ```
       replaceColor: |-
         ```
@@ -445,7 +463,14 @@ Penpot:
 
         Example
         ```
-        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');console.log(imageData);// to insert the image in a shape we can doconst board = penpot.createBoard();const shape = penpot.createRectangle();board.appendChild(shape);shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
+        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');
+        console.log(imageData);
+
+        // to insert the image in a shape we can do
+        const board = penpot.createBoard();
+        const shape = penpot.createRectangle();
+        board.appendChild(shape);
+        shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
         ```
       uploadMediaData: |-
         ```
@@ -474,7 +499,8 @@ Penpot:
 
         Example
         ```
-        const imageData = await context.uploadMediaData('example', imageData, 'image/jpeg');console.log(imageData);
+        const imageData = await context.uploadMediaData('example', imageData, 'image/jpeg');
+        console.log(imageData);
         ```
       group: |-
         ```
@@ -495,7 +521,8 @@ Penpot:
 
         Example
         ```
-        const penpotShapesArray = penpot.selection;penpot.group(penpotShapesArray);
+        const penpotShapesArray = penpot.selection;
+        penpot.group(penpotShapesArray);
         ```
       ungroup: |-
         ```
@@ -517,7 +544,11 @@ Penpot:
 
         Example
         ```
-        const penpotShapesArray = penpot.selection;// We need to make sure that something is selected, and that the selected shape is a groupif (penpotShapesArray.length && penpot.utils.types.isGroup(penpotShapesArray[0])) {  penpot.ungroup(penpotShapesArray[0]);}
+        const penpotShapesArray = penpot.selection;
+        // We need to make sure that something is selected, and that the selected shape is a group
+        if (penpotShapesArray.length && penpot.utils.types.isGroup(penpotShapesArray[0])) {
+          penpot.ungroup(penpotShapesArray[0]);
+        }
         ```
       createRectangle: |-
         ```
@@ -530,7 +561,48 @@ Penpot:
 
         Example
         ```
-        const shape = penpot.createRectangle();// just change the values like thisshape.name = "Example rectangle";// for solid colorshape.fills = [{ fillColor: "#7EFFF5" }];// for linear gradient colorshape.fills = [{ fillColorGradient: {   "type": "linear",   "startX": 0.5,   "startY": 0,   "endX": 0.5,   "endY": 1,   "width": 1,   "stops": [     {       "color": "#003ae9",       "opacity": 1,       "offset": 0     },     {       "color": "#003ae9",       "opacity": 0,       "offset": 1     }   ] }}];// for a image fillconst imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');shape.fills = [{ fillOpacity: 1, fillImage: imageData }];shape.borderRadius = 8;shape.strokes = [ {   strokeColor: "#2e3434",   strokeStyle: "solid",   strokeWidth: 2,   strokeAlignment: "center", },];
+        const shape = penpot.createRectangle();
+        // just change the values like this
+        shape.name = "Example rectangle";
+
+        // for solid color
+        shape.fills = [{ fillColor: "#7EFFF5" }];
+        // for linear gradient color
+        shape.fills = [{
+         fillColorGradient: {
+           "type": "linear",
+           "startX": 0.5,
+           "startY": 0,
+           "endX": 0.5,
+           "endY": 1,
+           "width": 1,
+           "stops": [
+             {
+               "color": "#003ae9",
+               "opacity": 1,
+               "offset": 0
+             },
+             {
+               "color": "#003ae9",
+               "opacity": 0,
+               "offset": 1
+             }
+           ]
+         }
+        }];
+        // for a image fill
+        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');
+        shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
+
+        shape.borderRadius = 8;
+        shape.strokes = [
+         {
+           strokeColor: "#2e3434",
+           strokeStyle: "solid",
+           strokeWidth: 2,
+           strokeAlignment: "center",
+         },
+        ];
         ```
       createBoard: |-
         ```
@@ -545,7 +617,16 @@ Penpot:
 
         Example
         ```
-        const board = penpot.createBoard();// to add grid layoutboard.addGridLayout();// to add flex layoutboard.addFlexLayout();// to create a shape inside the boardconst shape = penpot.createRectangle();board.appendChild(shape);
+        const board = penpot.createBoard();
+
+        // to add grid layout
+        board.addGridLayout();
+        // to add flex layout
+        board.addFlexLayout();
+
+        // to create a shape inside the board
+        const shape = penpot.createRectangle();
+        board.appendChild(shape);
         ```
       createEllipse: |-
         ```
@@ -558,7 +639,47 @@ Penpot:
 
         Example
         ```
-        const shape = penpot.createEllipse();// just change the values like thisshape.name = "Example ellipse";// for solid colorshape.fills = [{ fillColor: "#7EFFF5" }];// for linear gradient colorshape.fills = [{ fillColorGradient: {   "type": "linear",   "startX": 0.5,   "startY": 0,   "endX": 0.5,   "endY": 1,   "width": 1,   "stops": [     {       "color": "#003ae9",       "opacity": 1,       "offset": 0     },     {       "color": "#003ae9",       "opacity": 0,       "offset": 1     }   ] }}];// for an image fillconst imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');shape.fills = [{ fillOpacity: 1, fillImage: imageData }];shape.strokes = [ {   strokeColor: "#2e3434",   strokeStyle: "solid",   strokeWidth: 2,   strokeAlignment: "center", },];
+        const shape = penpot.createEllipse();
+        // just change the values like this
+        shape.name = "Example ellipse";
+
+        // for solid color
+        shape.fills = [{ fillColor: "#7EFFF5" }];
+        // for linear gradient color
+        shape.fills = [{
+         fillColorGradient: {
+           "type": "linear",
+           "startX": 0.5,
+           "startY": 0,
+           "endX": 0.5,
+           "endY": 1,
+           "width": 1,
+           "stops": [
+             {
+               "color": "#003ae9",
+               "opacity": 1,
+               "offset": 0
+             },
+             {
+               "color": "#003ae9",
+               "opacity": 0,
+               "offset": 1
+             }
+           ]
+         }
+        }];
+        // for an image fill
+        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');
+        shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
+
+        shape.strokes = [
+         {
+           strokeColor: "#2e3434",
+           strokeStyle: "solid",
+           strokeWidth: 2,
+           strokeAlignment: "center",
+         },
+        ];
         ```
       createPath: |-
         ```
@@ -571,7 +692,11 @@ Penpot:
 
         Example
         ```
-        const path = penpot.createPath();path.name = "My path";// for solid colorpath.fills = [{ fillColor: "#7EFFF5" }];
+        const path = penpot.createPath();
+        path.name = "My path";
+
+        // for solid color
+        path.fills = [{ fillColor: "#7EFFF5" }];
         ```
       createBoolean: |-
         ```
@@ -660,7 +785,16 @@ Penpot:
 
         Example
         ```
-        const board = penpot.createBoard();let text;text = penpot.createText();// just change the values like thistext.growType = 'auto-height';text.fontFamily = 'Work Sans';text.fontSize = '12';text.fills = [{fillColor: '#9f05ff', fillOpacity: 1}];text.strokes = [{strokeOpacity: 1, strokeStyle: 'solid', strokeWidth: 2, strokeColor: '#deabff', strokeAlignment: 'outer'}];board.appendChild(text);
+        const board = penpot.createBoard();
+        let text;
+        text = penpot.createText();
+        // just change the values like this
+        text.growType = 'auto-height';
+        text.fontFamily = 'Work Sans';
+        text.fontSize = '12';
+        text.fills = [{fillColor: '#9f05ff', fillOpacity: 1}];
+        text.strokes = [{strokeOpacity: 1, strokeStyle: 'solid', strokeWidth: 2, strokeColor: '#deabff', strokeAlignment: 'outer'}];
+        board.appendChild(text);
         ```
       generateMarkup: |-
         ```
@@ -682,7 +816,8 @@ Penpot:
 
         Example
         ```
-        const markup = context.generateMarkup(shapes, { type: 'html' });console.log(markup);
+        const markup = context.generateMarkup(shapes, { type: 'html' });
+        console.log(markup);
         ```
       generateStyle: |-
         ```
@@ -712,7 +847,8 @@ Penpot:
 
         Example
         ```
-        const styles = context.generateStyle(shapes, { type: 'css' });console.log(styles);
+        const styles = context.generateStyle(shapes, { type: 'css' });
+        console.log(styles);
         ```
       generateFontFaces: |-
         ```
@@ -730,7 +866,8 @@ Penpot:
 
         Example
         ```
-        const fontfaces = context.generateFontFaces(penpot.selection);console.log(fontfaces);
+        const fontfaces = context.generateFontFaces(penpot.selection);
+        console.log(fontfaces);
         ```
       openViewer: |-
         ```
@@ -755,7 +892,12 @@ Penpot:
 
         Example
         ```
-        const page = penpot.createPage();page.name = 'New Page';await penpot.openPage(page); // make the new page active firstconst board = penpot.createBoard();board.resize(375, 812);page.root.appendChild(board);
+        const page = penpot.createPage();
+        page.name = 'New Page';
+        await penpot.openPage(page); // make the new page active first
+        const board = penpot.createBoard();
+        board.resize(375, 812);
+        page.root.appendChild(board);
         ```
       openPage: |-
         ```
@@ -880,6 +1022,54 @@ Penpot:
         Returns VariantContainer
 
         The variant container created
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the layout settles, the promise is rejected. Defaults to
+          30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the layout is updated. It is
+        rejected with an Error, both on timeout and on an invalid timeout value.
+      waitForSave: |-
+        ```
+        waitForSave(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when pending file
+        changes have been saved to the backend, or when there is nothing to save.
+        It force-flushes the persistence buffer first when work is pending.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the save settles, the promise is rejected. Defaults to
+          60000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the save has settled. It is
+        rejected with an Error on save failure, when changes are rolled back
+        during the wait, on timeout, or on an invalid timeout value. A save
+        that failed before the call also rejects: with `save-retrying` while
+        Penpot keeps retrying it, otherwise with the failure code until the
+        file is reopened. The Error `code` property tells the cases apart:
+        `save-timeout`, `rolled-back`, `save-retrying`, or the failure code
+        (`save-failed` unless the backend gave a more specific one).
 ActiveUser:
   overview: |-
     Interface ActiveUser
@@ -917,7 +1107,8 @@ ActiveUser:
 
         Example
         ```
-        const userPosition = activeUser.position;console.log(userPosition);
+        const userPosition = activeUser.position;
+        console.log(userPosition);
         ```
       zoom: |-
         ```
@@ -928,7 +1119,8 @@ ActiveUser:
 
         Example
         ```
-        const userZoom = activeUser.zoom;console.log(userZoom);
+        const userZoom = activeUser.zoom;
+        console.log(userZoom);
         ```
       id: |-
         ```
@@ -939,7 +1131,8 @@ ActiveUser:
 
         Example
         ```
-        const userId = user.id;console.log(userId);
+        const userId = user.id;
+        console.log(userId);
         ```
       name: |-
         ```
@@ -950,7 +1143,8 @@ ActiveUser:
 
         Example
         ```
-        const userName = user.name;console.log(userName);
+        const userName = user.name;
+        console.log(userName);
         ```
       avatarUrl: |-
         ```
@@ -961,7 +1155,8 @@ ActiveUser:
 
         Example
         ```
-        const avatarUrl = user.avatarUrl;console.log(avatarUrl);
+        const avatarUrl = user.avatarUrl;
+        console.log(avatarUrl);
         ```
       color: |-
         ```
@@ -972,7 +1167,8 @@ ActiveUser:
 
         Example
         ```
-        const userColor = user.color;console.log(userColor);
+        const userColor = user.color;
+        console.log(userColor);
         ```
       sessionId: |-
         ```
@@ -983,7 +1179,8 @@ ActiveUser:
 
         Example
         ```
-        const sessionId = user.sessionId;console.log(sessionId);
+        const sessionId = user.sessionId;
+        console.log(sessionId);
         ```
 Blur:
   overview: |-
@@ -1118,9 +1315,9 @@ Board:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -1129,6 +1326,10 @@ Board:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -1165,6 +1366,7 @@ Board:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -1185,6 +1387,7 @@ Board:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -1533,9 +1736,9 @@ Board:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -1544,6 +1747,10 @@ Board:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -1638,7 +1845,16 @@ Board:
 
         Example
         ```
-        const board = penpot.createBoard();const flex = board.addFlexLayout();// You can change the flex properties as follows.flex.dir = "column";flex.wrap = "wrap";flex.alignItems = "center";flex.justifyContent = "center";flex.horizontalSizing = "fill";flex.verticalSizing = "fill";
+        const board = penpot.createBoard();
+        const flex = board.addFlexLayout();
+
+        // You can change the flex properties as follows.
+        flex.dir = "column";
+        flex.wrap = "wrap";
+        flex.alignItems = "center";
+        flex.justifyContent = "center";
+        flex.horizontalSizing = "fill";
+        flex.verticalSizing = "fill";
         ```
       addGridLayout: |-
         ```
@@ -1653,7 +1869,16 @@ Board:
 
         Example
         ```
-        const board = penpot.createBoard();const grid = board.addGridLayout();// You can change the grid properties as follows.grid.alignItems = "center";grid.justifyItems = "start";grid.rowGap = 10;grid.columnGap = 10;grid.verticalPadding = 5;grid.horizontalPadding = 5;
+        const board = penpot.createBoard();
+        const grid = board.addGridLayout();
+
+        // You can change the grid properties as follows.
+        grid.alignItems = "center";
+        grid.justifyItems = "start";
+        grid.rowGap = 10;
+        grid.columnGap = 10;
+        grid.verticalPadding = 5;
+        grid.horizontalPadding = 5;
         ```
       addRulerGuide: |-
         ```
@@ -1711,7 +1936,8 @@ Board:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -1748,7 +1974,8 @@ Board:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -1772,7 +1999,8 @@ Board:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -1818,7 +2046,8 @@ Board:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -1947,6 +2176,18 @@ Board:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -2156,6 +2397,11 @@ Board:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -2175,6 +2421,27 @@ Board:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 VariantContainer:
   overview: |-
     Interface VariantContainer
@@ -2271,9 +2538,9 @@ VariantContainer:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -2282,6 +2549,10 @@ VariantContainer:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -2318,6 +2589,7 @@ VariantContainer:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -2338,6 +2610,7 @@ VariantContainer:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -2689,9 +2962,9 @@ VariantContainer:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -2700,6 +2973,10 @@ VariantContainer:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -2794,7 +3071,16 @@ VariantContainer:
 
         Example
         ```
-        const board = penpot.createBoard();const flex = board.addFlexLayout();// You can change the flex properties as follows.flex.dir = "column";flex.wrap = "wrap";flex.alignItems = "center";flex.justifyContent = "center";flex.horizontalSizing = "fill";flex.verticalSizing = "fill";
+        const board = penpot.createBoard();
+        const flex = board.addFlexLayout();
+
+        // You can change the flex properties as follows.
+        flex.dir = "column";
+        flex.wrap = "wrap";
+        flex.alignItems = "center";
+        flex.justifyContent = "center";
+        flex.horizontalSizing = "fill";
+        flex.verticalSizing = "fill";
         ```
       addGridLayout: |-
         ```
@@ -2809,7 +3095,16 @@ VariantContainer:
 
         Example
         ```
-        const board = penpot.createBoard();const grid = board.addGridLayout();// You can change the grid properties as follows.grid.alignItems = "center";grid.justifyItems = "start";grid.rowGap = 10;grid.columnGap = 10;grid.verticalPadding = 5;grid.horizontalPadding = 5;
+        const board = penpot.createBoard();
+        const grid = board.addGridLayout();
+
+        // You can change the grid properties as follows.
+        grid.alignItems = "center";
+        grid.justifyItems = "start";
+        grid.rowGap = 10;
+        grid.columnGap = 10;
+        grid.verticalPadding = 5;
+        grid.horizontalPadding = 5;
         ```
       addRulerGuide: |-
         ```
@@ -2867,7 +3162,8 @@ VariantContainer:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -2904,7 +3200,8 @@ VariantContainer:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -2928,7 +3225,8 @@ VariantContainer:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -2974,7 +3272,8 @@ VariantContainer:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -3103,6 +3402,18 @@ VariantContainer:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -3312,6 +3623,11 @@ VariantContainer:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -3331,6 +3647,27 @@ VariantContainer:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 Boolean:
   overview: |-
     Interface Boolean
@@ -3414,9 +3751,9 @@ Boolean:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -3425,6 +3762,10 @@ Boolean:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -3461,6 +3802,7 @@ Boolean:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -3481,6 +3823,7 @@ Boolean:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -3786,9 +4129,9 @@ Boolean:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -3797,6 +4140,10 @@ Boolean:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -3911,7 +4258,8 @@ Boolean:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -3948,7 +4296,8 @@ Boolean:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -3972,7 +4321,8 @@ Boolean:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -4018,7 +4368,8 @@ Boolean:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -4147,6 +4498,18 @@ Boolean:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -4356,6 +4719,11 @@ Boolean:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -4375,6 +4743,27 @@ Boolean:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 CloseOverlay:
   overview: |-
     Interface CloseOverlay
@@ -4742,9 +5131,9 @@ CommonLayout:
         rightPadding: number;
         bottomPadding: number;
         leftPadding: number;
-        horizontalSizing: "fill"
-        | "auto"
-        | "fix";
+        paddingType: "simple"
+        | "multiple";
+        horizontalSizing: "fill" | "auto" | "fix";
         verticalSizing: "fill" | "auto" | "fix";
         remove(): void;
     }
@@ -4873,6 +5262,16 @@ CommonLayout:
         ```
 
         The `leftPadding` property specifies the padding at the left of the container.
+      paddingType: |-
+        ```
+        paddingType: "simple" | "multiple"
+        ```
+
+        The `paddingType` property specifies how the four padding values are applied.
+        It can be one of the following values:
+
+        * 'simple': the vertical and horizontal paddings are mirrored across both sides.
+        * 'multiple': each of the four sides (top, right, bottom, left) is honoured independently.
       horizontalSizing: |-
         ```
         horizontalSizing: "fill" | "auto" | "fix"
@@ -4904,6 +5303,598 @@ CommonLayout:
         The `remove` method removes the layout.
 
         Returns void
+WorkspaceContext:
+  overview: |-
+    Interface WorkspaceContext
+    ==========================
+
+    Current workspace of this browser tab.
+
+    ```
+    interface WorkspaceContext {
+        status: "none" | "loading" | "ready";
+        fileId: string | null;
+        fileName: string | null;
+        teamId: string | null;
+    }
+    ```
+
+    Referenced by: EventsMap, PenpotMgmt
+  members:
+    Properties:
+      status: |-
+        ```
+        readonly status: "none" | "loading" | "ready"
+        ```
+      fileId: |-
+        ```
+        readonly fileId: string | null
+        ```
+      fileName: |-
+        ```
+        readonly fileName: string | null
+        ```
+      teamId: |-
+        ```
+        readonly teamId: string | null
+        ```
+Team:
+  overview: |-
+    Interface Team
+    ==============
+
+    A team the user belongs to. Requires `manage:teams`.
+
+    Values are a snapshot taken when the team was listed; changes made through
+    this object update it.
+    Property assignments run asynchronously and update values after success.
+    Backend failures are logged to the console; assignments cannot be awaited.
+
+    ```
+    interface Team {
+        id: string;
+        isDefault: boolean;
+        name: string;
+        listProjects(): Promise<Project[]>;
+        listDeletedProjects(): Promise<Project[]>;
+        listDeletedFiles(): Promise<ProjectFile[]>;
+        createProject(options: { name: string }): Promise<Project>;
+    }
+    ```
+
+    Referenced by: PenpotMgmt, Project
+  members:
+    Properties:
+      id: |-
+        ```
+        readonly id: string
+        ```
+      isDefault: |-
+        ```
+        readonly isDefault: boolean
+        ```
+
+        Whether this is the user's personal team.
+      name: |-
+        ```
+        name: string
+        ```
+
+        The team name. Assigning renames the team; requires `manage:teams`.
+        Trims the name and requires 1 to 250 characters.
+    Methods:
+      listProjects: |-
+        ```
+        listProjects(): Promise<Project[]>
+        ```
+
+        Lists the team's projects. Requires `content:read`.
+
+        Returns Promise<Project[]>
+
+        Example
+        ```
+        const [team] = await penpotMgmt.listTeams();
+        const projects = await team.listProjects();
+        ```
+      listDeletedProjects: |-
+        ```
+        listDeletedProjects(): Promise<Project[]>
+        ```
+
+        Lists projects still recoverable from Trash. Requires `content:read`.
+
+        Returns Promise<Project[]>
+      listDeletedFiles: |-
+        ```
+        listDeletedFiles(): Promise<ProjectFile[]>
+        ```
+
+        Lists files still recoverable from Trash. Requires `content:read`.
+
+        Returns Promise<ProjectFile[]>
+      createProject: |-
+        ```
+        createProject(options: { name: string }): Promise<Project>
+        ```
+
+        Creates a project in the team. Requires `manage:projects`.
+
+        * Trims `name` and requires 1 to 250 characters.
+        * Does not change navigation.
+
+        Parameters
+
+        * options: { name: string }
+
+        Returns Promise<Project>
+
+        Example
+        ```
+        const project = await team.createProject({ name: 'Design system' });
+        ```
+Project:
+  overview: |-
+    Interface Project
+    =================
+
+    A project in the dashboard.
+
+    Values are a snapshot taken when the project was listed; changes made through
+    this object update it.
+    Property assignments run asynchronously and update values after success.
+    Backend failures are logged to the console; assignments cannot be awaited.
+
+    ```
+    interface Project {
+        id: string;
+        teamId: string;
+        isDefault: boolean;
+        fileCount: number;
+        name: string;
+        pinned: boolean;
+        listFiles(): Promise<ProjectFile[]>;
+        listDeletedFiles(): Promise<ProjectFile[]>;
+        restore(): Promise<void>;
+        createFile(options: { name: string }): Promise<ProjectFile>;
+        duplicate(options?: { name?: string }): Promise<Project>;
+        moveTo(team: Team): Promise<void>;
+        remove(): Promise<void>;
+    }
+    ```
+
+    Referenced by: PenpotMgmt, Project, ProjectFile, Team
+  members:
+    Properties:
+      id: |-
+        ```
+        readonly id: string
+        ```
+      teamId: |-
+        ```
+        readonly teamId: string
+        ```
+      isDefault: |-
+        ```
+        readonly isDefault: boolean
+        ```
+
+        Whether this is the team's Drafts project.
+      fileCount: |-
+        ```
+        readonly fileCount: number
+        ```
+
+        Number of files when the project was listed; file operations do not update it.
+      name: |-
+        ```
+        name: string
+        ```
+
+        The project name. Assigning renames the project; requires `manage:projects`.
+        Trims the name and requires 1 to 250 characters.
+      pinned: |-
+        ```
+        pinned: boolean
+        ```
+
+        Whether the project is pinned in the sidebar. Assigning requires `manage:projects`.
+    Methods:
+      listFiles: |-
+        ```
+        listFiles(): Promise<ProjectFile[]>
+        ```
+
+        Lists the files in the project. Requires `content:read`.
+
+        Returns Promise<ProjectFile[]>
+
+        Example
+        ```
+        const files = await project.listFiles();
+        ```
+      listDeletedFiles: |-
+        ```
+        listDeletedFiles(): Promise<ProjectFile[]>
+        ```
+
+        Lists the project's files still recoverable from Trash. Requires `content:read`.
+
+        Returns Promise<ProjectFile[]>
+      restore: |-
+        ```
+        restore(): Promise<void>
+        ```
+
+        Restores the project through its files using the dashboard's Trash operation.
+        Requires `manage:projects` and team edit access. Does not require `manage:delete`.
+        Rejects if the project has no recoverable files, including empty projects.
+
+        Returns Promise<void>
+      createFile: |-
+        ```
+        createFile(options: { name: string }): Promise<ProjectFile>
+        ```
+
+        Creates a file with an initial page in the project. Requires `content:write`.
+
+        * Trims `name` and requires 1 to 250 characters.
+        * Does not open the file. Use `ProjectFile.open` to edit it.
+
+        Parameters
+
+        * options: { name: string }
+
+        Returns Promise<ProjectFile>
+
+        Example
+        ```
+        const file = await project.createFile({ name: 'Login' });
+        await file.open();
+        ```
+      duplicate: |-
+        ```
+        duplicate(options?: { name?: string }): Promise<Project>
+        ```
+
+        Duplicates the project with all its files. Requires `manage:projects`.
+
+        `name` defaults to the name the backend chooses.
+
+        Parameters
+
+        * options: { name?: string }
+
+        Returns Promise<Project>
+      moveTo: |-
+        ```
+        moveTo(team: Team): Promise<void>
+        ```
+
+        Moves the project to another team. Requires `manage:teams`.
+
+        Parameters
+
+        * team: Team
+
+        Returns Promise<void>
+      remove: |-
+        ```
+        remove(): Promise<void>
+        ```
+
+        Moves the project and its files to Trash. Requires `manage:delete`.
+        They can be restored during the retention period. Cannot permanently delete.
+
+        Returns Promise<void>
+ProjectFile:
+  overview: |-
+    Interface ProjectFile
+    =====================
+
+    A file in the dashboard, which may or may not be open.
+
+    Values are a snapshot taken when the file was listed; changes made through
+    this object update it. To read or edit its content, `open` it and use
+    `penpot.currentFile`.
+    Property assignments run asynchronously and update values after success.
+    Backend failures are logged to the console; assignments cannot be awaited.
+
+    ```
+    interface ProjectFile {
+        id: string;
+        teamId: string;
+        projectId: string;
+        modifiedAt: string;
+        name: string;
+        shared: boolean;
+        open(): Promise<void>;
+        restore(): Promise<void>;
+        moveTo(project: Project): Promise<void>;
+        duplicate(options?: { name?: string }): Promise<ProjectFile>;
+        remove(): Promise<void>;
+    }
+    ```
+
+    Referenced by: PenpotMgmt, Project, ProjectFile, Team
+  members:
+    Properties:
+      id: |-
+        ```
+        readonly id: string
+        ```
+      teamId: |-
+        ```
+        readonly teamId: string
+        ```
+      projectId: |-
+        ```
+        readonly projectId: string
+        ```
+      modifiedAt: |-
+        ```
+        readonly modifiedAt: string
+        ```
+
+        Last modification time as an ISO 8601 string in UTC.
+      name: |-
+        ```
+        name: string
+        ```
+
+        The file name. Assigning renames the file; requires `content:write`.
+        Trims the name and requires 1 to 250 characters.
+      shared: |-
+        ```
+        shared: boolean
+        ```
+
+        Whether the file is shared as a library with its team. Assigning requires
+        `library:write`. A shared file is listed by
+        `penpot.library.availableLibraries()`; unsharing copies its assets into
+        every file that uses it and disconnects them.
+    Methods:
+      open: |-
+        ```
+        open(): Promise<void>
+        ```
+
+        Opens the file in this tab and resolves once its workspace and page are
+        ready. Requires `content:read`.
+
+        Returns Promise<void>
+      restore: |-
+        ```
+        restore(): Promise<void>
+        ```
+
+        Restores the file using the dashboard's Trash operation, including its parent
+        project if deleted. Requires `content:write` and team edit access.
+        Rejects if the file no longer exists. Does not require `manage:delete`.
+
+        Returns Promise<void>
+      moveTo: |-
+        ```
+        moveTo(project: Project): Promise<void>
+        ```
+
+        Moves the file to another project of the same team. Requires `content:write`.
+        Rejects a destination that currently belongs to another team.
+
+        Parameters
+
+        * project: Project
+
+        Returns Promise<void>
+      duplicate: |-
+        ```
+        duplicate(options?: { name?: string }): Promise<ProjectFile>
+        ```
+
+        Duplicates the file in its project. Requires `content:write`.
+
+        `name` defaults to the name the backend chooses.
+
+        Parameters
+
+        * options: { name?: string }
+
+        Returns Promise<ProjectFile>
+      remove: |-
+        ```
+        remove(): Promise<void>
+        ```
+
+        Moves the file to Trash. Requires `manage:delete`.
+        It can be restored during the retention period. Cannot permanently delete.
+
+        Returns Promise<void>
+PenpotMgmt:
+  overview: |-
+    Interface PenpotMgmt
+    ====================
+
+    Application management API exposed as `penpotMgmt` to global plugins.
+
+    * Lists teams, projects and files, and opens files, from the dashboard or a
+      file workspace. Teams, projects and files are objects with their own
+      properties and methods.
+    * Listing and opening require `content:read`; teams require `manage:teams`.
+    * File operations on `penpot` require a ready workspace.
+    * Reacquire file, page and shape objects after changing files.
+
+    ```
+    interface PenpotMgmt {
+        workspace: WorkspaceContext;
+        listTeams(): Promise<Team[]>;
+        createTeam(options: { name: string }): Promise<Team>;
+        listProjects(options?: { teamId?: string }): Promise<Project[]>;
+        listDeletedProjects(options?: { teamId?: string }): Promise<Project[]>;
+        listDeletedFiles(options?: { teamId?: string }): Promise<ProjectFile[]>;
+        getFile(fileId: string): Promise<ProjectFile>;
+        openFile(fileId: string, options?: { teamId?: string }): Promise<void>;
+        on(
+            type: "workspacechange",
+            callback: (workspace: WorkspaceContext) => void,
+        ): symbol;
+        off(listenerId: symbol): void;
+    }
+    ```
+
+    Referenced by: Context
+  members:
+    Properties:
+      workspace: |-
+        ```
+        readonly workspace: WorkspaceContext
+        ```
+
+        Current workspace availability and metadata; usable for file operations when status is `ready`.
+    Methods:
+      listTeams: |-
+        ```
+        listTeams(): Promise<Team[]>
+        ```
+
+        Lists the teams of the user. Requires `manage:teams`.
+
+        Returns Promise<Team[]>
+
+        Example
+        ```
+        const teams = await penpotMgmt.listTeams();
+        ```
+      createTeam: |-
+        ```
+        createTeam(options: { name: string }): Promise<Team>
+        ```
+
+        Creates a team with the user as owner. Requires `manage:teams`.
+
+        * Trims `name` and requires 1 to 250 characters.
+        * Does not change navigation.
+
+        Parameters
+
+        * options: { name: string }
+
+        Returns Promise<Team>
+
+        Example
+        ```
+        const team = await penpotMgmt.createTeam({ name: 'Marketing' });
+        ```
+      listProjects: |-
+        ```
+        listProjects(options?: { teamId?: string }): Promise<Project[]>
+        ```
+
+        Lists the projects of a team. Requires `content:read`.
+
+        * `teamId` defaults to the current team.
+        * Rejects invalid identifiers and backend access errors.
+
+        Parameters
+
+        * options: { teamId?: string }
+
+        Returns Promise<Project[]>
+
+        Example
+        ```
+        const projects = await penpotMgmt.listProjects();
+        ```
+      listDeletedProjects: |-
+        ```
+        listDeletedProjects(options?: { teamId?: string }): Promise<Project[]>
+        ```
+
+        Lists projects still recoverable from Trash. Requires `content:read`.
+        `teamId` defaults to the current team. Use `Project.restore` to recover them.
+
+        Parameters
+
+        * options: { teamId?: string }
+
+        Returns Promise<Project[]>
+      listDeletedFiles: |-
+        ```
+        listDeletedFiles(options?: { teamId?: string }): Promise<ProjectFile[]>
+        ```
+
+        Lists files still recoverable from Trash. Requires `content:read`.
+        `teamId` defaults to the current team. Use `ProjectFile.restore` to recover them.
+
+        Parameters
+
+        * options: { teamId?: string }
+
+        Returns Promise<ProjectFile[]>
+      getFile: |-
+        ```
+        getFile(fileId: string): Promise<ProjectFile>
+        ```
+
+        Loads a file by id, open or not. Requires `content:read`.
+
+        Parameters
+
+        * fileId: string
+
+        Returns Promise<ProjectFile>
+
+        Example
+        ```
+        const file = await penpotMgmt.getFile(penpotMgmt.workspace.fileId!);
+        file.name = 'Checkout';
+        ```
+      openFile: |-
+        ```
+        openFile(fileId: string, options?: { teamId?: string }): Promise<void>
+        ```
+
+        Opens a file in this tab and resolves once its workspace and page are ready.
+
+        * `teamId` defaults to the current team.
+        * Rejects invalid identifiers, failed or superseded navigation, and waits exceeding 30 seconds.
+
+        Parameters
+
+        * fileId: string
+        * options: { teamId?: string }
+
+        Returns Promise<void>
+
+        Example
+        ```
+        await penpotMgmt.openFile(file.id, { teamId: file.teamId });
+        ```
+      on: |-
+        ```
+        on(
+            type: "workspacechange",
+            callback: (workspace: WorkspaceContext) => void,
+        ): symbol
+        ```
+
+        Subscribes to workspace availability and metadata changes.
+
+        Parameters
+
+        * type: "workspacechange"
+        * callback: (workspace: WorkspaceContext) => void
+
+        Returns symbol
+      off: |-
+        ```
+        off(listenerId: symbol): void
+        ```
+
+        Parameters
+
+        * listenerId: symbol
+
+        Returns void
 Context:
   overview: |-
     Interface Context
@@ -4913,6 +5904,7 @@ Context:
 
     ```
     interface Context {
+        management?: Omit<PenpotMgmt, "on" | "off">;
         version: string;
         root: Shape | null;
         currentFile: File | null;
@@ -4979,10 +5971,19 @@ Context:
         distributeVertical(shapes: Shape[]): void;
         flatten(shapes: Shape[]): Path[];
         createVariantFromComponents(shapes: Board[]): VariantContainer;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
+        waitForSave(timeout?: number): Promise<void>;
     }
     ```
   members:
     Properties:
+      management: |-
+        ```
+        readonly management?: Omit<PenpotMgmt, "on" | "off">
+        ```
+
+        Backs `penpotMgmt`. Its events go through the plugin listener registry,
+        so `on` and `off` are not part of it.
       version: |-
         ```
         readonly version: string
@@ -4998,7 +5999,8 @@ Context:
 
         Example
         ```
-        const rootShape = context.root;console.log(rootShape);
+        const rootShape = context.root;
+        console.log(rootShape);
         ```
       currentFile: |-
         ```
@@ -5013,7 +6015,8 @@ Context:
 
         Example
         ```
-        const fileData = context.currentFile;console.log(fileData);
+        const fileData = context.currentFile;
+        console.log(fileData);
         ```
       currentPage: |-
         ```
@@ -5024,7 +6027,8 @@ Context:
 
         Example
         ```
-        const currentPage = context.currentPage;console.log(currentPage);
+        const currentPage = context.currentPage;
+        console.log(currentPage);
         ```
       viewport: |-
         ```
@@ -5035,7 +6039,8 @@ Context:
 
         Example
         ```
-        const viewportSettings = context.viewport;console.log(viewportSettings);
+        const viewportSettings = context.viewport;
+        console.log(viewportSettings);
         ```
       flags: |-
         ```
@@ -5052,7 +6057,8 @@ Context:
 
         Example
         ```
-        const historyContext = context.history;console.log(historyContext);
+        const historyContext = context.history;
+        console.log(historyContext);
         ```
       library: |-
         ```
@@ -5063,7 +6069,8 @@ Context:
 
         Example
         ```
-        const libraryContext = context.library;console.log(libraryContext);
+        const libraryContext = context.library;
+        console.log(libraryContext);
         ```
       fonts: |-
         ```
@@ -5074,7 +6081,8 @@ Context:
 
         Example
         ```
-        const fontsContext = context.fonts;console.log(fontsContext);
+        const fontsContext = context.fonts;
+        console.log(fontsContext);
         ```
       currentUser: |-
         ```
@@ -5085,7 +6093,8 @@ Context:
 
         Example
         ```
-        const currentUser = context.currentUser;console.log(currentUser);
+        const currentUser = context.currentUser;
+        console.log(currentUser);
         ```
       activeUsers: |-
         ```
@@ -5096,7 +6105,8 @@ Context:
 
         Example
         ```
-        const activeUsers = context.activeUsers;console.log(activeUsers);
+        const activeUsers = context.activeUsers;
+        console.log(activeUsers);
         ```
       theme: |-
         ```
@@ -5107,7 +6117,8 @@ Context:
 
         Example
         ```
-        const currentTheme = context.theme;console.log(currentTheme);
+        const currentTheme = context.theme;
+        console.log(currentTheme);
         ```
       localStorage: |-
         ```
@@ -5124,7 +6135,8 @@ Context:
 
         Example
         ```
-        const selectedShapes = context.selection;console.log(selectedShapes);
+        const selectedShapes = context.selection;
+        console.log(selectedShapes);
         ```
     Methods:
       shapesColors: |-
@@ -5144,7 +6156,8 @@ Context:
 
         Example
         ```
-        const colors = context.shapesColors(shapes);console.log(colors);
+        const colors = context.shapesColors(shapes);
+        console.log(colors);
         ```
       replaceColor: |-
         ```
@@ -5187,7 +6200,14 @@ Context:
 
         Example
         ```
-        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');console.log(imageData);// to insert the image in a shape we can doconst board = penpot.createBoard();const shape = penpot.createRectangle();board.appendChild(shape);shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
+        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');
+        console.log(imageData);
+
+        // to insert the image in a shape we can do
+        const board = penpot.createBoard();
+        const shape = penpot.createRectangle();
+        board.appendChild(shape);
+        shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
         ```
       uploadMediaData: |-
         ```
@@ -5216,7 +6236,8 @@ Context:
 
         Example
         ```
-        const imageData = await context.uploadMediaData('example', imageData, 'image/jpeg');console.log(imageData);
+        const imageData = await context.uploadMediaData('example', imageData, 'image/jpeg');
+        console.log(imageData);
         ```
       group: |-
         ```
@@ -5237,7 +6258,8 @@ Context:
 
         Example
         ```
-        const penpotShapesArray = penpot.selection;penpot.group(penpotShapesArray);
+        const penpotShapesArray = penpot.selection;
+        penpot.group(penpotShapesArray);
         ```
       ungroup: |-
         ```
@@ -5259,7 +6281,11 @@ Context:
 
         Example
         ```
-        const penpotShapesArray = penpot.selection;// We need to make sure that something is selected, and that the selected shape is a groupif (penpotShapesArray.length && penpot.utils.types.isGroup(penpotShapesArray[0])) {  penpot.ungroup(penpotShapesArray[0]);}
+        const penpotShapesArray = penpot.selection;
+        // We need to make sure that something is selected, and that the selected shape is a group
+        if (penpotShapesArray.length && penpot.utils.types.isGroup(penpotShapesArray[0])) {
+          penpot.ungroup(penpotShapesArray[0]);
+        }
         ```
       createRectangle: |-
         ```
@@ -5272,7 +6298,48 @@ Context:
 
         Example
         ```
-        const shape = penpot.createRectangle();// just change the values like thisshape.name = "Example rectangle";// for solid colorshape.fills = [{ fillColor: "#7EFFF5" }];// for linear gradient colorshape.fills = [{ fillColorGradient: {   "type": "linear",   "startX": 0.5,   "startY": 0,   "endX": 0.5,   "endY": 1,   "width": 1,   "stops": [     {       "color": "#003ae9",       "opacity": 1,       "offset": 0     },     {       "color": "#003ae9",       "opacity": 0,       "offset": 1     }   ] }}];// for a image fillconst imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');shape.fills = [{ fillOpacity: 1, fillImage: imageData }];shape.borderRadius = 8;shape.strokes = [ {   strokeColor: "#2e3434",   strokeStyle: "solid",   strokeWidth: 2,   strokeAlignment: "center", },];
+        const shape = penpot.createRectangle();
+        // just change the values like this
+        shape.name = "Example rectangle";
+
+        // for solid color
+        shape.fills = [{ fillColor: "#7EFFF5" }];
+        // for linear gradient color
+        shape.fills = [{
+         fillColorGradient: {
+           "type": "linear",
+           "startX": 0.5,
+           "startY": 0,
+           "endX": 0.5,
+           "endY": 1,
+           "width": 1,
+           "stops": [
+             {
+               "color": "#003ae9",
+               "opacity": 1,
+               "offset": 0
+             },
+             {
+               "color": "#003ae9",
+               "opacity": 0,
+               "offset": 1
+             }
+           ]
+         }
+        }];
+        // for a image fill
+        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');
+        shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
+
+        shape.borderRadius = 8;
+        shape.strokes = [
+         {
+           strokeColor: "#2e3434",
+           strokeStyle: "solid",
+           strokeWidth: 2,
+           strokeAlignment: "center",
+         },
+        ];
         ```
       createBoard: |-
         ```
@@ -5287,7 +6354,16 @@ Context:
 
         Example
         ```
-        const board = penpot.createBoard();// to add grid layoutboard.addGridLayout();// to add flex layoutboard.addFlexLayout();// to create a shape inside the boardconst shape = penpot.createRectangle();board.appendChild(shape);
+        const board = penpot.createBoard();
+
+        // to add grid layout
+        board.addGridLayout();
+        // to add flex layout
+        board.addFlexLayout();
+
+        // to create a shape inside the board
+        const shape = penpot.createRectangle();
+        board.appendChild(shape);
         ```
       createEllipse: |-
         ```
@@ -5300,7 +6376,47 @@ Context:
 
         Example
         ```
-        const shape = penpot.createEllipse();// just change the values like thisshape.name = "Example ellipse";// for solid colorshape.fills = [{ fillColor: "#7EFFF5" }];// for linear gradient colorshape.fills = [{ fillColorGradient: {   "type": "linear",   "startX": 0.5,   "startY": 0,   "endX": 0.5,   "endY": 1,   "width": 1,   "stops": [     {       "color": "#003ae9",       "opacity": 1,       "offset": 0     },     {       "color": "#003ae9",       "opacity": 0,       "offset": 1     }   ] }}];// for an image fillconst imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');shape.fills = [{ fillOpacity: 1, fillImage: imageData }];shape.strokes = [ {   strokeColor: "#2e3434",   strokeStyle: "solid",   strokeWidth: 2,   strokeAlignment: "center", },];
+        const shape = penpot.createEllipse();
+        // just change the values like this
+        shape.name = "Example ellipse";
+
+        // for solid color
+        shape.fills = [{ fillColor: "#7EFFF5" }];
+        // for linear gradient color
+        shape.fills = [{
+         fillColorGradient: {
+           "type": "linear",
+           "startX": 0.5,
+           "startY": 0,
+           "endX": 0.5,
+           "endY": 1,
+           "width": 1,
+           "stops": [
+             {
+               "color": "#003ae9",
+               "opacity": 1,
+               "offset": 0
+             },
+             {
+               "color": "#003ae9",
+               "opacity": 0,
+               "offset": 1
+             }
+           ]
+         }
+        }];
+        // for an image fill
+        const imageData = await context.uploadMediaUrl('example', 'https://example.com/image.jpg');
+        shape.fills = [{ fillOpacity: 1, fillImage: imageData }];
+
+        shape.strokes = [
+         {
+           strokeColor: "#2e3434",
+           strokeStyle: "solid",
+           strokeWidth: 2,
+           strokeAlignment: "center",
+         },
+        ];
         ```
       createPath: |-
         ```
@@ -5313,7 +6429,11 @@ Context:
 
         Example
         ```
-        const path = penpot.createPath();path.name = "My path";// for solid colorpath.fills = [{ fillColor: "#7EFFF5" }];
+        const path = penpot.createPath();
+        path.name = "My path";
+
+        // for solid color
+        path.fills = [{ fillColor: "#7EFFF5" }];
         ```
       createBoolean: |-
         ```
@@ -5402,7 +6522,16 @@ Context:
 
         Example
         ```
-        const board = penpot.createBoard();let text;text = penpot.createText();// just change the values like thistext.growType = 'auto-height';text.fontFamily = 'Work Sans';text.fontSize = '12';text.fills = [{fillColor: '#9f05ff', fillOpacity: 1}];text.strokes = [{strokeOpacity: 1, strokeStyle: 'solid', strokeWidth: 2, strokeColor: '#deabff', strokeAlignment: 'outer'}];board.appendChild(text);
+        const board = penpot.createBoard();
+        let text;
+        text = penpot.createText();
+        // just change the values like this
+        text.growType = 'auto-height';
+        text.fontFamily = 'Work Sans';
+        text.fontSize = '12';
+        text.fills = [{fillColor: '#9f05ff', fillOpacity: 1}];
+        text.strokes = [{strokeOpacity: 1, strokeStyle: 'solid', strokeWidth: 2, strokeColor: '#deabff', strokeAlignment: 'outer'}];
+        board.appendChild(text);
         ```
       generateMarkup: |-
         ```
@@ -5424,7 +6553,8 @@ Context:
 
         Example
         ```
-        const markup = context.generateMarkup(shapes, { type: 'html' });console.log(markup);
+        const markup = context.generateMarkup(shapes, { type: 'html' });
+        console.log(markup);
         ```
       generateStyle: |-
         ```
@@ -5454,7 +6584,8 @@ Context:
 
         Example
         ```
-        const styles = context.generateStyle(shapes, { type: 'css' });console.log(styles);
+        const styles = context.generateStyle(shapes, { type: 'css' });
+        console.log(styles);
         ```
       generateFontFaces: |-
         ```
@@ -5472,7 +6603,8 @@ Context:
 
         Example
         ```
-        const fontfaces = context.generateFontFaces(penpot.selection);console.log(fontfaces);
+        const fontfaces = context.generateFontFaces(penpot.selection);
+        console.log(fontfaces);
         ```
       addListener: |-
         ```
@@ -5499,7 +6631,9 @@ Context:
 
         Example
         ```
-        const listenerId = context.addListener('selectionchange', (event) => {  console.log(event);});
+        const listenerId = context.addListener('selectionchange', (event) => {
+          console.log(event);
+        });
         ```
       removeListener: |-
         ```
@@ -5541,7 +6675,12 @@ Context:
 
         Example
         ```
-        const page = penpot.createPage();page.name = 'New Page';await penpot.openPage(page); // make the new page active firstconst board = penpot.createBoard();board.resize(375, 812);page.root.appendChild(board);
+        const page = penpot.createPage();
+        page.name = 'New Page';
+        await penpot.openPage(page); // make the new page active first
+        const board = penpot.createBoard();
+        board.resize(375, 812);
+        page.root.appendChild(board);
         ```
       openPage: |-
         ```
@@ -5666,6 +6805,54 @@ Context:
         Returns VariantContainer
 
         The variant container created
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the layout settles, the promise is rejected. Defaults to
+          30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the layout is updated. It is
+        rejected with an Error, both on timeout and on an invalid timeout value.
+      waitForSave: |-
+        ```
+        waitForSave(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when pending file
+        changes have been saved to the backend, or when there is nothing to save.
+        It force-flushes the persistence buffer first when work is pending.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the save settles, the promise is rejected. Defaults to
+          60000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the save has settled. It is
+        rejected with an Error on save failure, when changes are rolled back
+        during the wait, on timeout, or on an invalid timeout value. A save
+        that failed before the call also rejects: with `save-retrying` while
+        Penpot keeps retrying it, otherwise with the failure code until the
+        file is reopened. The Error `code` property tells the cases apart:
+        `save-timeout`, `rolled-back`, `save-retrying`, or the failure code
+        (`save-failed` unless the backend gave a more specific one).
 ContextGeometryUtils:
   overview: |-
     Interface ContextGeometryUtils
@@ -5675,7 +6862,8 @@ ContextGeometryUtils:
 
     Example
     ```
-    const centerPoint = geometryUtils.center(shapes);console.log(centerPoint);
+    const centerPoint = geometryUtils.center(shapes);
+    console.log(centerPoint);
     ```
 
     ```
@@ -5707,7 +6895,8 @@ ContextGeometryUtils:
 
         Example
         ```
-        const centerPoint = geometryUtils.center(shapes);console.log(centerPoint);
+        const centerPoint = geometryUtils.center(shapes);
+        console.log(centerPoint);
         ```
 ContextTypesUtils:
   overview: |-
@@ -5718,7 +6907,8 @@ ContextTypesUtils:
 
     Example
     ```
-    const isBoard = typesUtils.isBoard(shape);console.log(isBoard);
+    const isBoard = typesUtils.isBoard(shape);
+    console.log(isBoard);
     ```
 
     ```
@@ -5947,7 +7137,8 @@ ContextUtils:
 
         Example
         ```
-        const centerPoint = penpot.utils.geometry.center(shapes);console.log(centerPoint);
+        const centerPoint = penpot.utils.geometry.center(shapes);
+        console.log(centerPoint);
         ```
       types: |-
         ```
@@ -5959,7 +7150,8 @@ ContextUtils:
 
         Example
         ```
-        const isBoard = utils.types.isBoard(shape);console.log(isBoard);
+        const isBoard = utils.types.isBoard(shape);
+        console.log(isBoard);
         ```
 Dissolve:
   overview: |-
@@ -6074,9 +7266,9 @@ Ellipse:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -6085,6 +7277,10 @@ Ellipse:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -6121,6 +7317,7 @@ Ellipse:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -6141,6 +7338,7 @@ Ellipse:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -6418,9 +7616,9 @@ Ellipse:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -6429,6 +7627,10 @@ Ellipse:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -6488,7 +7690,8 @@ Ellipse:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -6525,7 +7728,8 @@ Ellipse:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -6549,7 +7753,8 @@ Ellipse:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -6595,7 +7800,8 @@ Ellipse:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -6724,6 +7930,18 @@ Ellipse:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -6933,6 +8151,11 @@ Ellipse:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -6952,6 +8175,27 @@ Ellipse:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 EventsMap:
   overview: |-
     Interface EventsMap
@@ -6962,11 +8206,15 @@ EventsMap:
 
     Example
     ```
-    penpot.on('pagechange', (event) => {  console.log(event);});
+    penpot.on('pagechange', (event) => {
+      console.log(event);
+    });
     ```
 
     ```
     interface EventsMap {
+        workspacechange: WorkspaceContext;
+        logout: void;
         pagechange: Page;
         filechange: File;
         selectionchange: string[];
@@ -6974,12 +8222,21 @@ EventsMap:
         finish: string;
         shapechange: Shape;
         contentsave: void;
+        contentrollback: ContentRollback;
     }
     ```
 
     Referenced by: Context, Penpot
   members:
     Properties:
+      workspacechange: |-
+        ```
+        readonly workspacechange: WorkspaceContext
+        ```
+      logout: |-
+        ```
+        readonly logout: void
+        ```
       pagechange: |-
         ```
         readonly pagechange: Page
@@ -7026,6 +8283,56 @@ EventsMap:
         ```
 
         The `contentsave` event will trigger after the file content is saved in the backend.
+      contentrollback: |-
+        ```
+        readonly contentrollback: ContentRollback
+        ```
+
+        The `contentrollback` event will trigger after the backend rejected some changes
+        and the workspace undid them, together with the rest of their undo steps and any
+        later change to the same file. Changes made by a plugin can be undone this way
+        after the call that made them returned, so a plugin that relies on them should
+        read the affected shapes again. The event fires once the undone data is in the
+        workspace. When the workspace could not undo the changes in place, it reloads the
+        file from the server first; the whole file then holds the server data, so shapes
+        outside the listed ones may have changed too.
+ContentRollback:
+  overview: |-
+    Interface ContentRollback
+    =========================
+
+    What a rollback of rejected changes undid, as given to the `contentrollback` event.
+
+    ```
+    interface ContentRollback {
+        fileIds: string[];
+        pageIds: string[];
+        shapeIds: string[];
+    }
+    ```
+
+    Referenced by: EventsMap
+  members:
+    Properties:
+      fileIds: |-
+        ```
+        readonly fileIds: string[]
+        ```
+
+        Ids of the files that lost changes.
+      pageIds: |-
+        ```
+        readonly pageIds: string[]
+        ```
+
+        Ids of the pages the undone changes touched.
+      shapeIds: |-
+        ```
+        readonly shapeIds: string[]
+        ```
+
+        Ids of the page shapes the undone changes touched. A shape the undone changes
+        created no longer exists; one they removed exists again.
 Export:
   overview: |-
     Interface Export
@@ -7086,7 +8393,11 @@ File:
         pages: Page[];
         export(
             exportType: "penpot" | "zip",
-            libraryExportType?: "all" | "merge" | "detach",
+            libraryExportType?:
+                | "include-libraries"
+                | "merge-libraries"
+                | "detach-libraries"
+                | "link-later",
         ): Promise<Uint8Array<ArrayBufferLike>>;
         findVersions(criteria?: { createdBy: User }): Promise<FileVersion[]>;
         saveVersion(label: string): Promise<FileVersion>;
@@ -7137,7 +8448,11 @@ File:
         ```
         export(
             exportType: "penpot" | "zip",
-            libraryExportType?: "all" | "merge" | "detach",
+            libraryExportType?:
+                | "include-libraries"
+                | "merge-libraries"
+                | "detach-libraries"
+                | "link-later",
         ): Promise<Uint8Array<ArrayBufferLike>>
         ```
 
@@ -7146,13 +8461,13 @@ File:
         Parameters
 
         * exportType: "penpot" | "zip"
-        * libraryExportType: "all" | "merge" | "detach"
+        * libraryExportType: "include-libraries" | "merge-libraries" | "detach-libraries" | "link-later"
 
         Returns Promise<Uint8Array<ArrayBufferLike>>
 
         Example
         ```
-        const exportedData = await file.export('penpot', 'all');
+        const exportedData = await file.export('penpot', 'include-libraries');
         ```
       findVersions: |-
         ```
@@ -7193,7 +8508,8 @@ File:
 
         Example
         ```
-        const errors = file.validate();if (errors.length) console.error(errors);
+        const errors = file.validate();
+        if (errors.length) console.error(errors);
         ```
       getPluginData: |-
         ```
@@ -7214,7 +8530,8 @@ File:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -7251,7 +8568,8 @@ File:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -7275,7 +8593,8 @@ File:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -7321,7 +8640,8 @@ File:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 FileValidationError:
   overview: |-
@@ -7578,9 +8898,9 @@ FlexLayout:
         rightPadding: number;
         bottomPadding: number;
         leftPadding: number;
-        horizontalSizing: "fill"
-        | "auto"
-        | "fix";
+        paddingType: "simple"
+        | "multiple";
+        horizontalSizing: "fill" | "auto" | "fix";
         verticalSizing: "fill" | "auto" | "fix";
         remove(): void;
         dir: "row" | "row-reverse" | "column" | "column-reverse";
@@ -7713,6 +9033,16 @@ FlexLayout:
         ```
 
         The `leftPadding` property specifies the padding at the left of the container.
+      paddingType: |-
+        ```
+        paddingType: "simple" | "multiple"
+        ```
+
+        The `paddingType` property specifies how the four padding values are applied.
+        It can be one of the following values:
+
+        * 'simple': the vertical and horizontal paddings are mirrored across both sides.
+        * 'multiple': each of the four sides (top, right, bottom, left) is honoured independently.
       horizontalSizing: |-
         ```
         horizontalSizing: "fill" | "auto" | "fix"
@@ -8032,7 +9362,10 @@ FontsContext:
 
         Example
         ```
-        const font = fontsContext.findById('font-id');if (font) {  console.log(font.name);}
+        const font = fontsContext.findById('font-id');
+        if (font) {
+          console.log(font.name);
+        }
         ```
       findByName: |-
         ```
@@ -8053,7 +9386,10 @@ FontsContext:
 
         Example
         ```
-        const font = fontsContext.findByName('font-name');if (font) {  console.log(font.name);}
+        const font = fontsContext.findByName('font-name');
+        if (font) {
+          console.log(font.name);
+        }
         ```
       findAllById: |-
         ```
@@ -8074,7 +9410,8 @@ FontsContext:
 
         Example
         ```
-        const fonts = fontsContext.findAllById('font-id');console.log(fonts);
+        const fonts = fontsContext.findAllById('font-id');
+        console.log(fonts);
         ```
       findAllByName: |-
         ```
@@ -8095,7 +9432,8 @@ FontsContext:
 
         Example
         ```
-        const fonts = fontsContext.findAllByName('font-name');console.log(fonts);
+        const fonts = fontsContext.findAllByName('font-name');
+        console.log(fonts);
         ```
 GridLayout:
   overview: |-
@@ -8136,9 +9474,9 @@ GridLayout:
         rightPadding: number;
         bottomPadding: number;
         leftPadding: number;
-        horizontalSizing: "fill"
-        | "auto"
-        | "fix";
+        paddingType: "simple"
+        | "multiple";
+        horizontalSizing: "fill" | "auto" | "fix";
         verticalSizing: "fill" | "auto" | "fix";
         remove(): void;
         dir: "row" | "column";
@@ -8280,6 +9618,16 @@ GridLayout:
         ```
 
         The `leftPadding` property specifies the padding at the left of the container.
+      paddingType: |-
+        ```
+        paddingType: "simple" | "multiple"
+        ```
+
+        The `paddingType` property specifies how the four padding values are applied.
+        It can be one of the following values:
+
+        * 'simple': the vertical and horizontal paddings are mirrored across both sides.
+        * 'multiple': each of the four sides (top, right, bottom, left) is honoured independently.
       horizontalSizing: |-
         ```
         horizontalSizing: "fill" | "auto" | "fix"
@@ -8352,7 +9700,9 @@ GridLayout:
 
         Example
         ```
-        const board = penpot.createBoard();const grid = board.addGridLayout();grid.addRow("flex", 1);
+        const board = penpot.createBoard();
+        const grid = board.addGridLayout();
+        grid.addRow("flex", 1);
         ```
       addRowAtIndex: |-
         ```
@@ -8399,7 +9749,9 @@ GridLayout:
 
         Example
         ```
-        const board = penpot.createBoard();const grid = board.addGridLayout();grid.addColumn('percent', 50);
+        const board = penpot.createBoard();
+        const grid = board.addGridLayout();
+        grid.addColumn('percent', 50);
         ```
       addColumnAtIndex: |-
         ```
@@ -8622,9 +9974,9 @@ Group:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -8633,6 +9985,10 @@ Group:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -8669,6 +10025,7 @@ Group:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -8689,6 +10046,7 @@ Group:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -8970,9 +10328,9 @@ Group:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -8981,6 +10339,10 @@ Group:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -9106,7 +10468,8 @@ Group:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -9143,7 +10506,8 @@ Group:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -9167,7 +10531,8 @@ Group:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -9213,7 +10578,8 @@ Group:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -9342,6 +10708,18 @@ Group:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -9551,6 +10929,11 @@ Group:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -9570,6 +10953,27 @@ Group:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 GuideColumn:
   overview: |-
     Interface GuideColumn
@@ -9903,9 +11307,9 @@ Image:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -9914,6 +11318,10 @@ Image:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -9950,6 +11358,7 @@ Image:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -9970,6 +11379,7 @@ Image:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -10247,9 +11657,9 @@ Image:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -10258,6 +11668,10 @@ Image:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -10317,7 +11731,8 @@ Image:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -10354,7 +11769,8 @@ Image:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -10378,7 +11794,8 @@ Image:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -10424,7 +11841,8 @@ Image:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -10553,6 +11971,18 @@ Image:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -10762,6 +12192,11 @@ Image:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -10781,6 +12216,27 @@ Image:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 Interaction:
   overview: |-
     Interface Interaction
@@ -10917,6 +12373,7 @@ LayoutChildProperties:
         rightMargin: number;
         bottomMargin: number;
         leftMargin: number;
+        marginType: "simple" | "multiple";
         maxWidth: number | null;
         maxHeight: number | null;
         minWidth: number | null;
@@ -11015,6 +12472,16 @@ LayoutChildProperties:
 
         Sets the left margin of the child element.
         This is the space to the left of the element.
+      marginType: |-
+        ```
+        marginType: "simple" | "multiple"
+        ```
+
+        The `marginType` property specifies how the four margin values are applied.
+        It can be one of the following values:
+
+        * 'simple': the vertical and horizontal margins are mirrored across both sides.
+        * 'multiple': each of the four sides (top, right, bottom, left) is honoured independently.
       maxWidth: |-
         ```
         maxWidth: number | null
@@ -11057,6 +12524,7 @@ Library:
         colors: LibraryColor[];
         typographies: LibraryTypography[];
         components: LibraryComponent[];
+        deletedComponents: LibraryComponent[];
         tokens: TokenCatalog;
         createColor(): LibraryColor;
         createTypography(): LibraryTypography;
@@ -11118,6 +12586,13 @@ Library:
         ```
         console.log(penpot.library.local.components
         ```
+      deletedComponents: |-
+        ```
+        readonly deletedComponents: LibraryComponent[]
+        ```
+
+        Deleted components, including individual deleted variants.
+        Use a component's `restore()` method to restore it.
       tokens: |-
         ```
         readonly tokens: TokenCatalog
@@ -11140,7 +12615,8 @@ Library:
 
         Example
         ```
-        const newColor = penpot.library.local.createColor();console.log(newColor);
+        const newColor = penpot.library.local.createColor();
+        console.log(newColor);
         ```
       createTypography: |-
         ```
@@ -11197,7 +12673,8 @@ Library:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -11234,7 +12711,8 @@ Library:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -11258,7 +12736,8 @@ Library:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -11304,7 +12783,8 @@ Library:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 LibraryColor:
   overview: |-
@@ -11441,7 +12921,8 @@ LibraryColor:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -11478,7 +12959,8 @@ LibraryColor:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -11502,7 +12984,8 @@ LibraryColor:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -11548,7 +13031,8 @@ LibraryColor:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 LibraryComponent:
   overview: |-
@@ -11560,6 +13044,10 @@ LibraryComponent:
 
     ```
     interface LibraryComponent {
+        annotation: string | null;
+        duplicate(): LibraryComponent;
+        remove(): void;
+        restore(): void;
         instance(): Shape;
         mainInstance(): Shape;
         isVariant(): this is LibraryVariantComponent;
@@ -11583,9 +13071,18 @@ LibraryComponent:
       + LibraryComponent
         - LibraryVariantComponent
 
-    Referenced by: Board, Boolean, ContextTypesUtils, Ellipse, Group, Image, Library, Path, Rectangle, ShapeBase, SvgRaw, Text, VariantContainer, Variants
+    Referenced by: Board, Boolean, ContextTypesUtils, Ellipse, Group, Image, Library, LibraryComponent, LibraryVariantComponent, Path, Rectangle, ShapeBase, SvgRaw, Text, VariantContainer, Variants
   members:
     Properties:
+      annotation: |-
+        ```
+        annotation: string | null
+        ```
+
+        The component annotation, or null when none is set.
+        Set null to delete it. Text can contain at most 300 characters.
+        Writing requires `library:write` permission and a live component in the
+        current file's library.
       id: |-
         ```
         readonly id: string
@@ -11611,6 +13108,41 @@ LibraryComponent:
 
         The path of the library element.
     Methods:
+      duplicate: |-
+        ```
+        duplicate(): LibraryComponent
+        ```
+
+        Duplicates this component and its main instance in the current file's library.
+        Requires `library:write` permission. The component must not be deleted.
+
+        Returns LibraryComponent
+      remove: |-
+        ```
+        remove(): void
+        ```
+
+        Deletes this component and its main instance from the current file's library.
+        Requires `library:write` permission. Does nothing if already deleted.
+        Surviving copies keep their link so the component can be restored later.
+
+        Returns void
+      restore: |-
+        ```
+        restore(): void
+        ```
+
+        Restores this component if it has been deleted, including its main instance,
+        in the current file's library.
+        Leaves the current page, selection, zoom, and viewport unchanged.
+        Requires `library:write` permission. Does nothing if already restored.
+
+        Returns void
+
+        Example
+        ```
+        penpot.selection[0].component()?.restore();
+        ```
       instance: |-
         ```
         instance(): Shape
@@ -11673,7 +13205,8 @@ LibraryComponent:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -11710,7 +13243,8 @@ LibraryComponent:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -11734,7 +13268,8 @@ LibraryComponent:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -11780,7 +13315,8 @@ LibraryComponent:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 LibraryVariantComponent:
   overview: |-
@@ -11792,6 +13328,10 @@ LibraryVariantComponent:
 
     ```
     interface LibraryVariantComponent {
+        annotation: string | null;
+        duplicate(): LibraryComponent;
+        remove(): void;
+        restore(): void;
         instance(): Shape;
         mainInstance(): Shape;
         isVariant(): this is LibraryVariantComponent;
@@ -11822,6 +13362,15 @@ LibraryVariantComponent:
     Referenced by: ContextTypesUtils, LibraryComponent, LibraryVariantComponent
   members:
     Properties:
+      annotation: |-
+        ```
+        annotation: string | null
+        ```
+
+        The component annotation, or null when none is set.
+        Set null to delete it. Text can contain at most 300 characters.
+        Writing requires `library:write` permission and a live component in the
+        current file's library.
       variants: |-
         ```
         readonly variants: Variants | null
@@ -11866,6 +13415,41 @@ LibraryVariantComponent:
 
         The path of the library element.
     Methods:
+      duplicate: |-
+        ```
+        duplicate(): LibraryComponent
+        ```
+
+        Duplicates this component and its main instance in the current file's library.
+        Requires `library:write` permission. The component must not be deleted.
+
+        Returns LibraryComponent
+      remove: |-
+        ```
+        remove(): void
+        ```
+
+        Deletes this component and its main instance from the current file's library.
+        Requires `library:write` permission. Does nothing if already deleted.
+        Surviving copies keep their link so the component can be restored later.
+
+        Returns void
+      restore: |-
+        ```
+        restore(): void
+        ```
+
+        Restores this component if it has been deleted, including its main instance,
+        in the current file's library.
+        Leaves the current page, selection, zoom, and viewport unchanged.
+        Requires `library:write` permission. Does nothing if already restored.
+
+        Returns void
+
+        Example
+        ```
+        penpot.selection[0].component()?.restore();
+        ```
       instance: |-
         ```
         instance(): Shape
@@ -11953,7 +13537,8 @@ LibraryVariantComponent:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -11990,7 +13575,8 @@ LibraryVariantComponent:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -12014,7 +13600,8 @@ LibraryVariantComponent:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -12060,7 +13647,8 @@ LibraryVariantComponent:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 LibraryElement:
   overview: |-
@@ -12138,7 +13726,8 @@ LibraryElement:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -12175,7 +13764,8 @@ LibraryElement:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -12199,7 +13789,8 @@ LibraryElement:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -12245,7 +13836,8 @@ LibraryElement:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 LibrarySummary:
   overview: |-
@@ -12499,7 +14091,8 @@ LibraryTypography:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -12536,7 +14129,8 @@ LibraryTypography:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -12560,7 +14154,8 @@ LibraryTypography:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -12606,7 +14201,8 @@ LibraryTypography:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 LocalStorage:
   overview: |-
@@ -12950,9 +14546,9 @@ Page:
                 nameLike?: string;
                 type?:
                     | "boolean"
-                    | "path"
                     | "ellipse"
                     | "image"
+                    | "path"
                     | "text"
                     | "group"
                     | "board"
@@ -13037,7 +14633,8 @@ Page:
 
         Example
         ```
-        const page = penpot.createPage();page.remove();
+        const page = penpot.createPage();
+        page.remove();
         ```
       getShapeById: |-
         ```
@@ -13066,9 +14663,9 @@ Page:
                 nameLike?: string;
                 type?:
                     | "boolean"
-                    | "path"
                     | "ellipse"
                     | "image"
+                    | "path"
                     | "text"
                     | "group"
                     | "board"
@@ -13088,9 +14685,9 @@ Page:
               nameLike?: string;  
               type?:  
                   | "boolean"  
-                  | "path"  
                   | "ellipse"  
                   | "image"  
+                  | "path"  
                   | "text"  
                   | "group"  
                   | "board"  
@@ -13243,7 +14840,8 @@ Page:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -13280,7 +14878,8 @@ Page:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -13304,7 +14903,8 @@ Page:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -13350,7 +14950,8 @@ Page:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 Path:
   overview: |-
@@ -13432,9 +15033,9 @@ Path:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -13443,6 +15044,10 @@ Path:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -13479,6 +15084,7 @@ Path:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -13499,6 +15105,7 @@ Path:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -13798,9 +15405,9 @@ Path:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -13809,6 +15416,10 @@ Path:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -13882,7 +15493,8 @@ Path:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -13919,7 +15531,8 @@ Path:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -13943,7 +15556,8 @@ Path:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -13989,7 +15603,8 @@ Path:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -14118,6 +15733,18 @@ Path:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -14327,6 +15954,11 @@ Path:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -14346,6 +15978,27 @@ Path:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 PathCommand:
   overview: |-
     Interface PathCommand
@@ -14540,7 +16193,8 @@ PluginData:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -14577,7 +16231,8 @@ PluginData:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -14601,7 +16256,8 @@ PluginData:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -14647,7 +16303,8 @@ PluginData:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
 PreviousScreen:
   overview: |-
@@ -14791,9 +16448,9 @@ Rectangle:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -14802,6 +16459,10 @@ Rectangle:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -14838,6 +16499,7 @@ Rectangle:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -14858,6 +16520,7 @@ Rectangle:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -15135,9 +16798,9 @@ Rectangle:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -15146,6 +16809,10 @@ Rectangle:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -15205,7 +16872,8 @@ Rectangle:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -15242,7 +16910,8 @@ Rectangle:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -15266,7 +16935,8 @@ Rectangle:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -15312,7 +16982,8 @@ Rectangle:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -15441,6 +17112,18 @@ Rectangle:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -15650,6 +17333,11 @@ Rectangle:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -15669,6 +17357,27 @@ Rectangle:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 RulerGuide:
   overview: |-
     Interface RulerGuide
@@ -15869,9 +17578,9 @@ ShapeBase:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -15880,6 +17589,10 @@ ShapeBase:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -15916,6 +17629,7 @@ ShapeBase:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -15936,6 +17650,7 @@ ShapeBase:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
     }
     ```
 
@@ -16212,9 +17927,9 @@ ShapeBase:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -16223,6 +17938,10 @@ ShapeBase:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -16282,7 +18001,8 @@ ShapeBase:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -16319,7 +18039,8 @@ ShapeBase:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -16343,7 +18064,8 @@ ShapeBase:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -16389,7 +18111,8 @@ ShapeBase:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -16518,6 +18241,18 @@ ShapeBase:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -16727,6 +18462,11 @@ ShapeBase:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -16746,6 +18486,27 @@ ShapeBase:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 Slide:
   overview: |-
     Interface Slide
@@ -16756,7 +18517,7 @@ Slide:
     ```
     interface Slide {
         type: "slide";
-        way: "in" | "out";
+        way: "out" | "in";
         direction: "left" | "right" | "up" | "down";
         duration: number;
         offsetEffect?: boolean;
@@ -16775,7 +18536,7 @@ Slide:
         Type of the animation.
       way: |-
         ```
-        readonly way: "in" | "out"
+        readonly way: "out" | "in"
         ```
 
         Indicate if the slide will be either in-to-out `in` or out-to-in `out`.
@@ -16809,8 +18570,8 @@ Stroke:
     Interface Stroke
     ================
 
-    Represents stroke properties in Penpot. You can add a stroke to any shape except for groups.
-    This interface includes properties for defining the color, style, width, alignment, and caps of a stroke.
+    Stroke properties for any shape except groups.
+    Literals apply strokeWidth before top/right/bottom/left widths.
 
     ```
     interface Stroke {
@@ -16820,10 +18581,16 @@ Stroke:
         strokeOpacity?: number;
         strokeStyle?: "none" | "svg" | "mixed" | "solid" | "dotted" | "dashed";
         strokeWidth?: number;
+        strokeWidthType?: "simple" | "multiple";
+        strokeWidthTop?: number;
+        strokeWidthRight?: number;
+        strokeWidthBottom?: number;
+        strokeWidthLeft?: number;
         strokeAlignment?: "center" | "inner" | "outer";
         strokeCapStart?: StrokeCap;
         strokeCapEnd?: StrokeCap;
         strokeColorGradient?: Gradient;
+        strokeImage?: ImageData;
     }
     ```
 
@@ -16866,7 +18633,41 @@ Stroke:
         strokeWidth?: number
         ```
 
-        The optional width of the stroke.
+        Reads the top width. Setting it selects simple mode and sets all four sides.
+      strokeWidthType: |-
+        ```
+        readonly strokeWidthType?: "simple" | "multiple"
+        ```
+
+        Computed width mode: simple when all four effective widths match, multiple otherwise.
+      strokeWidthTop: |-
+        ```
+        strokeWidthTop?: number
+        ```
+
+        Top side width; setting it preserves the other side widths.
+        Boards and rectangles only; other shape types raise a validation error.
+      strokeWidthRight: |-
+        ```
+        strokeWidthRight?: number
+        ```
+
+        Right side width; setting it preserves the other side widths.
+        Boards and rectangles only; other shape types raise a validation error.
+      strokeWidthBottom: |-
+        ```
+        strokeWidthBottom?: number
+        ```
+
+        Bottom side width; setting it preserves the other side widths.
+        Boards and rectangles only; other shape types raise a validation error.
+      strokeWidthLeft: |-
+        ```
+        strokeWidthLeft?: number
+        ```
+
+        Left side width; setting it preserves the other side widths.
+        Boards and rectangles only; other shape types raise a validation error.
       strokeAlignment: |-
         ```
         strokeAlignment?: "center" | "inner" | "outer"
@@ -16891,6 +18692,12 @@ Stroke:
         ```
 
         The optional gradient stroke defined by a Gradient object.
+      strokeImage: |-
+        ```
+        strokeImage?: ImageData
+        ```
+
+        The optional image stroke defined by an ImageData object.
 SvgRaw:
   overview: |-
     Interface SvgRaw
@@ -16967,9 +18774,9 @@ SvgRaw:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -16978,6 +18785,10 @@ SvgRaw:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -17014,6 +18825,7 @@ SvgRaw:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -17034,6 +18846,7 @@ SvgRaw:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
         type: "svg-raw";
     }
     ```
@@ -17304,9 +19117,9 @@ SvgRaw:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -17315,6 +19128,10 @@ SvgRaw:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -17380,7 +19197,8 @@ SvgRaw:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -17417,7 +19235,8 @@ SvgRaw:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -17441,7 +19260,8 @@ SvgRaw:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -17487,7 +19307,8 @@ SvgRaw:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -17616,6 +19437,18 @@ SvgRaw:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -17825,6 +19658,11 @@ SvgRaw:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -17844,6 +19682,27 @@ SvgRaw:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
 Text:
   overview: |-
     Interface Text
@@ -17920,9 +19779,9 @@ Text:
         tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -17931,6 +19790,10 @@ Text:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -17967,6 +19830,7 @@ Text:
         detach(): void;
         swapComponent(component: LibraryComponent): void;
         resetOverrides(): void;
+        updateMain(): void;
         switchVariant(pos: number, value: string): void;
         combineAsVariants(ids: string[]): VariantContainer;
         isVariantHead(): boolean;
@@ -17987,6 +19851,7 @@ Text:
         applyToken(token: Token, properties?: TokenProperty[]): void;
         clone(): Shape;
         remove(): void;
+        waitForLayoutUpdate(timeout?: number): Promise<void>;
         type: "text";
         characters: string;
         growType: "fixed" | "auto-width" | "auto-height";
@@ -18275,9 +20140,9 @@ Text:
         readonly tokens: {
             width: string;
             height: string;
-            fill: string;
             x: string;
             y: string;
+            fill: string;
             all: string;
             borderRadiusTopLeft: string;
             borderRadiusTopRight: string;
@@ -18286,6 +20151,10 @@ Text:
             shadow: string;
             strokeColor: string;
             strokeWidth: string;
+            strokeWidthTop: string;
+            strokeWidthRight: string;
+            strokeWidthBottom: string;
+            strokeWidthLeft: string;
             fontFamilies: string;
             fontSize: string;
             fontWeight: string;
@@ -18453,7 +20322,8 @@ Text:
 
         Example
         ```
-        const data = shape.getPluginData('exampleKey');console.log(data);
+        const data = shape.getPluginData('exampleKey');
+        console.log(data);
         ```
       setPluginData: |-
         ```
@@ -18490,7 +20360,8 @@ Text:
 
         Example
         ```
-        const keys = shape.getPluginDataKeys();console.log(keys);
+        const keys = shape.getPluginDataKeys();
+        console.log(keys);
         ```
       getSharedPluginData: |-
         ```
@@ -18514,7 +20385,8 @@ Text:
 
         Example
         ```
-        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');console.log(sharedData);
+        const sharedData = shape.getSharedPluginData('exampleNamespace', 'exampleKey');
+        console.log(sharedData);
         ```
       setSharedPluginData: |-
         ```
@@ -18560,7 +20432,8 @@ Text:
 
         Example
         ```
-        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');console.log(sharedKeys);
+        const sharedKeys = shape.getSharedPluginDataKeys('exampleNamespace');
+        console.log(sharedKeys);
         ```
       setParentIndex: |-
         ```
@@ -18689,6 +20562,18 @@ Text:
         (and those of its children) to the ones in the linked main component.
         Similar to the "reset overrides" action on the Penpot interface.
         The current shape must be a component copy instance.
+
+        Returns void
+      updateMain: |-
+        ```
+        updateMain(): void
+        ```
+
+        Applies this copy's overrides to its main component and synchronizes copies.
+        Similar to the editor's "update main component" action.
+        Requires `content:write` and `library:write` permissions.
+        The shape must be a component copy head on the active page of the current file,
+        outside any other component copy, with a main component that is not deleted.
 
         Returns void
       switchVariant: |-
@@ -18898,6 +20783,11 @@ Text:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties (`strokeWidthTop`,
+          `strokeWidthRight`, `strokeWidthBottom`, `strokeWidthLeft`) are only valid on
+          boards and rectangles. Applying one to any other shape raises a validation
+          error. The uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       clone: |-
         ```
@@ -18917,6 +20807,27 @@ Text:
         Removes the shape from its parent.
 
         Returns void
+      waitForLayoutUpdate: |-
+        ```
+        waitForLayoutUpdate(timeout?: number): Promise<void>
+        ```
+
+        This method returns a promise that will be resolved when all the
+        pending layout updates have finished and the components have synchronized.
+        If no layout work is pending the promise resolves immediately.
+
+        Parameters
+
+        * timeout: number
+
+          Maximum time to wait, in milliseconds. If the timeout
+          elapses before the shape's layout settles, the promise is rejected.
+          Defaults to 30000; the promise never waits indefinitely.
+
+        Returns Promise<void>
+
+        The promise to be resolved when the shape's layout is updated. It
+        is rejected with an Error, both on timeout and on an invalid timeout value.
       getRange: |-
         ```
         getRange(start: number, end: number): TextRange
@@ -18939,7 +20850,8 @@ Text:
 
         Example
         ```
-        const textRange = textShape.getRange(0, 10);console.log(textRange.characters);
+        const textRange = textShape.getRange(0, 10);
+        console.log(textRange.characters);
         ```
       applyTypography: |-
         ```
@@ -19374,6 +21286,10 @@ TokenBase:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -19514,6 +21430,10 @@ TokenBorderRadius:
           several tokens with the same name in different sets, the actual token applied
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
+
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
 
         Returns void
       applyToSelected: |-
@@ -19778,6 +21698,10 @@ TokenShadow:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -19919,6 +21843,10 @@ TokenColor:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -20059,6 +21987,10 @@ TokenDimension:
           several tokens with the same name in different sets, the actual token applied
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
+
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
 
         Returns void
       applyToSelected: |-
@@ -20204,6 +22136,10 @@ TokenFontFamilies:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -20344,6 +22280,10 @@ TokenFontSizes:
           several tokens with the same name in different sets, the actual token applied
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
+
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
 
         Returns void
       applyToSelected: |-
@@ -20487,6 +22427,10 @@ TokenFontWeights:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -20628,6 +22572,10 @@ TokenLetterSpacing:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -20768,6 +22716,10 @@ TokenNumber:
           several tokens with the same name in different sets, the actual token applied
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
+
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
 
         Returns void
       applyToSelected: |-
@@ -20911,6 +22863,10 @@ TokenOpacity:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -21053,6 +23009,10 @@ TokenRotation:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -21193,6 +23153,10 @@ TokenSizing:
           several tokens with the same name in different sets, the actual token applied
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
+
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
 
         Returns void
       applyToSelected: |-
@@ -21335,6 +23299,10 @@ TokenSpacing:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -21475,6 +23443,10 @@ TokenBorderWidth:
           several tokens with the same name in different sets, the actual token applied
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
+
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
 
         Returns void
       applyToSelected: |-
@@ -21618,6 +23590,10 @@ TokenTextCase:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -21759,6 +23735,10 @@ TokenTextDecoration:
           several tokens with the same name in different sets, the actual token applied
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
+
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
 
         Returns void
       applyToSelected: |-
@@ -22036,6 +24016,10 @@ TokenTypography:
           and the value set to the attributes will depend on which sets are active
           (and will change if different sets or themes are activated later).
 
+          NOTE that the per-side stroke width properties are only valid on boards and
+          rectangles; applying one to any other shape raises a validation error. The
+          uniform `strokeWidth` property is accepted on every shape.
+
         Returns void
       applyToSelected: |-
         ```
@@ -22066,6 +24050,7 @@ TokenCatalog:
 
     ```
     interface TokenCatalog {
+        isEditableTokens: boolean;
         themes: TokenTheme[];
         sets: TokenSet[];
         addTheme(group: { group: string; name: string }): TokenTheme;
@@ -22078,6 +24063,17 @@ TokenCatalog:
     Referenced by: Library
   members:
     Properties:
+      isEditableTokens: |-
+        ```
+        readonly isEditableTokens: boolean
+        ```
+
+        Returns true if the tokens in this catalog can be edited. Only the
+        catalog of the current file (`penpot.library.local.tokens`) can be
+        edited, and only when the file is its own tokens source.
+        When the tokens come from an external library, the local catalog
+        can still change the active themes and sets, and its tokens can
+        still be applied to shapes.
       themes: |-
         ```
         readonly themes: TokenTheme[]
@@ -22212,7 +24208,8 @@ TokenSet:
         active: boolean
         ```
 
-        Indicates if the set is currently active.
+        Indicates if the set is active in the file that owns this catalog.
+        Only sets from `penpot.library.local.tokens` can be changed.
       tokens: |-
         ```
         readonly tokens: Token[]
@@ -22232,6 +24229,7 @@ TokenSet:
         ```
 
         Toggles the active status of this set.
+        Only sets from `penpot.library.local.tokens` can be changed.
 
         Returns void
       getTokenById: |-
@@ -22355,7 +24353,8 @@ TokenTheme:
         active: boolean
         ```
 
-        Indicates if the theme is currently active.
+        Indicates if the theme is active in the file that owns this catalog.
+        Only themes from `penpot.library.local.tokens` can be changed.
       activeSets: |-
         ```
         readonly activeSets: TokenSet[]
@@ -22369,6 +24368,7 @@ TokenTheme:
         ```
 
         Toggles the active status of this theme.
+        Only themes from `penpot.library.local.tokens` can be changed.
 
         Returns void
       addSet: |-
@@ -22449,7 +24449,8 @@ User:
 
         Example
         ```
-        const userId = user.id;console.log(userId);
+        const userId = user.id;
+        console.log(userId);
         ```
       name: |-
         ```
@@ -22460,7 +24461,8 @@ User:
 
         Example
         ```
-        const userName = user.name;console.log(userName);
+        const userName = user.name;
+        console.log(userName);
         ```
       avatarUrl: |-
         ```
@@ -22471,7 +24473,8 @@ User:
 
         Example
         ```
-        const avatarUrl = user.avatarUrl;console.log(avatarUrl);
+        const avatarUrl = user.avatarUrl;
+        console.log(avatarUrl);
         ```
       color: |-
         ```
@@ -22482,7 +24485,8 @@ User:
 
         Example
         ```
-        const userColor = user.color;console.log(userColor);
+        const userColor = user.color;
+        console.log(userColor);
         ```
       sessionId: |-
         ```
@@ -22493,7 +24497,8 @@ User:
 
         Example
         ```
-        const sessionId = user.sessionId;console.log(sessionId);
+        const sessionId = user.sessionId;
+        console.log(sessionId);
         ```
 Variants:
   overview: |-
@@ -22738,7 +24743,8 @@ Bounds:
 
     Example
     ```
-    const bounds = { x: 50, y: 50, width: 200, height: 100 };console.log(bounds);
+    const bounds = { x: 50, y: 50, width: 200, height: 100 };
+    console.log(bounds);
     ```
 
     ```
@@ -22884,7 +24890,7 @@ ImageData:
     }
     ```
 
-    Referenced by: Color, Context, Fill, LibraryColor, Penpot
+    Referenced by: Color, Context, Fill, LibraryColor, Penpot, Stroke
   members:
     Properties:
       name: |-
@@ -22945,6 +24951,7 @@ LibraryContext:
     type LibraryContext = {
         local: Library;
         connected: Library[];
+        tokensSource: Library;
         availableLibraries(): Promise<LibrarySummary[]>;
         connectLibrary(libraryId: string): Promise<Library>;
     }
@@ -22974,6 +24981,33 @@ LibraryContext:
         Example
         ```
         const connectedLibraries = libraryContext.connected;
+        ```
+      tokensSource: |-
+        ```
+        tokensSource: Library
+        ```
+
+        The library that supplies tokens to the current file.
+        Defaults to the local library.
+
+        Assign a connected library that has its own tokens to use it as the
+        source. This copies its active themes and sets to the current file.
+        Assign `local` to use the file's own tokens again. Themes and sets
+        that don't exist in the local tokens are deactivated.
+        Setting the source requires `content:write` permission and supports undo.
+        Assigning the current source again keeps the active themes and sets.
+
+        The catalog of an external `tokensSource` is read-only and reports the
+        library's own active themes and sets. To change which ones are active
+        in the current file, use `penpot.library.local.tokens`, which lists the
+        tokens of the source.
+
+        Example
+        ```
+        const source = await penpot.library.connectLibrary('library-id');
+        penpot.library.tokensSource = source;
+        // Restore local tokens:
+        penpot.library.tokensSource = penpot.library.local;
         ```
     Methods:
       availableLibraries: |-
@@ -23073,7 +25107,10 @@ Shape:
 
     Example
     ```
-    let shape: Shape;if (penpot.utils.types.isRectangle(shape)) {  console.log(shape.type);}
+    let shape: Shape;
+    if (penpot.utils.types.isRectangle(shape)) {
+      console.log(shape.type);
+    }
     ```
 
     Referenced by: Board, Boolean, Context, ContextGeometryUtils, ContextTypesUtils, Ellipse, EventsMap, FlexLayout, GridLayout, Group, Image, Interaction, Library, LibraryComponent, LibraryTypography, LibraryVariantComponent, OpenOverlay, OverlayAction, Page, Path, Penpot, Rectangle, ShapeBase, SvgRaw, Text, ToggleOverlay, TokenBase, TokenBorderRadius, TokenBorderWidth, TokenColor, TokenDimension, TokenFontFamilies, TokenFontSizes, TokenFontWeights, TokenLetterSpacing, TokenNumber, TokenOpacity, TokenRotation, TokenShadow, TokenSizing, TokenSpacing, TokenTextCase, TokenTextDecoration, TokenTypography, VariantContainer, Viewport
@@ -23246,7 +25283,14 @@ TokenDimensionProps:
     ==============================
 
     ```
-    TokenDimensionProps: "x" | "y" | "strokeWidth"
+    TokenDimensionProps:
+        | "x"
+        | "y"
+        | "strokeWidth"
+        | "strokeWidthTop"
+        | "strokeWidthRight"
+        | "strokeWidthBottom"
+        | "strokeWidthLeft"
     ```
 
     The properties that a Dimension token can be applied to.
@@ -23379,7 +25423,12 @@ TokenBorderWidthProps:
     ================================
 
     ```
-    TokenBorderWidthProps: "strokeWidth"
+    TokenBorderWidthProps:
+        | "strokeWidth"
+        | "strokeWidthTop"
+        | "strokeWidthRight"
+        | "strokeWidthBottom"
+        | "strokeWidthLeft"
     ```
 
     The properties that a BorderWidth token can be applied to.

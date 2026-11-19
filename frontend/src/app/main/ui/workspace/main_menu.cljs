@@ -23,6 +23,7 @@
    [app.main.data.shortcuts :as scd]
    [app.main.data.workspace :as dw]
    [app.main.data.workspace.comments :as dwcm]
+   [app.main.data.workspace.history :as dwh]
    [app.main.data.workspace.libraries :as dwl]
    [app.main.data.workspace.mcp :as mcp]
    [app.main.data.workspace.shortcuts :as sc]
@@ -41,6 +42,7 @@
    [app.main.ui.ds.foundations.assets.icon :as i :refer [icon*]]
    [app.main.ui.hooks.resize :as r]
    [app.plugins.register :as preg]
+   [app.render-wasm.api.webgl :as webgl]
    [app.util.dom :as dom]
    [app.util.i18n :as i18n :refer [tr]]
    [app.util.keyboard :as kbd]
@@ -617,9 +619,9 @@
 
         on-show-version-history
         (mf/use-fn
-         (mf/deps file-id)
          (fn [_]
-           (st/emit! (dw/toggle-layout-flag :document-history))))
+           (st/emit! (-> (dwh/initialize-history)
+                         (vary-meta assoc ::ev/origin "workspace:menu")))))
 
         on-show-version-history-key-down
         (mf/use-fn
@@ -650,6 +652,10 @@
          (fn [event]
            (when (kbd/enter? event)
              (on-export-shapes event))))
+
+        on-export-selection
+        (mf/use-fn
+         #(st/emit! (de/export-selected-shapes {:origin "workspace:menu"})))
 
         on-export-file
         (mf/use-fn
@@ -729,6 +735,13 @@
       [:> shortcuts* {:id :export-shapes}]]
 
      [:> dropdown-menu-item* {:class (stl/css :base-menu-item :submenu-item)
+                              :on-click    on-export-selection
+                              :id          "file-menu-export-selection"}
+      [:span {:class (stl/css :item-name)}
+       (tr "workspace.export-selection")]
+      [:> shortcuts* {:id :export-selection}]]
+
+     [:> dropdown-menu-item* {:class (stl/css :base-menu-item :submenu-item)
                               :on-click    on-export-file
                               :on-key-down on-export-file-key-down
                               :data-format "binfile-v3"
@@ -806,7 +819,7 @@
                                                                :submenu-item true
                                                                :disabled (not can-open?))
                                     :on-key-down on-key-down}
-            [:span {:class (stl/css :item-name)} name]
+            [:span {:class (stl/css :item-name :plugin-name) :title name} name]
             (when-not can-open?
               [:span {:title (tr "workspace.plugins.error.need-editor")}
                [:> icon* {:icon-id i/help
@@ -964,8 +977,9 @@
                               (dom/reload-current-window true))
                             (fn [_]
                               (st/emit! (ntf/error (tr "errors.generic"))))))
-             (st/emit! (ev/event {::ev/name ev-name
-                                  ::ev/origin "workspace:menu"})
+             (st/emit! (ev/event (assoc (webgl/get-environment)
+                                        ::ev/name ev-name
+                                        ::ev/origin "workspace:menu"))
                        (ptk/data-event ::ev/force-persist {})))))
 
         open-plugins-manager
@@ -1005,7 +1019,7 @@
     [:*
      [:> icon-button* {:variant "ghost"
                        :aria-pressed show-menu?
-                       :aria-label (tr "shortcut-subsection.main-menu")
+                       :aria-label (tr "shortcuts.subsection.main-menu")
                        :on-click toggle-menu
                        :icon i/menu}]
 

@@ -4,7 +4,7 @@
 //
 // Copyright (c) KALEIDOS SUBSIDIARY SL
 
-@use "common/refactor/common-dashboard";
+@use "dashboard/common/header";
 @use "ds/typography.scss" as t;
 @use "ds/_borders.scss" as *;
 @use "ds/spacing.scss" as *;
@@ -33,10 +33,6 @@
 .dashboard-shared {
   inline-size: calc(100vw - px2rem(320));
   margin-inline-end: px2rem(52);
-}
-
-.search {
-  margin-block-start: var(--sp-m);
 }
 
 .dashboard-project-row {

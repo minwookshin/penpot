@@ -11,6 +11,8 @@
    #?(:clj [malli.dev.pretty :as mdp])
    #?(:clj [malli.dev.virhe :as v])
    [app.common.data :as d]
+   [app.common.data.macros :as dm]
+   [app.common.i18n :as i18n :refer [tr]]
    [app.common.json :as json]
    [app.common.math :as mth]
    [app.common.pprint :as pp]
@@ -319,25 +321,32 @@
   ([s] (lookup sr/default-registry s))
   ([registry s] (schema (mr/schema registry s))))
 
-(defn check-fn
-  "Create a predefined check function"
-  [s & {:keys [hint type code]}]
-  (let [s          #?(:clj
-                      (schema s)
-                      :cljs
-                      (try
-                        (schema s)
-                        (catch :default cause
-                          (let [data (ex-data cause)]
-                            (if (= :malli.core/invalid-schema (:type data))
-                              (throw (ex-info
-                                      (str "Invalid schema\n"
-                                           (pp/pprint-str (:data data)))
-                                      {}))
-                              (throw cause))))))
+(defn- resolve-schema
+  "Resolves the schema definition. On ClojureScript it rewrites the malli
+  invalid schema error with a human readable message."
+  [s]
+  #?(:clj  (schema s)
+     :cljs (try
+             (schema s)
+             (catch :default cause
+               (let [data (ex-data cause)]
+                 (if (= :malli.core/invalid-schema (:type data))
+                   (throw (ex-info
+                           (str "Invalid schema\n"
+                                (pp/pprint-str (:data data)))
+                           {}))
+                   (throw cause)))))))
 
-        validator* (delay (m/validator s))
-        explainer* (delay (m/explainer s))
+(defn check-fn
+  "Create a predefined check function.
+
+  The schema definition is resolved lazily on production builds, and
+  eagerly on development ones, so invalid schemas are detected early
+  while developing. See `app.common.data.macros/lazy-delay`."
+  [s & {:keys [hint type code]}]
+  (let [s*         (dm/lazy-delay (resolve-schema s))
+        validator* (delay (m/validator @s*))
+        explainer* (delay (m/explainer @s*))
         hint       (or ^boolean hint "check error")
         type       (or ^boolean type :assertion)
         code       (or ^boolean code :data-validation)]
@@ -493,7 +502,7 @@
   :type-properties
   {:title "email"
    :description "string with valid email address"
-   :error/code "errors.invalid-email"
+   :error/fn #(tr "errors.invalid-email")
    :gen/gen (sg/email)
    :decode/string (fn [v] (or (parse-email v) v))
    :decode/json (fn [v] (or (parse-email v) v))
@@ -883,6 +892,14 @@
 (register! ::safe-number [::number {:gen/gen (sg/small-double)
                                     :max max-safe-int
                                     :min min-safe-int}])
+(register! ::non-negative-safe-number
+           [:and {:gen/gen (sg/small-double :min 0)}
+            ::safe-number
+            [:fn #(not (neg? %))]])
+(register! ::positive-safe-number
+           [:and {:gen/gen (sg/small-double :min 0.01)}
+            ::safe-number
+            [:fn pos?]])
 
 (defn parse-boolean
   [v]
@@ -1051,23 +1068,23 @@
          (and (string? value)
               (number? max)
               (> (count value) max))
-         {:code ["errors.field-max-length" max]}
+         (tr "errors.field-max-length" (i18n/c max))
 
          (and (string? value)
               (number? min)
               (< (count value) min))
-         {:code ["errors.field-min-length" min]}
+         (tr "errors.field-min-length" (i18n/c min))
 
          (and (string? value)
               (str/empty? value))
-         {:code "errors.field-missing"}
+         (tr "errors.field-missing")
 
          (and (string? value)
               (str/blank? value))
-         {:code "errors.field-not-all-whitespace"}
+         (tr "errors.field-not-all-whitespace")
 
          :else
-         {:code "errors.invalid-text"})))}})
+         (tr "errors.invalid-text"))))}})
 
 (register!
  {:type ::password
@@ -1080,7 +1097,7 @@
   {:title "password"
    :gen/gen (->> (sg/word-string)
                  (sg/filter #(>= (count %) 8)))
-   :error/code "errors.password-too-short"
+   :error/fn #(tr "errors.password-too-short")
    ::oapi/type "string"
    ::oapi/format "password"}})
 
@@ -1107,6 +1124,12 @@
 
 (def valid-safe-number?
   (lazy-validator ::safe-number))
+
+(def valid-non-negative-safe-number?
+  (lazy-validator ::non-negative-safe-number))
+
+(def valid-positive-safe-number?
+  (lazy-validator ::positive-safe-number))
 
 (def valid-safe-int?
   (lazy-validator ::safe-int))

@@ -15,12 +15,15 @@
    [app.common.schema :as sm]
    [app.common.thumbnails :as thc]
    [app.common.time :as ct]
+   [app.common.types.objects-map :as omap]
    [app.common.types.shape-tree :as ctt]
    [app.config :as cf]
    [app.db :as db]
    [app.db.sql :as-alias sql]
+   [app.features.fdata :as fdata]
    [app.loggers.audit :as-alias audit]
    [app.loggers.webhooks :as-alias webhooks]
+   [app.media.svg :as svg]
    [app.media.validation :as media.v]
    [app.rpc :as-alias rpc]
    [app.rpc.climit :as-alias climit]
@@ -92,26 +95,38 @@
 
 ;; --- COMMAND QUERY: get-file-data-for-thumbnail
 
-;; We need to improve how we set frame for thumbnail in order to avoid
-;; loading all pages into memory for find the frame set for thumbnail.
+(defn- get-thumbnail-frame-candidates
+  "Only decode the objects whose encoded form can carry the flag."
+  [objects]
+  (if (omap/objects-map? objects)
+    (keep (fn [[id encoded]]
+            (when (str/includes? encoded "use-for-thumbnail")
+              (get objects id)))
+          (omap/get-data objects))
+    (vals objects)))
+
+(defn- get-thumbnail-frame
+  "Find the frame marked to be used as thumbnail, loading pages lazily.
+  The returned frame has the :page-id assoc'ed."
+  [data]
+  (d/seek some?
+          (for [page (-> data :pages-index vals)
+                :let [page (cond-> page (pmap/pointer-map? page) deref)]]
+            (some-> (d/seek #(and (cfh/frame-shape? %)
+                                  (or (:use-for-thumbnail %)
+                                      (:use-for-thumbnail? %))) ; NOTE: backward comp (remove on v1.21)
+                            (get-thumbnail-frame-candidates (:objects page)))
+                    (assoc :page-id (:id page))))))
 
 (defn get-file-data-for-thumbnail
   [{:keys [::db/conn] :as cfg} {:keys [data id] :as file} strip-frames-with-thumbnails]
-  (letfn [;; function responsible on finding the frame marked to be
-          ;; used as thumbnail; the returned frame always have
-          ;; the :page-id set to the page that it belongs.
-          (get-thumbnail-frame [{:keys [data]}]
-            (d/seek #(or (:use-for-thumbnail %)
-                         (:use-for-thumbnail? %)) ; NOTE: backward comp (remove on v1.21)
-                    (for [page  (-> data :pages-index vals)
-                          frame (-> page :objects ctt/get-frames)]
-                      (assoc frame :page-id (:id page)))))
-
-          ;; function responsible to filter objects data structure of
+  (letfn [;; function responsible to filter objects data structure of
           ;; all unneeded shapes if a concrete frame is provided. If no
-          ;; frame, the objects is returned untouched.
+          ;; frame, all objects are returned as a plain map.
           (filter-objects [objects frame-id]
-            (d/index-by :id (cfh/get-children-with-self objects frame-id)))
+            (if (some? frame-id)
+              (d/index-by :id (cfh/get-children-with-self objects frame-id))
+              (into {} objects)))
 
           ;; function responsible of assoc available thumbnails
           ;; to frames and remove all children shapes from objects if
@@ -152,29 +167,28 @@
 
                 objects)))]
 
-    (let [frame     (get-thumbnail-frame file)
-          frame-id  (:id frame)
-          page-id   (or (:page-id frame)
-                        (-> data :pages first))
+    (fdata/with-pointers cfg id
+      (let [frame     (get-thumbnail-frame data)
+            frame-id  (:id frame)
+            page-id   (or (:page-id frame)
+                          (-> data :pages first))
 
-          page      (dm/get-in data [:pages-index page-id])
-          page      (cond-> page (pmap/pointer-map? page) deref)
-          frame-ids (if (some? frame) (list frame-id) (map :id (ctt/get-frames (:objects page))))
+            page      (dm/get-in data [:pages-index page-id])
+            page      (cond-> page (pmap/pointer-map? page) deref)
+            frame-ids (if (some? frame) (list frame-id) (map :id (ctt/get-frames (:objects page))))
 
-          obj-ids   (map #(thc/fmt-object-id (:id file) page-id % "frame") frame-ids)
-          thumbs    (get-object-thumbnails conn id obj-ids)]
+            obj-ids   (map #(thc/fmt-object-id (:id file) page-id % "frame") frame-ids)
+            thumbs    (get-object-thumbnails conn id obj-ids)]
 
-      (cond-> page
-        ;; If we have frame, we need to specify it on the page level
-        ;; and remove the all other unrelated objects.
-        (some? frame-id)
-        (-> (assoc :thumbnail-frame-id frame-id)
-            (update :objects filter-objects frame-id))
+        (cond-> (update page :objects filter-objects frame-id)
+          ;; If we have frame, we need to specify it on the page level
+          (some? frame-id)
+          (assoc :thumbnail-frame-id frame-id)
 
-        ;; Assoc the available thumbnails and prune not visible shapes
-        ;; for avoid transfer unnecessary data.
-        strip-frames-with-thumbnails
-        (update :objects assoc-thumbnails page-id thumbs)))))
+          ;; Assoc the available thumbnails and prune not visible shapes
+          ;; for avoid transfer unnecessary data.
+          strip-frames-with-thumbnails
+          (update :objects assoc-thumbnails page-id thumbs))))))
 
 (def ^:private
   schema:get-file-data-for-thumbnail
@@ -204,7 +218,6 @@
                                             :file-id file-id)
                        file (bfc/get-file cfg file-id
                                           :include-deleted? true
-                                          :realize? true
                                           :read-only? true)
                        strip-frames-with-thumbnails
                        (or (nil? strip-frames-with-thumbnails) ;; if not present, default to true
@@ -235,8 +248,7 @@
 
 (defn- persist-thumbnail!
   [storage media created-at]
-  (let [path  (:path media)
-        mtype (:mtype media)
+  (let [{:keys [path mtype]} (svg/sanitize-svg-upload media)
         hash  (sto/calculate-hash path)
         data  (-> (sto/content path)
                   (sto/wrap-with-hash hash))]
@@ -286,11 +298,13 @@
    ::rtry/enabled true
    ::rtry/when rtry/conflict-exception?
    ::audit/skip true
-   ::sm/params schema:create-file-object-thumbnail}
+   ::sm/params schema:create-file-object-thumbnail
+   ::rpc/multipart-only-params [:media]}
 
   [cfg {:keys [::rpc/profile-id file-id object-id media tag]}]
-  (media.v/validate-media-type! media)
-  (media.v/validate-media-size! media)
+  (media.v/check-upload-path media)
+  (media.v/check-media-type media)
+  (media.v/check-media-size media)
 
   (db/run! cfg files/check-edition-permissions! profile-id file-id)
   (when-let [file (files/get-minimal-file cfg file-id {::db/check-deleted false})]
@@ -387,11 +401,13 @@
                 [:file-thumbnail-ops/global]]
    ::rtry/enabled true
    ::rtry/when rtry/conflict-exception?
-   ::sm/params schema:create-file-thumbnail}
+   ::sm/params schema:create-file-thumbnail
+   ::rpc/multipart-only-params [:media]}
 
   [cfg {:keys [::rpc/profile-id file-id] :as params}]
-  (media.v/validate-media-type! (:media params))
-  (media.v/validate-media-size! (:media params))
+  (media.v/check-upload-path (:media params))
+  (media.v/check-media-type (:media params))
+  (media.v/check-media-size (:media params))
 
   (db/run! cfg files/check-edition-permissions! profile-id file-id)
 
@@ -399,7 +415,7 @@
     (let [storage (::sto/storage cfg)
           file    (bfc/get-file cfg file-id :include-deleted? true :load-data? false)
           props   (db/tjson (or (:props params) {}))
-          {:keys [path mtype]} (:media params)
+          {:keys [path mtype]} (svg/sanitize-svg-upload (:media params))
           hash    (sto/calculate-hash path)
           data    (-> (sto/content path)
                       (sto/wrap-with-hash hash))

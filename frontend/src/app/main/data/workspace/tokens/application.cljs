@@ -101,14 +101,50 @@
                                    :no-wasm? true})))))))
 
 (defn update-stroke-width
-  ([value shape-ids attributes] (update-stroke-width value shape-ids attributes nil))
-  ([value shape-ids _attributes page-id] ; The attributes param is needed to have the same arity that other update functions
+  ([value shape-ids attributes]
+   (update-stroke-width value shape-ids attributes nil))
+  ([value shape-ids _attributes page-id]
+   (when (number? value)
+     (let [value (max 0 value)]
+       (dwsh/update-shapes shape-ids
+                           (fn [shape]
+                             (if (seq (:strokes shape))
+                               (let [stroke (get-in shape [:strokes 0])]
+                                 (assoc-in shape [:strokes 0]
+                                           (merge stroke
+                                                  {:stroke-width value
+                                                   :stroke-width-top value
+                                                   :stroke-width-right value
+                                                   :stroke-width-bottom value
+                                                   :stroke-width-left value})))
+                               (let [stroke (assoc cts/default-stroke
+                                                   :stroke-width value
+                                                   :stroke-width-top value
+                                                   :stroke-width-right value
+                                                   :stroke-width-bottom value
+                                                   :stroke-width-left value)]
+                                 (assoc shape :strokes [stroke]))))
+                           {:reg-objects? true
+                            :ignore-touched true
+                            :page-id page-id
+                            :attrs [:strokes]})))))
+
+(defn update-stroke-width-side
+  "Updates the width of the sides in `attributes` on the first stroke of each
+  shape. Sides not in `attributes` keep their current width (0 when the shape
+  had no stroke yet) and all side keys are materialized so consumers never
+  fall back to `:stroke-width`. `:stroke-width` keeps acting as the top-side
+  alias."
+  ([value shape-ids attributes]
+   (update-stroke-width-side value shape-ids attributes nil))
+  ([value shape-ids attributes page-id]
    (when (number? value)
      (dwsh/update-shapes shape-ids
                          (fn [shape]
-                           (if (seq (:strokes shape))
-                             (assoc-in shape [:strokes 0 :stroke-width] value)
-                             (let [stroke (assoc cts/default-stroke :stroke-width value)]
+                           (let [stroke (cts/materialize-stroke-side-widths
+                                         (first (:strokes shape)) attributes value)]
+                             (if (seq (:strokes shape))
+                               (update shape :strokes #(into [stroke] (rest %)))
                                (assoc shape :strokes [stroke]))))
                          {:reg-objects? true
                           :ignore-touched true
@@ -163,7 +199,7 @@
            :hidden false
            :offset-x offset-x
            :offset-y offset-y
-           :blur blur
+           :blur (cond-> blur (number? blur) (max 0))
            :color (value->color color)
            :spread spread
            :style
@@ -239,7 +275,7 @@
          (let [ids-with-layout (shape-ids-with-layout state (or page-id (:current-page-id state)) shape-ids)]
            (rx/of
             (dwsl/update-layout ids-with-layout
-                                {:layout-padding (zipmap attrs (repeat value))}
+                                {:layout-padding (zipmap attrs (repeat (max 0 value)))}
                                 {:ignore-touched true
                                  :page-id page-id}))))))))
 
@@ -264,7 +300,7 @@
     (watch [_ state _]
       (when (number? value)
         (let [ids-with-layout (shape-ids-with-layout state (or page-id (:current-page-id state)) shape-ids)
-              layout-attributes (attributes->layout-gap attributes value)]
+              layout-attributes (attributes->layout-gap attributes (max 0 value))]
           (rx/of
            (dwsl/update-layout ids-with-layout
                                layout-attributes
@@ -278,7 +314,8 @@
      ptk/WatchEvent
      (watch [_ _ _]
        (when (number? value)
-         (let [props (-> {:layout-item-min-w value
+         (let [value (max 0 value)
+               props (-> {:layout-item-min-w value
                           :layout-item-min-h value
                           :layout-item-max-w value
                           :layout-item-max-h value}
@@ -538,10 +575,10 @@
               (set (filter attributes #{:r1 :r2 :r3 :r4}))
               page-id)))
 
-    (some attributes #{:stroke-width})
-    (conj #(update-stroke-width
+    (some attributes ctt/stroke-width-keys)
+    (conj #(update-stroke-width-side
             value shape-ids
-            #{:stroke-width}
+            (set/intersection attributes ctt/stroke-width-keys)
             page-id))
 
     (some attributes #{:max-width :max-height :layout-item-max-h :layout-item-max-w :layout-item-min-h :layout-item-min-w})
@@ -616,7 +653,7 @@
   passed to toggle-token) and in propagation.cljs (re-exported from there)."
   {ctt/border-radius-keys  update-shape-radius-for-corners
    ctt/color-keys          update-fill-stroke
-   ctt/stroke-width-keys   update-stroke-width
+   ctt/stroke-width-keys   update-stroke-width-side
    ctt/sizing-keys         apply-dimensions-token
    ctt/opacity-keys        update-opacity
    ctt/rotation-keys       update-rotation
@@ -696,11 +733,10 @@
                                                         (all-attrs-appliable-for-token? attributes (:type token)))))))
                             shape-ids (d/nilv (keys shapes)  [])
                             any-variant? (->> shapes vals (some ctk/is-variant?) boolean)
+                            file-data    (dsh/lookup-file-data state)
+                            from-library (not (cfo/effective-tokens-source? file-data (:id file-data)))
 
                             resolved-value (get-in resolved-tokens [(:name token) :resolved-value])
-                            resolved-value (if (contains? cf/flags :tokenscript)
-                                             (ts/tokenscript-symbols->penpot-unit resolved-value)
-                                             resolved-value)
                             tokenized-attributes (cfo/attributes-map attributes token)
                             type (:type token)]
                         (rx/concat
@@ -709,7 +745,9 @@
                                      (-> {::ev/name "apply-tokens"
                                           :type type
                                           :applied-to attributes
-                                          :applied-to-variant any-variant?}
+                                          :applied-to-variant any-variant?
+                                          :shape-count (count shape-ids)
+                                          :from-library from-library}
                                          (merge (meta it)))))
                           (dwu/start-undo-transaction undo-id)
                           (dwsh/update-shapes shape-ids (fn [shape]
@@ -737,7 +775,7 @@
   Splits out `shape-ids` into separate default actions:
   - Layouts take the `default` update function
   - Shapes inside layout will only take margin"
-  [{:keys [token shapes attr]}]
+  [{:keys [token shapes]}]
   (ptk/reify ::apply-spacing-token-separated
     ptk/WatchEvent
     (watch [it state _]
@@ -750,7 +788,7 @@
             (group-by #(if (ctsl/any-layout-immediate-child? objects %) :frame-children :other) shapes)]
 
         (rx/of
-         (-> (apply-token {:attributes (or attr attributes)
+         (-> (apply-token {:attributes attributes
                            :token token
                            :shape-ids (map :id other)
                            :on-update-shape on-update-shape})
@@ -791,98 +829,87 @@
           (update shape :applied-tokens #(when % (apply dissoc % attributes)))))))))
 
 
+(defn- target-shapes
+  "The selected shapes a token goes on. A selected group can stand for
+  its children, since groups take no tokens."
+  [objects shape-ids expand-with-children]
+  (cond->> (into [] (keep (d/getf objects)) shape-ids)
+    expand-with-children
+    (into [] (mapcat (fn [shape]
+                       (if (= (:type shape) :group)
+                         (keep objects (:shapes shape))
+                         [shape]))))))
+
+(defn- apply-action
+  "Works out which attributes the token goes on: the chosen ones, or its
+  type's defaults. A spacing token without chosen attributes goes on
+  layouts, and only on the margins of the shapes inside them."
+  [token attrs]
+  (let [{:keys [attributes on-update-shape]} (get token-properties (:type token))]
+    (if (and (= (:type token) :spacing) (nil? attrs))
+      {:action :apply-spacing}
+      {:action :apply
+       :attributes (if (empty? attrs) attributes attrs)
+       :on-update-shape (or (get attr->shape-update (first attrs)) on-update-shape)})))
+
+(defn- toggle-action
+  "Works out whether toggling the token removes it from the selection
+  or applies it, and on which attributes. From the token pill it comes
+  off when any shape has it; on chosen attributes (a design tab input,
+  a plugin) only when every shape has it on all of them, so a partial
+  application is completed instead."
+  [token attrs shapes]
+  (let [{:keys [attributes all-attributes]} (get token-properties (:type token))
+        target-attrs (or attrs all-attributes attributes)
+        unapply?     (if (seq attrs)
+                       (cfo/shapes-applied-all?
+                        (cfo/shapes-ids-by-applied-attributes token shapes target-attrs)
+                        (into #{} (map :id) shapes)
+                        target-attrs)
+                       (cfo/shapes-token-applied? token shapes target-attrs))]
+    (if unapply?
+      {:action :unapply :attributes target-attrs}
+      (apply-action token attrs))))
+
+(defn- action->event
+  [{:keys [action attributes on-update-shape]} token shapes shape-ids]
+  (case action
+    :unapply
+    (unapply-token {:attributes attributes
+                    :token-name (:name token)
+                    :shape-ids shape-ids})
+
+    :apply-spacing
+    (apply-spacing-token-separated {:token token
+                                    :shapes shapes})
+
+    :apply
+    (apply-token {:attributes attributes
+                  :token token
+                  :shape-ids shape-ids
+                  :on-update-shape on-update-shape})))
+
 (defn toggle-token
   [{:keys [token attrs shape-ids expand-with-children]}]
   (ptk/reify ::on-toggle-token
     ptk/WatchEvent
     (watch [it state _]
-      (let [objects (dsh/lookup-page-objects state)
-            shapes (into [] (keep (d/getf objects)) shape-ids)
-
-            shapes
-            (if expand-with-children
-              (into []
-                    (mapcat (fn [shape]
-                              (if (= (:type shape) :group)
-                                (keep objects (:shapes shape))
-                                [shape])))
-                    shapes)
-              shapes)
-
-            {:keys [attributes all-attributes on-update-shape]}
-            (get token-properties (:type token))
-
-            on-update-shape
-            (if (seq attrs)
-              (or (get attr->shape-update (first attrs)) on-update-shape)
-              on-update-shape)
-
-            unapply-tokens?
-            (cfo/shapes-token-applied? token shapes (or attrs all-attributes attributes))
-
-            shape-ids
-            (map :id shapes)]
-
-        (if unapply-tokens?
-          (rx/of
-           (unapply-token {:attributes (or attrs all-attributes attributes)
-                           :token-name (:name token)
-                           :shape-ids shape-ids}))
-          (rx/of
-           (cond
-             (and (= (:type token) :spacing)
-                  (nil? attrs))
-             (-> (apply-spacing-token-separated {:token token
-                                                 :attr attrs
-                                                 :shapes shapes})
-                 (with-meta (meta it)))
-
-             :else
-             (-> (apply-token {:attributes (if (empty? attrs) attributes attrs)
-                               :token token
-                               :shape-ids shape-ids
-                               :on-update-shape on-update-shape})
-                 (with-meta (meta it))))))))))
+      (let [shapes (target-shapes (dsh/lookup-page-objects state) shape-ids expand-with-children)
+            action (toggle-action token attrs shapes)
+            event  (action->event action token shapes (map :id shapes))]
+        (rx/of
+         (if (= :unapply (:action action))
+           event
+           (with-meta event (meta it))))))))
 
 (defn apply-token-from-input
   [{:keys [token attrs shape-ids expand-with-children]}]
   (ptk/reify ::apply-token-from-input
     ptk/WatchEvent
     (watch [_ state _]
-      (let [objects (dsh/lookup-page-objects state)
-            shapes (into [] (keep (d/getf objects)) shape-ids)
-
-            shapes
-            (if expand-with-children
-              (into []
-                    (mapcat (fn [shape]
-                              (if (= (:type shape) :group)
-                                (keep objects (:shapes shape))
-                                [shape])))
-                    shapes)
-              shapes)
-
-            {:keys [attributes _ on-update-shape]}
-            (get token-properties (:type token))
-
-            on-update-shape
-            (if (seq attrs)
-              (or (get attr->shape-update (first attrs)) on-update-shape)
-              on-update-shape)]
-
+      (let [shapes (target-shapes (dsh/lookup-page-objects state) shape-ids expand-with-children)]
         (rx/of
-         (cond
-           (and (= (:type token) :spacing)
-                (nil? attrs))
-           (apply-spacing-token-separated {:token token
-                                           :attr attrs
-                                           :shapes shapes})
-
-           :else
-           (apply-token {:attributes (if (empty? attrs) attributes attrs)
-                         :token token
-                         :shape-ids shape-ids
-                         :on-update-shape on-update-shape})))))))
+         (action->event (apply-action token attrs) token shapes shape-ids))))))
 
 
 (defn apply-token-on-color-selected

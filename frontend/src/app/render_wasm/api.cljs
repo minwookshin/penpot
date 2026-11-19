@@ -16,8 +16,9 @@
    [app.common.fonts :as cfnt]
    [app.common.logging :as log]
    [app.common.math :as mth]
+   [app.common.render-wasm.api.modifiers :as modifiers]
    [app.common.render-wasm.api.props :as props]
-   [app.common.render-wasm.api.upload :as upload]
+   [app.common.render-wasm.api.select :as wselect]
    [app.common.render-wasm.helpers :as h]
    [app.common.render-wasm.mem :as mem]
    [app.common.render-wasm.mem.heap32 :as mem.h32]
@@ -33,6 +34,7 @@
    [app.common.types.text :as txt]
    [app.common.uuid :as uuid]
    [app.config :as cf]
+   [app.main.data.event :as-alias ev]
    [app.main.data.helpers :as dsh]
    [app.main.data.notifications :as ntf]
    [app.main.data.render-wasm :as drw]
@@ -50,8 +52,8 @@
    [app.render-wasm.gesture :as wasm-gesture]
    [app.render-wasm.performance :as perf]
    [app.render-wasm.rulers-state :as rulers-state]
-   [app.render-wasm.svg-filters :as svg-filters]
    [app.render-wasm.text-editor :as text-editor]
+   [app.render-wasm.text-paste :as text-paste]
    [app.util.debug :as dbg]
    [app.util.dom :as dom]
    [app.util.functions :as fns]
@@ -228,13 +230,6 @@
 (def ^:const UUID-U8-SIZE 16)
 (def ^:const UUID-U32-SIZE (/ UUID-U8-SIZE 4))
 
-;; FIXME: Migrate this as we adjust the DTO structure in wasm
-(def ^:const MODIFIER-U8-SIZE 40)
-(def ^:const MODIFIER-U32-SIZE (/ MODIFIER-U8-SIZE 4))
-(def ^:const MODIFIER-TRANSFORM-U8-OFFSET-SIZE 16)
-(def ^:const INPUT-MODIFIER-U8-SIZE 44)
-(def ^:const INPUT-MODIFIER-U32-SIZE (/ INPUT-MODIFIER-U8-SIZE 4))
-
 (def ^:const GRID-LAYOUT-ROW-U8-SIZE 8)
 (def ^:const GRID-LAYOUT-COLUMN-U8-SIZE 8)
 (def ^:const GRID-LAYOUT-CELL-U8-SIZE 36)
@@ -276,8 +271,6 @@
 (def text-editor-select-paragraph text-editor/text-editor-select-paragraph)
 (def text-editor-sync-content text-editor/text-editor-sync-content)
 
-(def dpr
-  (if use-dpr? (if (exists? js/window) js/window.devicePixelRatio 1.0) 1.0))
 
 (defn get-dpr
   "Returns the current device pixel ratio. Use instead of `dpr` wherever
@@ -346,20 +339,11 @@
 (declare request-render-preserving-target)
 (declare render-pending?)
 
-;; These are the type of frames we have in our
-;; render pipeline.
-(def ^:const FRAME_TYPE_NONE 0)     ;; This type should never "leak".
-(def ^:const FRAME_TYPE_PARTIAL 1)  ;; A frame needs more render calls to end.
-(def ^:const FRAME_TYPE_FULL 2)     ;; A frame was full.
-(def ^:const FRAME_TYPE_VIEWPORT_READY 3) ;; Viewport presented; interest tiles may still be pending.
-
 (defn- needs-more-render-frames?
   "True when WASM still has progressive tile work (visible or interest ring)."
   []
-  (or (= wasm/internal-frame-type FRAME_TYPE_PARTIAL)
-      (= wasm/internal-frame-type FRAME_TYPE_VIEWPORT_READY)))
-
-(def ^:const RENDER-FLAG-SYNC-TILES 4) ;; Rebuild tile index without ending fast mode (pan/zoom pause).
+  (or (= wasm/internal-frame-type wasm/FRAME_TYPE_PARTIAL)
+      (= wasm/internal-frame-type wasm/FRAME_TYPE_VIEWPORT_READY)))
 
 (defn- internal-render
   ([]
@@ -457,7 +441,7 @@
     ;; one-shot on both sides: WASM clears it when the render loop starts, so
     ;; the progressive continuation frames behave normally.
     (if (compare-and-set! preserve-target-render? true false)
-      (internal-render timestamp (bit-or wasm/internal-frame-type RENDER-FLAG-SYNC-TILES))
+      (internal-render timestamp (bit-or wasm/internal-frame-type wasm/RENDER_FLAG_SYNC_TILES))
       (internal-render timestamp))
 
     ;; Update text editor blink (so cursor toggles) using the same timestamp
@@ -662,7 +646,7 @@
     (timers/cancel-af! frame-id)
     (set! wasm/internal-frame-id nil))
   (reset! pending-render false)
-  (set! wasm/internal-frame-type FRAME_TYPE_NONE))
+  (set! wasm/internal-frame-type wasm/FRAME_TYPE_NONE))
 
 (defn- register-deferred-render!
   []
@@ -729,18 +713,6 @@
 
 (declare get-text-dimensions)
 
-(defn use-shape
-  [id]
-  ;; Use `wasm/live?` (not `initialized?`) so context-restore reload can
-  ;; select shapes while `reloading?` still blocks external app callers.
-  (when (wasm/live?)
-    (let [buffer (uuid/get-u32 id)]
-      (h/call wasm/internal-module "_use_shape"
-              (aget buffer 0)
-              (aget buffer 1)
-              (aget buffer 2)
-              (aget buffer 3)))))
-
 (defn has-shape
   [id]
   (when (wasm/live?)
@@ -765,9 +737,14 @@
       (let [text (apply str (map :text spans))]
         (t/write-shape-text spans paragraph text)))))
 
-(defn set-shape-text-content
-  "This function sets shape text content and returns a stream that loads the needed fonts asynchronously"
-  [shape-id content]
+(defn- text-content-fonts
+  "Content fonts and fallback faces (emoji, Noto, ...) of a text content."
+  [content]
+  {:fonts          (f/get-content-fonts content)
+   :fallback-fonts (fonts-from-text-content content false)})
+
+(defn- upload-text-content
+  [shape-id content {:keys [fonts fallback-fonts]}]
 
   ;; Cache content for text editor sync
   (text-editor/cache-shape-text-content! shape-id content)
@@ -781,21 +758,23 @@
 
     (set-shape-vertical-align (get content :vertical-align))
 
-    (let [fonts          (f/get-content-fonts content)
-          fallback-fonts (fonts-from-text-content content false)
-          all-fonts      (concat fonts fallback-fonts)
-          result         (f/store-fonts all-fonts)]
+    (let [result (f/store-fonts (concat fonts fallback-fonts))]
       (write-text-content! content)
       (f/load-fallback-fonts-for-editor! fallback-fonts)
       (h/call wasm/internal-module "_update_shape_text_layout")
       result)))
+
+(defn set-shape-text-content
+  "This function sets shape text content and returns a stream that loads the needed fonts asynchronously"
+  [shape-id content]
+  (upload-text-content shape-id content (text-content-fonts content)))
 
 (defn apply-styles-to-selection
   "Apply style attrs to the currently selected text spans.
    Updates the cached content, pushes to WASM, and returns {:shape-id :content} for saving.
    `:with-fills?` also returns the selection's `:fills`."
   [styles & [opts]]
-  (let [result (text-editor/apply-styles-to-selection styles use-shape set-shape-text-content opts)]
+  (let [result (text-editor/apply-styles-to-selection styles wselect/use-shape set-shape-text-content opts)]
     (request-render "apply-styles-to-selection")
     result))
 
@@ -803,7 +782,7 @@
   "Apply paragraph attrs to the paragraphs the editor selection touches.
    Returns {:shape-id :content} for saving."
   [attrs]
-  (let [result (text-editor/apply-paragraph-attrs-to-selection attrs use-shape set-shape-text-content)]
+  (let [result (text-editor/apply-paragraph-attrs-to-selection attrs wselect/use-shape set-shape-text-content)]
     (request-render "apply-paragraph-attrs-to-selection")
     result))
 
@@ -813,10 +792,24 @@
   [shape-id range]
   (when-let [styles (text-editor/get-pending-caret-styles shape-id)]
     (let [result (text-editor/apply-styles-to-range
-                  shape-id range styles use-shape set-shape-text-content)]
+                  shape-id range styles wselect/use-shape set-shape-text-content)]
       (text-editor/clear-pending-caret-styles!)
       (request-render "apply-pending-caret-styles")
       result)))
+
+(defn apply-paste-styles
+  "Restyle the text just pasted at `start` with `fragment`: its overrides, or its full
+   styles when copied in Penpot. Nil when the shape has no cached content."
+  [shape-id fragment start penpot?]
+  (when-let [content (text-editor/get-cached-content shape-id)]
+    (let [content (if penpot?
+                    (text-paste/apply-content-styles content fragment start)
+                    (text-paste/apply-fragment-styles content fragment start))]
+      (wselect/use-shape shape-id)
+      (set-shape-text-content shape-id content)
+      (request-render "apply-paste-styles")
+      {:shape-id shape-id
+       :content  content})))
 
 (defn set-parent-id
   [id]
@@ -867,9 +860,9 @@
   (let [children (into [] (filter uuid?) children)]
     (if (empty? children)
       (h/call wasm/internal-module "_set_children_0")
-      (let [heap   (mem/get-heap-u32)
-            size   (mem/get-alloc-size children UUID-U8-SIZE)
-            offset (mem/alloc->offset-32 size)]
+      (let [size   (mem/get-alloc-size children UUID-U8-SIZE)
+            offset (mem/alloc->offset-32 size)
+            heap   (mem/get-heap-u32)]
         (reduce
          (fn [offset id]
            (mem.h32/write-uuid offset heap id))
@@ -1130,6 +1123,10 @@
 (defn set-shape-hidden
   [hidden]
   (h/call wasm/internal-module "_set_shape_hidden" hidden))
+
+(defn set-shape-hide-fill-on-export
+  [hide]
+  (h/call wasm/internal-module "_set_shape_hide_fill_on_export" hide))
 
 (defn clear-shape-fills!
   "Clear the fills of the currently-selected shape (call `use-shape` first).
@@ -1409,7 +1406,7 @@
 
 (defn get-text-dimensions
   ([id]
-   (use-shape id)
+   (wselect/use-shape id)
    (get-text-dimensions))
   ([]
    (if-not (initialized?)
@@ -1483,7 +1480,7 @@
     ;; this implicitly (`zoom_changed`); this extends it to pan/resize-triggered
     ;; ends (e.g. selecting a shape opens the options panel and resizes the
     ;; viewport), which previously blanked.
-    (internal-render (js/performance.now) RENDER-FLAG-SYNC-TILES)))
+    (internal-render (js/performance.now) wasm/RENDER_FLAG_SYNC_TILES)))
 
 (def render-finish
   (letfn [(do-render []
@@ -1492,7 +1489,7 @@
             (when (initialized?)
               (if (view-gesture-active?)
                 ;; Pan/zoom pause: render without ending the interaction.
-                (internal-render (js/performance.now) RENDER-FLAG-SYNC-TILES)
+                (internal-render (js/performance.now) wasm/RENDER_FLAG_SYNC_TILES)
                 (finalize-view-interaction!))))]
     (fns/debounce do-render DEBOUNCE_DELAY_MS)))
 
@@ -1532,16 +1529,10 @@
 (def ^:private empty-text-font-state
   {:font-index {} :pending-faces #{}})
 
-(defn- text-layout-fonts
-  "Content and fallback faces (emoji, Noto, ...) that `set-shape-text-content`
-  uploads, must match that path for pending-face tracking."
-  [content]
-  (into #{} (concat (f/get-content-fonts content)
-                    (fonts-from-text-content content false))))
-
 (defn- text-font-face-keys-state
-  "All font-face keys for a text content, and the subset not WASM-ready yet."
-  [content]
+  "All font-face keys for the `text-content-fonts` of a text, and the subset
+  not WASM-ready yet."
+  [{:keys [fonts fallback-fonts]}]
   (reduce
    (fn [acc font]
      (let [font-data (f/make-font-data font)
@@ -1552,7 +1543,7 @@
            (cond-> pending?
              (update :pending-font-face-keys conj key)))))
    {:font-face-keys #{} :pending-font-face-keys #{}}
-   (text-layout-fonts content)))
+   (into #{} (concat fonts fallback-fonts))))
 
 (defn- acc-text-font-state
   [{:keys [font-index pending-faces]} id font-face-keys pending-font-face-keys]
@@ -1569,7 +1560,7 @@
   (if (cfh/text-shape? shape)
     (let [content (ensure-text-content (:content shape))
           {:keys [font-face-keys pending-font-face-keys]}
-          (text-font-face-keys-state content)]
+          (text-font-face-keys-state (text-content-fonts content))]
       (acc-text-font-state empty-text-font-state
                            (:id shape)
                            font-face-keys
@@ -1610,7 +1601,7 @@
                              true))]
 
     (when needs-current?
-      (use-shape id))
+      (wselect/use-shape id))
 
     (when (and (some? content) (= type :svg-raw))
       (set-shape-svg-raw-content (get-static-markup shape)))
@@ -1622,9 +1613,10 @@
           (set-layout-data shape)))
 
     (let [is-text? (= type :text)
+          text-fonts (when is-text? (text-content-fonts content))
           {:keys [font-face-keys pending-font-face-keys]}
-          (when is-text? (text-font-face-keys-state content))
-          text-content-pending (when is-text? (set-shape-text-content id content))
+          (when is-text? (text-font-face-keys-state text-fonts))
+          text-content-pending (when is-text? (upload-text-content id content text-fonts))
           pending-thumbnails (into [] (concat
                                        text-content-pending
                                        (when is-text? (set-shape-text-images id content true))
@@ -1645,11 +1637,10 @@
     {:thumbnails [] :full [] :font-face-keys #{} :pending-font-face-keys #{}}
     (do
       (perf/begin-measure "set-object")
-      (let [shape (svg-filters/apply-svg-derived shape)]
-        (serialize-shape/serialize-shape! shape)
-        (let [result (set-object-host-attrs shape false)]
-          (perf/end-measure "set-object")
-          result)))))
+      (let [prepared (serialize-shape/serialize-shape shape)
+            result (set-object-host-attrs prepared false)]
+        (perf/end-measure "set-object")
+        result))))
 
 (defn- update-text-layouts
   "Synchronously update text layouts for all shapes and send rect updates
@@ -1762,21 +1753,11 @@
       ;; No pending images — complete immediately.
       (when on-complete (on-complete)))))
 
-(defn process-object
-  [shape]
-  (let [{:keys [thumbnails full font-face-keys pending-font-face-keys]}
-        (set-object shape)
-        text-font-state (acc-text-font-state empty-text-font-state
-                                             (:id shape)
-                                             font-face-keys
-                                             pending-font-face-keys)]
-    (process-pending [shape] thumbnails full text-font-state noop-fn)))
-
 (defn process-objects
-  "Like process-object but for multiple shapes at once. Accumulates all
-   pending font/image callbacks before calling process-pending, so that
-   update-text-layouts fires for all text shapes after fonts load — not
-   just the first shape that triggered the fetch."
+  "Takes multiple shapes, calling `set-object` for each one and accumulating
+  their thumbnails, full-image callbacks, and text font state. Then calls
+  `process-pending` once for the whole batch, so text layouts are updated for
+  all shapes after pending fonts and images are processed."
   [shapes]
   (let [total-shapes (count shapes)
         {:keys [thumbnails full text-font-state]}
@@ -1814,24 +1795,10 @@
         end-index (min total (+ start-index BATCH_MAX_SHAPES))
         chunk     (into [] (subvec (if (vector? shapes) shapes (vec shapes))
                                    start-index end-index))
-        prepared  (mapv svg-filters/apply-svg-derived chunk)]
-
-    ;; One multi-shape structural upload (base+children+blur+shadows+flex+item+fills+strokes).
-    (when (seq prepared)
-      (upload/flush-shapes-batch! prepared {:include-layout? true
-                                            :include-fills-strokes? true}))
-
-    ;; Path + svg-attrs still need the legacy per-shape path (variable/large).
-    (doseq [shape prepared]
-      (let [id   (dm/get-prop shape :id)
-            type (dm/get-prop shape :type)]
-        (when (or (some? (get shape :svg-attrs))
-                  (and (contains? #{:path :bool} type) (some? (get shape :content))))
-          (use-shape id)
-          (when (some? (get shape :svg-attrs))
-            (props/set-shape-svg-attrs (get shape :svg-attrs)))
-          (when (and (contains? #{:path :bool} type) (some? (get shape :content)))
-            (props/set-shape-path-content (get shape :content))))))
+        prepared  (serialize-shape/serialize-shapes-batch
+                   chunk
+                   {:include-layout? true
+                    :include-fills-strokes? true})]
 
     (loop [xs prepared
            t-acc (transient thumbnails-acc)
@@ -1977,53 +1944,43 @@
 (defn- set-objects-sync
   "Synchronously process all shapes (for small shape counts)."
   [shapes render-callback on-shapes-ready]
-  (let [prepared (mapv svg-filters/apply-svg-derived shapes)]
-    (when (seq prepared)
-      (upload/flush-shapes-batch! prepared {:include-layout? true
-                                            :include-fills-strokes? true}))
-    (doseq [shape prepared]
-      (let [id   (dm/get-prop shape :id)
-            type (dm/get-prop shape :type)]
-        (when (or (some? (get shape :svg-attrs))
-                  (and (contains? #{:path :bool} type) (some? (get shape :content))))
-          (use-shape id)
-          (when (some? (get shape :svg-attrs))
-            (props/set-shape-svg-attrs (get shape :svg-attrs)))
-          (when (and (contains? #{:path :bool} type) (some? (get shape :content)))
-            (props/set-shape-path-content (get shape :content))))))
-    (let [total-shapes (count prepared)
-          {:keys [thumbnails full text-font-state]}
-          (loop [index 0
-                 thumbnails-acc (transient [])
-                 full-acc (transient [])
-                 font-state-acc empty-text-font-state]
-            (if (< index total-shapes)
-              (let [shape (nth prepared index)
-                    {:keys [thumbnails full font-face-keys pending-font-face-keys]}
-                    (set-object-host-attrs shape true :skip-fills-strokes? true)]
-                (recur (inc index)
-                       (reduce conj! thumbnails-acc thumbnails)
-                       (reduce conj! full-acc full)
-                       (acc-text-font-state font-state-acc
-                                            (:id shape)
-                                            font-face-keys
-                                            pending-font-face-keys)))
-              {:thumbnails (persistent! thumbnails-acc)
-               :full (persistent! full-acc)
-               :text-font-state font-state-acc}))]
-      (perf/end-measure "set-objects")
-      (when on-shapes-ready (on-shapes-ready))
-      (when (wasm/live?)
-        ;; Rebuild the tile index so _render knows which shapes
-        ;; map to which tiles after a page switch.
-        (h/call wasm/internal-module "_set_view_end")
-        (reset! view-interaction-active? false)
-        (process-pending shapes thumbnails full text-font-state
-                         (fn []
-                           (if render-callback
-                             (render-callback)
-                             (request-render "set-objects-sync-complete"))
-                           (ug/dispatch! (ug/event "penpot:wasm:set-objects"))))))))
+  (let [prepared     (serialize-shape/serialize-shapes-batch
+                      shapes
+                      {:include-layout? true
+                       :include-fills-strokes? true})
+        total-shapes (count prepared)
+        {:keys [thumbnails full text-font-state]}
+        (loop [index 0
+               thumbnails-acc (transient [])
+               full-acc (transient [])
+               font-state-acc empty-text-font-state]
+          (if (< index total-shapes)
+            (let [shape (nth prepared index)
+                  {:keys [thumbnails full font-face-keys pending-font-face-keys]}
+                  (set-object-host-attrs shape true :skip-fills-strokes? true)]
+              (recur (inc index)
+                     (reduce conj! thumbnails-acc thumbnails)
+                     (reduce conj! full-acc full)
+                     (acc-text-font-state font-state-acc
+                                          (:id shape)
+                                          font-face-keys
+                                          pending-font-face-keys)))
+            {:thumbnails (persistent! thumbnails-acc)
+             :full (persistent! full-acc)
+             :text-font-state font-state-acc}))]
+    (perf/end-measure "set-objects")
+    (when on-shapes-ready (on-shapes-ready))
+    (when (wasm/live?)
+      ;; Rebuild the tile index so _render knows which shapes
+      ;; map to which tiles after a page switch.
+      (h/call wasm/internal-module "_set_view_end")
+      (reset! view-interaction-active? false)
+      (process-pending shapes thumbnails full text-font-state
+                       (fn []
+                         (if render-callback
+                           (render-callback)
+                           (request-render "set-objects-sync-complete"))
+                         (ug/dispatch! (ug/event "penpot:wasm:set-objects")))))))
 
 (defn- shapes-in-tree-order
   "Returns shapes sorted in tree order (parents before children).
@@ -2104,8 +2061,8 @@
   [entries]
   (when (and (initialized?) (not ^boolean (empty? entries)))
     (let [size   (mem/get-alloc-size entries UUID-U8-SIZE)
-          heap   (mem/get-heap-u32)
-          offset (mem/alloc->offset-32 size)]
+          offset (mem/alloc->offset-32 size)
+          heap   (mem/get-heap-u32)]
 
       (reduce (fn [offset id]
                 (mem.h32/write-uuid offset heap id))
@@ -2128,8 +2085,8 @@
   (when (and (initialized?) (seq shape-ids))
     (let [ids    (vec shape-ids)
           size   (mem/get-alloc-size ids UUID-U8-SIZE)
-          heap   (mem/get-heap-u32)
-          offset (mem/alloc->offset-32 size)]
+          offset (mem/alloc->offset-32 size)
+          heap   (mem/get-heap-u32)]
       (reduce (fn [offset id]
                 (mem.h32/write-uuid offset heap id))
               offset
@@ -2138,85 +2095,25 @@
 
 (defn set-structure-modifiers
   [entries]
-  (when (and (initialized?) (not ^boolean (empty? entries)))
-    (let [size    (mem/get-alloc-size entries 44)
-          offset  (mem/alloc->offset-32 size)
-          heapu32 (mem/get-heap-u32)
-          heapf32 (mem/get-heap-f32)]
-
-
-      (reduce (fn [offset {:keys [type parent id index value]}]
-                (-> offset
-                    (mem.h32/write-u32 heapu32 (sr/translate-structure-modifier-type type))
-                    (mem.h32/write-u32 heapu32 (d/nilv index 0))
-                    (mem.h32/write-uuid heapu32 parent)
-                    (mem.h32/write-uuid heapu32 id)
-                    (mem.h32/write-f32 heapf32 value)))
-              offset
-              entries)
-
-      (h/call wasm/internal-module "_set_structure_modifiers"))))
+  (when (initialized?)
+    (modifiers/set-structure-modifiers entries)))
 
 ;; Axes the pixel grid rounds, as `propagate_modifiers` expects them.
-(def ^:private pixel-precision
-  {:disabled 0
-   :both     1
-   :only-x   2
-   :only-y   3})
-
-(defn- pixel-precision-mode
-  "Encodes the pixel grid snapping for the renderer. `snap-ignore-axis`
-  names the axis to leave alone (`:x`, `:y` or nil)."
-  [snap-pixel? snap-ignore-axis]
-  (pixel-precision
-   (cond
-     (not snap-pixel?)       :disabled
-     (= :x snap-ignore-axis) :only-y
-     (= :y snap-ignore-axis) :only-x
-     :else                   :both)))
-
 (defn propagate-modifiers
-  "Propagates geometry modifiers through the WASM shape tree.
+  "Propagates geometry transforms when the renderer is ready.
 
-  Rounds the resulting geometry to the pixel grid when `snap-pixel?` is set,
-  skipping the axis named by `snap-ignore-axis` (`:x`, `:y` or nil).
+  Args:
+    entries: Collection of [uuid {:transform matrix :kind kind}].
+    snap-pixel?: Whether to round geometry to the pixel grid.
+    snap-ignore-axis: Axis to leave unsnapped, :x, :y or nil.
 
-  Always returns a vector. When the context is not ready (lost / mid-reload)
-  or `entries` is empty, returns `[]` so callers never receive `nil` (which
-  would trip `set-modifiers`' vector assert)."
+  Returns:
+    A vector of [uuid matrix], or [] for an unavailable renderer or empty
+    entries."
   [entries snap-pixel? snap-ignore-axis]
-  (if-not (and (initialized?) (not ^boolean (empty? entries)))
-    []
-    (let [heapf32 (mem/get-heap-f32)
-          heapu32 (mem/get-heap-u32)
-          size    (mem/get-alloc-size entries INPUT-MODIFIER-U8-SIZE)
-          offset  (mem/alloc->offset-32 size)]
-
-      (reduce (fn [offset [id data]]
-                (let [transform (:transform data)
-                      kind (:kind data)]
-                  (-> offset
-                      (mem.h32/write-uuid heapu32 id)
-                      (mem.h32/write-matrix heapf32 transform)
-                      (mem.h32/write-u32 heapu32 (sr/translate-transform-entry-kind kind)))))
-              offset
-              entries)
-
-      (let [precision  (pixel-precision-mode snap-pixel? snap-ignore-axis)
-            offset     (-> (h/call wasm/internal-module "_propagate_modifiers" precision)
-                           (mem/->offset-32))
-            length     (aget heapu32 offset)
-            max-offset (+ offset 1 (* length MODIFIER-U32-SIZE))
-            result     (loop [result (transient [])
-                              offset (inc offset)]
-                         (if (< offset max-offset)
-                           (let [entry (dr/read-modifier-entry heapu32 heapf32 offset)]
-                             (recur (conj! result entry)
-                                    (+ offset MODIFIER-U32-SIZE)))
-                           (persistent! result)))]
-
-        (mem/free)
-        result))))
+  (if (initialized?)
+    (modifiers/propagate-modifiers entries snap-pixel? snap-ignore-axis)
+    []))
 
 (defn get-selection-rect
   [entries]
@@ -2224,8 +2121,7 @@
   (when (and (initialized?) (not ^boolean (empty? entries)))
     (let [size    (mem/get-alloc-size entries UUID-U8-SIZE)
           offset  (mem/alloc->offset-32 size)
-          heapu32 (mem/get-heap-u32)
-          heapf32 (mem/get-heap-f32)]
+          heapu32 (mem/get-heap-u32)]
 
       (reduce (fn [offset id]
                 (mem.h32/write-uuid offset heapu32 id))
@@ -2234,7 +2130,7 @@
 
       (let [offset (-> (h/call wasm/internal-module "_get_selection_rect")
                        (mem/->offset-32))
-            result (dr/read-selection-rect heapf32 offset)]
+            result (dr/read-selection-rect (mem/get-heap-f32) offset)]
         (mem/free)
         result))))
 
@@ -2252,48 +2148,29 @@
 (defn clean-modifiers
   []
   (when (initialized?)
-    (h/call wasm/internal-module "_clean_modifiers")))
+    (modifiers/clean-modifiers)))
 
 (defn set-modifiers-start
-  "Enter interactive transform mode (drag / resize / rotate). Enables
-   fast-mode effect skipping in the renderer and activates an atlas
-   backdrop so tiles do not appear sequentially or flicker while the
-   gesture is in progress."
+  "Enables interactive rendering for shape transforms when the renderer is ready."
   []
   (when (initialized?)
-    (h/call wasm/internal-module "_set_modifiers_start")))
+    (modifiers/set-modifiers-start)))
 
 (defn set-modifiers-end
-  "Leave interactive transform mode. Cancels any pending async render
-   scheduled under it; the caller is expected to trigger a full-quality
-   render (via `request-render`) once the gesture is committed."
+  "Ends interactive rendering for shape transforms when the renderer is ready.
+
+  A subsequent render produces the final full-quality image."
   []
   (when (initialized?)
-    (h/call wasm/internal-module "_set_modifiers_end")))
+    (modifiers/set-modifiers-end)))
 
 (defn set-modifiers
-  [modifiers]
+  [entries]
   (when (initialized?)
-    ;; Assert only when we would touch WASM; callers may still build
-    ;; modifiers while the context is unavailable.
-    (assert (vector? modifiers) "expected a vector for `set-modifiers`")
-
-    (let [length (count modifiers)]
-      (when (pos? length)
-        (let [offset  (mem/alloc->offset-32 (* MODIFIER-U8-SIZE length))
-              heapu32 (mem/get-heap-u32)
-              heapf32 (mem/get-heap-f32)]
-
-          (reduce (fn [offset [id transform]]
-                    (-> offset
-                        (mem.h32/write-uuid heapu32 id)
-                        (mem.h32/write-matrix heapf32 transform)))
-                  offset
-                  modifiers)
-
-          (h/call wasm/internal-module "_set_modifiers")
-
-          (request-render "set-modifiers"))))))
+    (assert (vector? entries) "expected a vector for `set-modifiers`")
+    (when (seq entries)
+      (modifiers/set-modifiers entries)
+      (request-render "set-modifiers"))))
 
 (defn initialize-viewport
   [base-objects zoom vbox &
@@ -2361,13 +2238,6 @@
    (fn [resolve _reject]
      (timers/raf (fn [] (resolve nil))))))
 
-(def ^:private default-context-options
-  #js {:antialias false
-       :depth true
-       :stencil true
-       :alpha true
-       "preserveDrawingBuffer" true})
-
 (defn resize-viewbox
   "Resizes the WASM viewbox. No-ops unless the GL context is live
   (`wasm/live?`), so callers cannot hit `_resize_viewbox` during
@@ -2402,53 +2272,18 @@
   (when (wasm/live?)
     (h/call wasm/internal-module "_set_render_options" (debug-flags) new-dpr)))
 
-(def ^:private max-surface-size
-  ;; Must match `gpu_state::MAX_SURFACE_SIZE`.
-  8192)
-
-(defn- clamp-physical-size
-  "Clamp physical pixel dimensions before assigning `canvas.width/height`.
-  Rust `resize` applies the same cap and syncs the effective DPR from the
-  real drawing buffer."
-  [w h]
-  (let [w     (mth/max 1 w)
-        h     (mth/max 1 h)
-        scale (mth/min 1 (/ max-surface-size w) (/ max-surface-size h))]
-    [(mth/max 1 (mth/floor (* scale w)))
-     (mth/max 1 (mth/floor (* scale h)))]))
-
 (defn resize-offscreen-canvas!
   "Resize a persistent OffscreenCanvas to new physical-pixel dimensions and
   update the WASM render surfaces accordingly (via `_resize_viewbox`). The
   design state (shape pool) is preserved so `set-objects` is not needed again."
   [canvas new-physical-w new-physical-h]
   (when (wasm/live?)
-    (let [dpr (get-dpr)
-          [pw ph] (clamp-physical-size new-physical-w new-physical-h)]
+    (let [dpr     (get-dpr)
+          [pw ph] (webgl/clamp-physical-size new-physical-w new-physical-h)]
       (set! (.-width canvas) pw)
       (set! (.-height canvas) ph)
       (set-render-options! dpr)
       (resize-viewbox (/ new-physical-w dpr) (/ new-physical-h dpr)))))
-
-(defn- wasm-set-param-from-route-params-if-present
-  [param-name]
-  (when-let [value (wasm-get-numeric-value param-name)]
-    (let [setter-name (str/concat "_set_" (name param-name))]
-      (h/call wasm/internal-module setter-name value))))
-
-(defn- canvas-css-size
-  "Return canvas size in CSS pixels.
-
-  - For DOM canvases: use `clientWidth/clientHeight`.
-  - For OffscreenCanvas: fall back to `width/height` (physical px) converted by DPR."
-  [canvas dpr]
-  (let [cw (.-clientWidth ^js canvas)
-        ch (.-clientHeight ^js canvas)]
-    (if (and (number? cw) (pos? cw)
-             (number? ch) (pos? ch))
-      [cw ch]
-      [(/ (.-width ^js canvas) dpr)
-       (/ (.-height ^js canvas) dpr)])))
 
 (defn resize-canvas!
   "Sizes the canvas drawing buffer, the WASM render surface and the DPR from a
@@ -2461,16 +2296,27 @@
    (resize-canvas! canvas (get-dpr)))
   ([canvas new-dpr]
    (when (wasm/live?)
-     (let [[css-w css-h] (canvas-css-size canvas new-dpr)
-           css-w         (mth/max 1 css-w)
-           css-h         (mth/max 1 css-h)
-           [phys-w phys-h] (clamp-physical-size
+     (let [[css-w css-h]   (webgl/canvas-css-size canvas new-dpr)
+           css-w           (mth/max 1 css-w)
+           css-h           (mth/max 1 css-h)
+           [phys-w phys-h] (webgl/clamp-physical-size
                             (mth/floor (* css-w new-dpr))
                             (mth/floor (* css-h new-dpr)))]
        (set! (.-width ^js canvas) phys-w)
        (set! (.-height ^js canvas) phys-h)
        (set-render-options! new-dpr)
        (resize-viewbox css-w css-h)))))
+
+(defn- emit-webgl-event
+  "Send a WebGL audit event with the environment details. Built as a plain
+  data event so this namespace does not load `app.main.data.event`, which
+  the worker build cannot run."
+  [event-name props]
+  (st/emit! (ptk/data-event ::ev/event
+                            (merge (webgl/get-environment)
+                                   props
+                                   {::ev/name event-name
+                                    ::ev/origin "workspace"}))))
 
 (defn- on-webgl-context-lost
   [event]
@@ -2488,7 +2334,8 @@
               :type :toast
               :level :warning
               :timeout 5000}))
-  (st/emit! (drw/context-lost)))
+  (st/emit! (drw/context-lost))
+  (emit-webgl-event "webgl-context-lost" {}))
 
 (defn- on-webgl-context-restored
   [event]
@@ -2505,6 +2352,7 @@
                   ;; only after the full reload so layout/viewport sync runs
                   ;; against a live renderer with `wasm/ready?` true.
                   (st/emit! (drw/context-restored))
+                  (emit-webgl-event "webgl-context-restored" {})
                   (listen-tiles-render-complete-once! end-context-loss-overlay!)
                   (st/async-emit!
                    (ntf/show {:content (tr "webgl.webgl-context-recovered.toast")
@@ -2517,52 +2365,55 @@
                               :cause cause)
                    nil)))))
 
+;; Stable listener identities, so `removeEventListener` matches across hot reloads
+(defonce ^:private webgl-context-lost-listener
+  (fn [event] (on-webgl-context-lost event)))
+
+(defonce ^:private webgl-context-restored-listener
+  (fn [event] (on-webgl-context-restored event)))
+
 (defn init-canvas-context
   [canvas]
   (if-not (wasm/module-ready?)
     false
-    (let [gl      (unchecked-get wasm/internal-module "GL")
-          flags   (debug-flags)
+    (let [flags      (debug-flags)
           context-id (if (dbg/enabled? :wasm-gl-context-init-error) "fail" "webgl2")
-          context (.getContext ^js canvas context-id default-context-options)
-          context-init? (not (nil? context))
-          browser (sr/translate-browser cf/browser)
-          dpr     (get-dpr)
-          [css-w css-h] (canvas-css-size canvas dpr)
+          browser    (sr/translate-browser cf/browser)
+          dpr        (get-dpr)
+          [css-w css-h] (webgl/canvas-css-size canvas dpr)
           ;; Avoid 0×0 Skia/GL surfaces (crashes on some browsers).
-          css-w (mth/max 1 css-w)
-          css-h (mth/max 1 css-h)
+          css-w      (mth/max 1 css-w)
+          css-h      (mth/max 1 css-h)
+          params     {:antialias_threshold              (wasm-get-numeric-value :antialias_threshold)
+                      :viewport_interest_area_threshold (wasm-get-numeric-value :viewport_interest_area_threshold)
+                      :max_blocking_time_ms             (wasm-get-numeric-value :max_blocking_time_ms)
+                      :node_batch_threshold             (wasm-get-numeric-value :node_batch_threshold)
+                      :blur_downscale_threshold         (wasm-get-numeric-value :blur_downscale_threshold)}
+          result     (webgl/init-context canvas {:module     wasm/internal-module
+                                                 :context-id context-id
+                                                 :css-width  css-w
+                                                 :css-height css-h
+                                                 :dpr        dpr
+                                                 :flags      flags
+                                                 :browser    browser
+                                                 :params     params})
+          context-init? (some? result)
           can-listen? (fn? (.-addEventListener ^js canvas))]
-      (when-not (nil? context)
-        (let [handle (.registerContext ^js gl context #js {"majorVersion" 2})]
-          (.makeContextCurrent ^js gl handle)
+      (when result
+        (let [{:keys [context handle]} result]
           (set! wasm/gl-context-handle handle)
           (set! wasm/gl-context context)
+          (webgl/remember-gpu-info context)
 
-          ;; Force the WEBGL_debug_renderer_info extension as emscripten does not enable it
-          (.getExtension context "WEBGL_debug_renderer_info")
-
-          ;; Initialize Wasm Render Engine
-          (h/call wasm/internal-module "_init" css-w css-h)
-          (h/call wasm/internal-module "_set_render_options" flags dpr)
-
-          ;; Configurable parameters.
-          (wasm-set-param-from-route-params-if-present :antialias_threshold)
-          (wasm-set-param-from-route-params-if-present :viewport_interest_area_threshold)
-          (wasm-set-param-from-route-params-if-present :max_blocking_time_ms)
-          (wasm-set-param-from-route-params-if-present :node_batch_threshold)
-          (wasm-set-param-from-route-params-if-present :blur_downscale_threshold)
-
-          ;; Set browser after `_init`; mark live before sizing so the
+          ;; `init-context` already ran `_init` through `_set_browser` in
+          ;; order. Publish the handles, then mark live before sizing so the
           ;; guarded `resize-*` helpers can run (they require `wasm/live?`,
           ;; which is true here even while `reloading?` still blocks app callers).
-          (h/call wasm/internal-module "_set_browser" browser)
-
-          ;; Add event listeners for WebGL context lost
           (set! wasm/canvas canvas)
+          ;; Add event listeners for WebGL context lost
           (when can-listen?
-            (.addEventListener canvas "webglcontextlost" on-webgl-context-lost)
-            (.addEventListener canvas "webglcontextrestored" on-webgl-context-restored))
+            (.addEventListener canvas "webglcontextlost" webgl-context-lost-listener)
+            (.addEventListener canvas "webglcontextrestored" webgl-context-restored-listener))
           (start-canvas-snapshot-listener!)
           (reset! wasm/context-lost? false)
           (set! wasm/context-initialized? true)
@@ -2596,8 +2447,8 @@
 
      ;; Remove listener before losing/deleting context.
      (when wasm/canvas
-       (.removeEventListener wasm/canvas "webglcontextlost" on-webgl-context-lost)
-       (.removeEventListener wasm/canvas "webglcontextrestored" on-webgl-context-restored))
+       (.removeEventListener wasm/canvas "webglcontextlost" webgl-context-lost-listener)
+       (.removeEventListener wasm/canvas "webglcontextrestored" webgl-context-restored-listener))
      (stop-canvas-snapshot-listener!)
 
      (when (wasm/module-ready?)
@@ -2605,19 +2456,18 @@
 
      ;; Ensure the WebGL context is properly disposed so browsers do not keep
      ;; accumulating active contexts between page switches.
-     (when-let [gl (unchecked-get wasm/internal-module "GL")]
-       (when-let [handle wasm/gl-context-handle]
-         (try
-           ;; For hard teardown we can explicitly lose browser context.
-           ;; For reload->reinit flows we skip this because immediate context
-           ;; recreation may fail on some browsers/GPUs while context is lost.
-           (when lose-browser-context?
-             (when-let [ctx wasm/gl-context]
-               (when-let [lose-ext (.getExtension ^js ctx "WEBGL_lose_context")]
-                 (.loseContext ^js lose-ext))))
-           (.deleteContext ^js gl handle)
-           (catch :default dispose-error
-             (.error js/console dispose-error)))))
+     (when-let [handle wasm/gl-context-handle]
+       (try
+         ;; For hard teardown we can explicitly lose browser context.
+         ;; For reload->reinit flows we skip this because immediate context
+         ;; recreation may fail on some browsers/GPUs while context is lost.
+         (when lose-browser-context?
+           (when-let [ctx wasm/gl-context]
+             (when-let [lose-ext (.getExtension ^js ctx "WEBGL_lose_context")]
+               (.loseContext ^js lose-ext))))
+         (webgl/delete-context! wasm/internal-module handle)
+         (catch :default dispose-error
+           (.error js/console dispose-error))))
 
      (wasm-gesture/reset-after-wasm-reload!)
      (wasm/reset-context-state!)
@@ -2691,6 +2541,9 @@
         (p/catch
          (fn [cause]
            (ug/dispatch! (ug/event "penpot:wasm:reload-failed"))
+           (emit-webgl-event "webgl-reload-failed"
+                             {:hint (ex-message cause)
+                              :code (some-> (ex-data cause) :code name)})
            (reset! wasm/reloading? false)
            (reset! wasm/context-lost? true)
            (clear-canvas)
@@ -2797,7 +2650,7 @@
 (defn shape-to-path
   [id]
   (when (initialized?)
-    (use-shape id)
+    (wselect/use-shape id)
     (try
       (let [offset (-> (h/call wasm/internal-module "_current_to_path")
                        (mem/->offset-32))
@@ -2821,7 +2674,7 @@
    the fill rule itself)."
   [id stroke-index]
   (when (initialized?)
-    (use-shape id)
+    (wselect/use-shape id)
     (try
       (let [offset    (-> (h/call wasm/internal-module "_convert_stroke_to_path" stroke-index)
                           (mem/->offset-32))
@@ -2844,8 +2697,8 @@
 (defn calculate-bool*
   [bool-type ids]
   (let [size   (mem/get-alloc-size ids UUID-U8-SIZE)
-        heap   (mem/get-heap-u32)
-        offset (mem/alloc->offset-32 size)]
+        offset (mem/alloc->offset-32 size)
+        heap   (mem/get-heap-u32)]
 
     (reduce (fn [offset id]
               (mem.h32/write-uuid offset heap id))
@@ -2857,6 +2710,7 @@
             (-> (h/call wasm/internal-module "_calculate_bool" (sr/translate-bool-type bool-type))
                 (mem/->offset-32))
 
+            heap    (mem/get-heap-u32)
             length  (aget heap offset)
             data    (mem/slice heap
                                (+ offset 1)
@@ -2911,11 +2765,11 @@
 (defn calculate-position-data
   [shape]
   (when (initialized?)
-    (use-shape (:id shape))
-    (let [heapf32 (mem/get-heap-f32)
-          heapu32 (mem/get-heap-u32)
-          offset (-> (h/call wasm/internal-module "_calculate_position_data")
+    (wselect/use-shape (:id shape))
+    (let [offset (-> (h/call wasm/internal-module "_calculate_position_data")
                      (mem/->offset-32))
+          heapf32 (mem/get-heap-f32)
+          heapu32 (mem/get-heap-u32)
           length (aget heapu32 offset)
 
           max-offset (+ offset 1 (* length POSITION-DATA-U32-SIZE))
@@ -2984,29 +2838,49 @@
       (when-let [snapshot wasm/canvas-snapshot]
         (reset! transition-image* snapshot)))))
 
+(defn- read-raster-result
+  "Decode `[len][width][height][bytes]` from a `_render_shape_*` raster call."
+  [offset]
+  (let [heap (mem/get-heap-u8)
+        heapu32 (mem/get-heap-u32)
+        length (aget heapu32 (mem/->offset-32 offset))
+        result (dr/read-image-bytes heap (+ offset 12) length)]
+    (mem/free)
+    result))
+
 (defn render-shape-pixels
-  "Renders a shape subtree to encoded image bytes. `format` is :png, :jpeg or
-  :webp; jpeg is flattened onto white on the Rust side, since it has no alpha
-  channel."
+  "Renders a shape subtree to encoded image bytes on the GPU export surface.
+  `format` is :png, :jpeg or :webp; jpeg is flattened onto white on the Rust
+  side, since it has no alpha channel. With `export?` the root drops its
+  fills when it hides them on export."
+  [shape-id scale format export?]
+  (when (initialized?)
+    (let [buffer (uuid/get-u32 shape-id)
+          offset (h/call wasm/internal-module "_render_shape_pixels"
+                         (aget buffer 0)
+                         (aget buffer 1)
+                         (aget buffer 2)
+                         (aget buffer 3)
+                         scale
+                         (sr/translate-raster-format format)
+                         export?)]
+      (read-raster-result offset))))
+
+(defn render-shape-raster
+  "Same output as `render-shape-pixels`, but on a CPU Skia surface (no
+  GPU/WebGL). Used when the export exceeds the GPU max texture size — the
+  same path the headless exporter uses for wasm rasters."
   [shape-id scale format]
   (when (initialized?)
     (let [buffer (uuid/get-u32 shape-id)
-
-          offset
-          (h/call wasm/internal-module "_render_shape_pixels"
-                  (aget buffer 0)
-                  (aget buffer 1)
-                  (aget buffer 2)
-                  (aget buffer 3)
-                  scale
-                  (sr/translate-raster-format format))
-
-          heap (mem/get-heap-u8)
-          heapu32 (mem/get-heap-u32)
-          length (aget heapu32 (mem/->offset-32 offset))
-          result (dr/read-image-bytes heap (+ offset 12) length)]
-      (mem/free)
-      result)))
+          offset (h/call wasm/internal-module "_render_shape_raster"
+                         (aget buffer 0)
+                         (aget buffer 1)
+                         (aget buffer 2)
+                         (aget buffer 3)
+                         scale
+                         (sr/translate-raster-format format))]
+      (read-raster-result offset))))
 
 (defn get-shape-extrect
   [shape-id]
@@ -3027,8 +2901,23 @@
           (mem/free)
           {:x x :y y :width w :height h})))))
 
+(defn export-target
+  [shape-id scale format]
+  (when (initialized?)
+    (let [buffer (uuid/get-u32 shape-id)]
+      (case (h/call wasm/internal-module "_export_target"
+                    (aget buffer 0)
+                    (aget buffer 1)
+                    (aget buffer 2)
+                    (aget buffer 3)
+                    scale
+                    (sr/translate-raster-format format))
+        0 :client
+        2 :too-large
+        :exporter))))
+
 (defn render-shape-pdf
-  [shape-id scale]
+  [shape-id]
   (when (initialized?)
     (let [buffer (uuid/get-u32 shape-id)
 
@@ -3037,8 +2926,7 @@
                   (aget buffer 0)
                   (aget buffer 1)
                   (aget buffer 2)
-                  (aget buffer 3)
-                  scale)
+                  (aget buffer 3))
 
           heap (mem/get-heap-u8)
           heapu32 (mem/get-heap-u32)
@@ -3046,6 +2934,66 @@
           result (dr/read-image-bytes heap (+ offset 4) length)]
       (mem/free)
       result)))
+
+(defn render-shapes-pdf
+  "Renders each shape id as a page of one PDF. IDs are written to the
+  transfer buffer (same layout as `set-focus-mode`) before the call."
+  [shape-ids]
+  (when (and (initialized?) (seq shape-ids))
+    (let [ids    (vec shape-ids)
+          size   (mem/get-alloc-size ids UUID-U8-SIZE)
+          offset (mem/alloc->offset-32 size)
+          heap   (mem/get-heap-u32)
+
+          _ (reduce (fn [offset id]
+                      (mem.h32/write-uuid offset heap id))
+                    offset
+                    ids)
+
+          result-offset
+          (h/call wasm/internal-module "_render_shapes_pdf")
+
+          heapu8  (mem/get-heap-u8)
+          heapu32 (mem/get-heap-u32)
+          length  (aget heapu32 (mem/->offset-32 result-offset))
+          result  (dr/read-image-bytes heapu8 (+ result-offset 4) length)]
+      (mem/free)
+      result)))
+
+(defn pdf-export-begin!
+  "Opens a progressive multi-page PDF session."
+  []
+  (when (initialized?)
+    (h/call wasm/internal-module "_pdf_export_begin")))
+
+(defn pdf-export-add-page!
+  "Appends `shape-id` as the next page of the current PDF session."
+  [shape-id]
+  (when (initialized?)
+    (let [buffer (uuid/get-u32 shape-id)]
+      (h/call wasm/internal-module "_pdf_export_add_page"
+              (aget buffer 0)
+              (aget buffer 1)
+              (aget buffer 2)
+              (aget buffer 3)))))
+
+(defn pdf-export-finish
+  "Closes the PDF session and returns the encoded PDF bytes."
+  []
+  (when (initialized?)
+    (let [offset  (h/call wasm/internal-module "_pdf_export_finish")
+          heapu8  (mem/get-heap-u8)
+          heapu32 (mem/get-heap-u32)
+          length  (aget heapu32 (mem/->offset-32 offset))
+          result  (dr/read-image-bytes heapu8 (+ offset 4) length)]
+      (mem/free)
+      result)))
+
+(defn pdf-export-abort!
+  "Drops an in-flight PDF session without returning bytes."
+  []
+  (when (initialized?)
+    (h/call wasm/internal-module "_pdf_export_abort")))
 
 (defn render-shape-svg
   [shape-id scale]
@@ -3063,6 +3011,31 @@
           heapu32 (mem/get-heap-u32)
           length (aget heapu32 (mem/->offset-32 offset))
           result (dr/read-image-bytes heap (+ offset 4) length)]
+      (mem/free)
+      result)))
+
+(defn render-shapes-svg
+  "Renders the given shape ids into one SVG document (joined viewBox).
+  IDs are written to the transfer buffer (same layout as `render-shapes-pdf`)."
+  [shape-ids scale]
+  (when (and (initialized?) (seq shape-ids))
+    (let [ids    (vec shape-ids)
+          size   (mem/get-alloc-size ids UUID-U8-SIZE)
+          offset (mem/alloc->offset-32 size)
+          heap   (mem/get-heap-u32)
+
+          _ (reduce (fn [offset id]
+                      (mem.h32/write-uuid offset heap id))
+                    offset
+                    ids)
+
+          result-offset
+          (h/call wasm/internal-module "_render_shapes_svg" scale)
+
+          heapu8  (mem/get-heap-u8)
+          heapu32 (mem/get-heap-u32)
+          length  (aget heapu32 (mem/->offset-32 result-offset))
+          result  (dr/read-image-bytes heapu8 (+ result-offset 4) length)]
       (mem/free)
       result)))
 

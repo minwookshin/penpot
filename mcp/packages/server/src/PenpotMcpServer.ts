@@ -1,25 +1,31 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { createMcpHandler, McpServer, type McpHttpHandler } from "@modelcontextprotocol/server";
+import { toNodeHandler } from "@modelcontextprotocol/node";
+import type { Server as HttpServer } from "node:http";
+import type { Express } from "express";
+import { z } from "zod";
 import { AsyncLocalStorage } from "async_hooks";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ExecuteCodeTool } from "./tools/ExecuteCodeTool";
 import { PluginBridge } from "./PluginBridge";
 import { RedisBridge } from "./RedisBridge";
 import { ConfigurationLoader } from "./ConfigurationLoader";
+import { PenpotBackendClient } from "./PenpotBackendClient";
+import { SubmitFeedbackTool } from "./tools/SubmitFeedbackTool";
 import { createLogger } from "./logger";
 import { Tool } from "./Tool";
 import { HighLevelOverviewTool } from "./tools/HighLevelOverviewTool";
 import { PenpotApiInfoTool } from "./tools/PenpotApiInfoTool";
 import { ExportShapeTool } from "./tools/ExportShapeTool";
 import { ImportImageTool } from "./tools/ImportImageTool";
-import { CljsReplTool } from "./tools/CljsReplTool";
-import { ImportPenpotFileTool } from "./tools/ImportPenpotFileTool";
-import { CljsCompilerOutputTool } from "./tools/CljsCompilerOutputTool";
-import { CljCheckParentheses } from "./tools/CljCheckParentheses";
-import { ReadTaigaIssueTool } from "./tools/ReadTaigaIssueTool";
+import { CljsReplTool } from "./tools/dev/CljsReplTool";
+import { ImportPenpotFileTool } from "./tools/dev/ImportPenpotFileTool";
+import { CljsCompilerOutputTool } from "./tools/dev/CljsCompilerOutputTool";
+import { CljCheckParentheses } from "./tools/dev/CljCheckParentheses";
+import { ReadTaigaIssueTool } from "./tools/dev/ReadTaigaIssueTool";
 import { NreplClient } from "./NreplClient";
 import { ReplServer } from "./ReplServer";
 import { ApiDocs } from "./ApiDocs";
+import { McpAuthentication } from "./McpAuthentication";
+import { RequestGuard } from "./RequestGuard";
 
 /**
  * Session context for request-scoped data.
@@ -29,24 +35,13 @@ export interface SessionContext {
 }
 
 /**
- * Represents an active Streamable HTTP session, grouping the transport, MCP server, and session metadata.
- */
-class StreamableSession {
-    constructor(
-        public readonly transport: StreamableHTTPServerTransport,
-        public readonly userToken: string | undefined,
-        public lastActiveTime: number
-    ) {}
-}
-
-/**
  * Holds information about a registered tool, including its instance, name, and configuration.
  */
 class ToolInfo {
     constructor(
         public readonly instance: Tool<any>,
         public readonly name: string,
-        public readonly config: { description: string; inputSchema: any }
+        public readonly config: { description: string; inputSchema: z.ZodObject<z.ZodRawShape> }
     ) {}
 }
 
@@ -68,11 +63,6 @@ export function shouldStartReplServer(isReplEnabled: boolean, isMultiUserMode: b
 }
 
 export class PenpotMcpServer {
-    /**
-     * Timeout, in minutes, for idle sessions (Streamable HTTP and SSE) before they are automatically closed and removed.
-     */
-    private static readonly SESSION_TIMEOUT_MINUTES = 60;
-
     /**
      * Determines whether the server is running in a Penpot development
      * environment, based on the given environment variables.
@@ -122,7 +112,15 @@ export class PenpotMcpServer {
     private readonly logger = createLogger("PenpotMcpServer");
     private readonly tools: ToolInfo[];
     public readonly configLoader: ConfigurationLoader;
-    private app: any;
+    private app!: Express;
+    private httpServer?: HttpServer;
+    private readonly mcpHandler: McpHttpHandler;
+    private readonly authentication: McpAuthentication;
+
+    /**
+     * Check of the `Host` and `Origin` headers of HTTP and plugin WebSocket requests.
+     */
+    public readonly requestGuard: RequestGuard;
     public readonly pluginBridge: PluginBridge;
     private readonly replServer: ReplServer | null;
     private apiDocs: ApiDocs;
@@ -130,22 +128,15 @@ export class PenpotMcpServer {
     private readonly connectionInstructions: string;
 
     /**
-     * Manages session-specific context, particularly user tokens for each request.
+     * Carries the user token through each request and its asynchronous tool execution.
      */
     private readonly sessionContext = new AsyncLocalStorage<SessionContext>();
-
-    private readonly streamableTransports: Record<string, StreamableSession> = {};
-    private readonly sseTransports: Record<
-        string,
-        { transport: SSEServerTransport; userToken?: string; lastActiveTime: number }
-    > = {};
 
     public readonly host: string;
     public readonly port: number;
     public readonly webSocketPort: number;
     public readonly replHost: string;
     public readonly replPort: number;
-    private sessionTimeoutInterval: ReturnType<typeof setInterval> | undefined;
 
     /**
      * Optional Redis bridge for multi-instance task routing; present only when running
@@ -162,7 +153,16 @@ export class PenpotMcpServer {
      */
     private readonly tenant: string;
 
+    /**
+     * Maximum size of a JSON request body, read from the `PENPOT_MCP_MAX_BODY_SIZE` environment variable.
+     *
+     * Accepts any value supported by Express' `json` body parser (e.g. `"10mb"`). Defaults to `"10mb"`,
+     * since tool calls such as `execute_code` can carry large payloads.
+     */
+    private readonly maxBodySize: string;
+
     constructor(private isMultiUser: boolean = false) {
+        this.authentication = new McpAuthentication(process.env.PENPOT_MCP_AUTH_URI, isMultiUser);
         // read port configuration from environment variables
         this.host = process.env.PENPOT_MCP_SERVER_HOST ?? "localhost";
         this.port = parseInt(process.env.PENPOT_MCP_SERVER_PORT ?? "4401", 10);
@@ -170,7 +170,10 @@ export class PenpotMcpServer {
         this.replHost = process.env.PENPOT_MCP_REPL_HOST ?? "localhost";
         this.replPort = parseInt(process.env.PENPOT_MCP_REPL_PORT ?? "4403", 10);
         this.tenant = process.env.PENPOT_TENANT ?? "default";
+        this.maxBodySize = process.env.PENPOT_MCP_MAX_BODY_SIZE ?? "10mb";
         const toolTimeoutSecs = parseInt(process.env.PENPOT_MCP_TOOL_TIMEOUT_S ?? "120", 10);
+
+        this.requestGuard = RequestGuard.fromEnvironment(process.env, this.isMultiUserMode());
 
         this.configLoader = new ConfigurationLoader(process.cwd());
         this.apiDocs = new ApiDocs();
@@ -182,6 +185,7 @@ export class PenpotMcpServer {
         this.connectionInstructions = this.configLoader.getBaseInstructions();
 
         this.tools = this.initTools();
+        this.mcpHandler = createMcpHandler(() => this.createMcpServer());
 
         // Enable multi-instance task routing when running in multi-user mode with a
         // configured Redis URI. Without it, the server operates in single-instance mode,
@@ -194,7 +198,7 @@ export class PenpotMcpServer {
         this.pluginBridge = new PluginBridge(this, this.webSocketPort, toolTimeoutSecs, this.redisBridge);
 
         if (shouldStartReplServer(PenpotMcpServer.isReplEnabled(process.env), this.isMultiUserMode())) {
-            this.replServer = new ReplServer(this.pluginBridge, this.replPort, this.replHost);
+            this.replServer = new ReplServer(this.pluginBridge, this.requestGuard, this.replPort, this.replHost);
         } else {
             this.replServer = null;
         }
@@ -279,6 +283,10 @@ export class PenpotMcpServer {
         if (this.isFileSystemAccessEnabled()) {
             toolInstances.push(new ImportImageTool(this));
         }
+        const backendUri = process.env.PENPOT_MCP_BACKEND_URI?.trim();
+        if (backendUri) {
+            toolInstances.push(new SubmitFeedbackTool(this, new PenpotBackendClient(backendUri)));
+        }
         if (shouldRegisterDeveloperTools(this.isDevEnv(), this.isMultiUserMode())) {
             const nreplClient = new NreplClient();
             toolInstances.push(new CljsReplTool(this, nreplClient));
@@ -292,7 +300,7 @@ export class PenpotMcpServer {
             this.logger.info(`Registering tool: ${instance.getToolName()}`);
             return new ToolInfo(instance, instance.getToolName(), {
                 description: instance.getToolDescription(),
-                inputSchema: instance.getInputSchema(),
+                inputSchema: z.object(instance.getInputSchema()),
             });
         });
     }
@@ -307,181 +315,56 @@ export class PenpotMcpServer {
         );
 
         for (const tool of this.tools) {
-            server.registerTool(tool.name, tool.config, async (args: any) => tool.instance.execute(args));
+            server.registerTool(tool.name, tool.config, async (args) => tool.instance.execute(args));
         }
 
         return server;
     }
 
-    /**
-     * Starts a periodic timer that closes and removes Streamable HTTP and SSE sessions that have been
-     * idle for longer than {@link SESSION_TIMEOUT_MINUTES}.
-     */
-    private startSessionTimeoutChecker(): void {
-        const timeoutMs = PenpotMcpServer.SESSION_TIMEOUT_MINUTES * 60 * 1000;
-        const checkIntervalMs = timeoutMs / 2;
-        this.sessionTimeoutInterval = setInterval(() => {
-            this.logger.info("Checking for stale sessions...");
-            const now = Date.now();
-            let removed = 0;
-            for (const session of Object.values(this.streamableTransports)) {
-                if (now - session.lastActiveTime > timeoutMs) {
-                    session.transport.close();
-                    removed++;
-                }
-            }
-            for (const [id, session] of Object.entries(this.sseTransports)) {
-                if (now - session.lastActiveTime > timeoutMs) {
-                    this.logger.info(`Closing stale SSE session ${id}`);
-                    session.transport.close();
-                    delete this.sseTransports[id];
-                    removed++;
-                }
+    private setupHttpEndpoints(): void {
+        const handleMcpRequest = toNodeHandler(this.mcpHandler);
+        this.app.all("/mcp", async (req, res) => {
+            const authResult = this.authentication.authenticate(req, res);
+            if (authResult.isRejected) {
+                return;
             }
             this.logger.info(
-                `Removed ${removed} stale session(s); total sessions remaining: ${
-                    Object.keys(this.streamableTransports).length + Object.keys(this.sseTransports).length
-                }`
+                `Received MCP request: method=${req.body?.method ?? "<none>"}; userTokenFp=${PenpotMcpServer.tokenFingerprint(authResult.userToken)}`
             );
-        }, checkIntervalMs);
-    }
-
-    private setupHttpEndpoints(): void {
-        /**
-         * Modern Streamable HTTP connection endpoint.
-         *
-         * New sessions are created on initialize requests (no mcp-session-id header).
-         * Subsequent requests for an existing session are routed to the stored transport,
-         * with the session context populated from the stored userToken.
-         */
-        this.app.all("/mcp", async (req: any, res: any) => {
-            const sessionId = req.headers["mcp-session-id"] as string | undefined;
-            let userToken: string | undefined = undefined;
-            let transport: StreamableHTTPServerTransport;
-
-            // obtain transport and user token for the session, either from an existing session or by creating a new one
-            if (sessionId && this.streamableTransports[sessionId]) {
-                // existing session: reuse stored transport and token
-                const session = this.streamableTransports[sessionId];
-                transport = session.transport;
-                userToken = session.userToken;
-                session.lastActiveTime = Date.now();
-                this.logger.info(
-                    `Received request for existing session with id=${sessionId}; userTokenFp=${PenpotMcpServer.tokenFingerprint(session.userToken)}`
-                );
-            } else {
-                // No locally-known session for this request. Either a brand-new session
-                // (no session ID) or a session that was initialized on another instance
-                // and routed here by the load balancer (session ID present but unknown
-                // locally), which we adopt rather than reject.
-                const isAdoptedSession = sessionId !== undefined;
-                userToken = req.query.userToken as string | undefined;
-                this.logger.info(
-                    `${isAdoptedSession ? `Adopting session initialized on another instance with id=${sessionId}` : "Received new session request"}; userTokenFp=${PenpotMcpServer.tokenFingerprint(userToken)}`
-                );
-
-                const { randomUUID } = await import("node:crypto");
-                const server = this.createMcpServer();
-                transport = new StreamableHTTPServerTransport({
-                    // For an adopted session, reuse the existing ID; otherwise generate a new one.
-                    sessionIdGenerator: () => (isAdoptedSession ? sessionId! : randomUUID()),
-                    onsessioninitialized: (id) => {
-                        this.streamableTransports[id] = new StreamableSession(transport, userToken, Date.now());
-                        this.logger.info(
-                            `Session initialized with id=${id} for userTokenFp=${PenpotMcpServer.tokenFingerprint(userToken)}; total sessions: ${Object.keys(this.streamableTransports).length}`
-                        );
-                    },
-                });
-
-                if (isAdoptedSession) {
-                    // Pre-initialize the transport so that the SDK's validateSession() accepts
-                    // subsequent (non-initialize) requests for this session ID. The SDK stores
-                    // these on the inner WebStandardStreamableHTTPServerTransport as plain
-                    // (non-#private) properties; validateSession() checks exactly _initialized
-                    // and sessionId. Verified against @modelcontextprotocol/sdk 1.25.3.
-                    //
-                    // Since no initialize request will arrive for an adopted session, the
-                    // onsessioninitialized callback will not fire; register the session here.
-                    const inner = (transport as any)._webStandardTransport;
-                    inner._initialized = true;
-                    inner.sessionId = sessionId;
-                    this.streamableTransports[sessionId!] = new StreamableSession(transport, userToken, Date.now());
-                }
-
-                transport.onclose = () => {
-                    if (transport.sessionId) {
-                        this.logger.info(
-                            `Closing session with id=${transport.sessionId} for userTokenFp=${PenpotMcpServer.tokenFingerprint(userToken)}`
-                        );
-                        delete this.streamableTransports[transport.sessionId];
-                    }
-                };
-                await server.connect(transport);
-            }
-
-            // handle the request
-            await this.sessionContext.run({ userToken }, async () => {
-                await transport.handleRequest(req, res, req.body);
-            });
-        });
-
-        /**
-         * Legacy SSE connection endpoint.
-         */
-        this.app.get("/sse", async (req: any, res: any) => {
-            const userToken = req.query.userToken as string | undefined;
-
-            await this.sessionContext.run({ userToken }, async () => {
-                const transport = new SSEServerTransport("/messages", res);
-                this.sseTransports[transport.sessionId] = { transport, userToken, lastActiveTime: Date.now() };
-
-                const server = this.createMcpServer();
-                await server.connect(transport);
-                res.on("close", () => {
-                    delete this.sseTransports[transport.sessionId];
-                    server.close();
-                });
-            });
-        });
-
-        /**
-         * SSE message POST endpoint (using previously established session)
-         */
-        this.app.post("/messages", async (req: any, res: any) => {
-            const sessionId = req.query.sessionId as string;
-            const session = this.sseTransports[sessionId];
-
-            if (session) {
-                session.lastActiveTime = Date.now();
-                await this.sessionContext.run({ userToken: session.userToken }, async () => {
-                    await session.transport.handlePostMessage(req, res, req.body);
-                });
-            } else {
-                res.status(400).send("No transport found for sessionId");
-            }
+            await this.sessionContext.run({ userToken: authResult.userToken }, () =>
+                handleMcpRequest(req, res, req.body)
+            );
         });
     }
 
     async start(): Promise<void> {
         const { default: express } = await import("express");
         this.app = express();
-        this.app.use(express.json());
+        this.app.use(this.requestGuard.httpMiddleware);
+        this.app.use(express.json({ limit: this.maxBodySize }));
 
         this.setupHttpEndpoints();
 
-        return new Promise((resolve) => {
-            this.app.listen(this.port, this.host, async () => {
+        return new Promise((resolve, reject) => {
+            this.httpServer = this.app.listen(this.port, this.host, async () => {
                 this.logger.info(`Multi-user mode: ${this.isMultiUserMode()}`);
+                this.logger.info(`OAuth enabled: ${this.authentication.isOAuthEnabled}`);
                 this.logger.info(
                     `Multi-instance mode with Redis-backed transport: ${this.redisBridge ? "true" : "false"}`
                 );
                 this.logger.info(`Remote mode: ${this.isRemoteMode()}`);
                 this.logger.info(`DevEnv mode: ${this.isDevEnv()}`);
+                this.logger.info(`Allowed hosts and origins: ${this.requestGuard.describe()}`);
+                if (this.requestGuard.allowsAny() && !this.isMultiUserMode()) {
+                    this.logger.warn(
+                        "Host and Origin check is off and no user token is required: " +
+                            "any web page opened in a browser that reaches this server can drive it"
+                    );
+                }
                 this.logger.info(`Modern Streamable HTTP endpoint: http://${this.host}:${this.port}/mcp`);
-                this.logger.info(`Legacy SSE endpoint: http://${this.host}:${this.port}/sse`);
                 this.logger.info(`WebSocket server URL: ws://${this.host}:${this.webSocketPort}`);
 
-                // start the REPL server (devenv only) and session timeout checker
+                // start the REPL server when enabled
                 if (this.replServer) {
                     await this.replServer.start();
                 } else if (this.isMultiUserMode()) {
@@ -491,10 +374,10 @@ export class PenpotMcpServer {
                         "REPL server disabled (set PENPOT_MCP_REPL_ENABLE=true or PENPOT_MCP_DEVENV=true to enable)"
                     );
                 }
-                this.startSessionTimeoutChecker();
 
                 resolve();
             });
+            this.httpServer.once("error", reject);
         });
     }
 
@@ -505,7 +388,13 @@ export class PenpotMcpServer {
      */
     public async stop(): Promise<void> {
         this.logger.info("Stopping Penpot MCP Server...");
-        clearInterval(this.sessionTimeoutInterval);
+        const httpClosed = this.httpServer
+            ? new Promise<void>((resolve, reject) => {
+                  this.httpServer!.close((error) => (error ? reject(error) : resolve()));
+              })
+            : Promise.resolve();
+        await this.mcpHandler.close();
+        await httpClosed;
         await this.pluginBridge.close();
         await this.redisBridge?.close();
         if (this.replServer) {

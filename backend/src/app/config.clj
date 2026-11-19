@@ -10,6 +10,7 @@
    [app.common.data :as d]
    [app.common.exceptions :as ex]
    [app.common.flags :as flags]
+   [app.common.logging :as l]
    [app.common.schema :as sm]
    [app.common.time :as ct]
    [app.common.uri :as u]
@@ -49,6 +50,9 @@
 
    :host "localhost"
    :tenant "default"
+   ;; The SaaS host also sets penpotIsSaas in the browser. Keep this server
+   ;; value in sync so Admin Console can query the same deployment type.
+   :is-saas false
 
    :redis-uri "redis://redis/0"
 
@@ -58,7 +62,6 @@
    :objects-storage-fs-directory "assets"
 
    :auth-token-cookie-name "auth-token"
-   :auth-token-cookie-max-age-absolute (ct/duration {:days 30})
 
    :assets-path "/internal/assets/"
    :smtp-default-reply-to "Penpot <no-reply@example.com>"
@@ -70,7 +73,15 @@
    :profile-bounce-max-age (ct/duration {:days 7})
    :profile-bounce-threshold 10
 
+   :login-lockout-max-attempts 5
+   :login-lockout-window (ct/duration "15m")
+
    :telemetry-uri "https://telemetry.penpot.app/"
+
+   :jobs-lease (ct/duration {:minutes 30})
+   :jobs-retention (ct/duration {:days 7})
+   :jobs-user-ttl (ct/duration {:days 7})
+   :jobs-request-timeout (ct/duration {:minutes 2})
 
    :media-max-file-size (* 1024 1024 30) ; 30MiB
    :font-max-file-size  (* 1024 1024 30) ; 30MiB
@@ -92,11 +103,43 @@
 
    :quotes-upload-sessions-per-profile 5
    :quotes-upload-chunks-per-session 20
+   :quotes-export-jobs-per-profile 10
+   :quotes-import-jobs-per-profile 10
    :upload-max-chunk-size (* 1024 1024 30) ; 30MiB
 
    ;; SSRF protection
    :ssrf-allowed-hosts #{}
    :ssrf-extra-blocked-cidrs #{}})
+
+(def schema:tenant
+  "Tenant identifier: hostname-label-style, lowercase (letters, digits
+  and hyphens). The value is normalized to lowercase when the
+  configuration is read, so an operator writing `PENPOT_TENANT=ACME` and
+  one writing `acme` name the same tenant: the value is compared as an
+  exact string in the keys and rows it lands in, and one uppercase
+  letter would otherwise split one tenant into two.
+
+  It is interpolated into Redis keys separated by dots (msgbus
+  topics, rate-limit buckets, exporter job keys, which are also matched
+  with a glob pattern), so `.` and whitespace are rejected at startup
+  because one tenant would then be able to read or overwrite another's
+  keys.
+
+  `%`, `_` and `:` are rejected too, and the reason they were added is
+  gone: the job queue used to be filtered with a LIKE over a
+  `<tenant>:<queue>` prefix and now has a `tenant` column. They are kept
+  because narrowing the rule is a startup contract change with no real
+  tenant asking for it, and a tenant that has one would have to be
+  renamed. Tenants using those characters must be renamed before
+  upgrading."
+  [:re #"^[a-z0-9-]+$"])
+
+(defn- normalize-tenant
+  "Lowercase the configured tenant before it is validated, so
+  `PENPOT_TENANT=ACME` and `acme` mean the same tenant everywhere."
+  [config]
+  (cond-> config
+    (string? (:tenant config)) (update :tenant str/lower)))
 
 (def schema:config
   (do #_sm/optional-keys
@@ -105,7 +148,8 @@
     [:admins {:optional true} [::sm/set ::sm/email]]
     [:secret-key {:optional true} :string]
 
-    [:tenant {:optional false} :string]
+    [:tenant {:optional false} schema:tenant]
+    [:is-saas ::sm/boolean]
     [:public-uri {:optional false} ::sm/uri]
     [:host {:optional false} :string]
 
@@ -114,6 +158,10 @@
     [:http-server-max-body-size {:optional true} ::sm/int]
     [:http-server-io-threads {:optional true} ::sm/int]
     [:http-server-max-worker-threads {:optional true} ::sm/int]
+
+    ;; How often a websocket subscription re-checks that its access still
+    ;; holds. The default lives in `app.http.websocket`, not here.
+    [:subscription-revalidation-interval {:optional true} ::ct/duration]
 
     ;; Explicit CORS allowlist used when the :cors flag is enabled.
     ;; Configured via PENPOT_ALLOWED_ORIGINS as a comma/whitespace
@@ -159,25 +207,37 @@
     [:binfile-import-max-text-total-size {:optional true} ::sm/int]
     [:binfile-import-max-zip-entries {:optional true} ::sm/int]
 
+    ;; Max serialized size of profile props in bytes (default 2 MiB)
+    [:profile-props-max-size {:optional true} ::sm/int]
+
+    [:login-lockout-max-attempts {:optional true} ::sm/int]
+    [:login-lockout-window {:optional true} ::ct/duration]
+
     [:deletion-delay {:optional true} ::ct/duration]
     [:file-clean-delay {:optional true} ::ct/duration]
+    [:jobs-lease {:optional true} ::ct/duration]
+    [:jobs-retention {:optional true} ::ct/duration]
+    [:jobs-user-ttl {:optional true} ::ct/duration]
+    [:jobs-request-timeout {:optional true} ::ct/duration]
     [:telemetry-enabled {:optional true} ::sm/boolean]
     [:default-blob-version {:optional true} ::sm/int]
     [:allow-demo-users {:optional true} ::sm/boolean]
     [:error-report-webhook {:optional true} :string]
     [:user-feedback-destination {:optional true} :string]
+    [:mcp-feedback-email {:optional true} ::sm/email]
 
     [:default-rpc-rlimit {:optional true} [::sm/vec :string]]
     [:rpc-rlimit-config {:optional true} ::fs/path]
     [:rpc-climit-config {:optional true} ::fs/path]
 
-    [:audit-log-archive-uri {:optional true} :string]
+    [:nexus-uri {:optional true} ::sm/uri]
     [:audit-log-http-handler-concurrency {:optional true} ::sm/int]
 
     [:default-executor-parallelism {:optional true} ::sm/int] ;; REVIEW
-    [:scheduled-executor-parallelism {:optional true} ::sm/int] ;; REVIEW
     [:worker-default-parallelism {:optional true} ::sm/int]
     [:worker-webhook-parallelism {:optional true} ::sm/int]
+    [:worker-cron-parallelism {:optional true} ::sm/int]
+    [:worker-binfile-parallelism {:optional true} ::sm/int]
 
     [:database-password {:optional true} [:maybe :string]]
     [:database-uri {:optional true} ::sm/uri]
@@ -185,6 +245,12 @@
     [:database-readonly {:optional true} ::sm/boolean]
     [:database-min-pool-size {:optional true} ::sm/int]
     [:database-max-pool-size {:optional true} ::sm/int]
+    ;; pgjdbc prepared statement cache (see app.db). Size is in bytes and is
+    ;; converted to the whole MiB the driver accepts. Absent keys mean the
+    ;; driver defaults; see docs/technical-guide/configuration.md.
+    [:database-prepared-statement-cache-threshold {:optional true} [::sm/int {:min -1}]]
+    [:database-prepared-statement-cache-queries {:optional true} [::sm/int {:min 0}]]
+    [:database-prepared-statement-cache-size {:optional true} [::sm/int {:min 0}]]
 
     [:quotes-teams-per-profile {:optional true} ::sm/int]
     [:quotes-access-tokens-per-profile {:optional true} ::sm/int]
@@ -196,6 +262,8 @@
     [:quotes-font-variants-per-team {:optional true} ::sm/int]
     [:quotes-comment-threads-per-file {:optional true} ::sm/int]
     [:quotes-comments-per-file {:optional true} ::sm/int]
+    [:quotes-export-jobs-per-profile {:optional true} ::sm/int]
+    [:quotes-import-jobs-per-profile {:optional true} ::sm/int]
     [:quotes-snapshots-per-file {:optional true} ::sm/int]
     [:quotes-snapshots-per-team {:optional true} ::sm/int]
     [:quotes-team-access-requests-per-team {:optional true} ::sm/int]
@@ -294,6 +362,10 @@
     [:objects-storage-s3-region {:optional true} :keyword]
     [:objects-storage-s3-endpoint {:optional true} ::sm/uri]
 
+    ;; Write storage_object.metadata as plain JSON instead of
+    ;; Transit-JSON. Unset by default (Phase 1: keep writing Transit).
+    [:storage-metadata-as-json {:optional true} ::sm/boolean]
+
     ;; SSRF protection
     [:ssrf-allowed-hosts {:optional true} [::sm/set :string]]
     [:ssrf-extra-blocked-cidrs {:optional true} [::sm/set :string]]]))
@@ -347,13 +419,31 @@
 (def explain-config
   (sm/explainer schema:config))
 
+(defn- normalize-file-data-backend
+  "The file data moved to `file_data` (migration `0157-migrate-legacy-file-data`), so
+  `file.data` and `file_change.data` are read-only leftovers and the `legacy-db`
+  back end is read-only: a write against it fails on every save. Accepting it would
+  start a healthy instance that cannot save a single file, so it reads as `db`,
+  which serves the legacy rows too. Warn instead of aborting: the operator may
+  still be halfway through the migration."
+  [config]
+  (if (= "legacy-db" (c/get config :file-data-backend))
+    (do
+      (l/warn :hint "file-data-backend=legacy-db is read-only, using db"
+              :file-data-backend "legacy-db"
+              :replacement "db")
+      (assoc config :file-data-backend "db"))
+    config))
+
 (defn read-config
   "Reads the configuration from environment variables and decodes all
   known values."
   [& {:keys [prefix default] :or {prefix "penpot"}}]
   (->> (read-env prefix)
        (merge default)
-       (decode-config)))
+       (normalize-tenant)
+       (decode-config)
+       (normalize-file-data-backend)))
 
 (def version
   (v/parse (or (some-> (io/resource "version.txt")
@@ -406,6 +496,41 @@
   :public-uri. With no segments, returns the normalized base."
   [& segments]
   (apply join-uri (c/get config :public-uri) segments))
+
+(defn get-jobs-lease
+  "Max time a job can run without touching modified_at (heartbeat or
+  progress) before the dispatcher marks it as `aborted` (system-side
+  terminal, never retried, reported with an error log)."
+  []
+  (or (c/get config :jobs-lease)
+      (ct/duration {:minutes 30})))
+
+(defn get-jobs-request-timeout
+  "Default timeout for the ephemeral request! calls (waiting for the
+  reply-key blpop); can be overridden per call. Any override is applied
+  by raising the pooled connection command timeout for the duration of
+  the call, which the pool restores on return."
+  []
+  (or (c/get config :jobs-request-timeout)
+      (ct/duration {:minutes 2})))
+
+(defn get-jobs-retention
+  "How long terminal (completed/failed/cancelled/aborted) internal job rows are
+  kept before the jobs GC deletes them. The legacy `task` table is not
+  touched by the jobs GC: while both versions run in parallel it is
+  cleaned by the legacy `tasks-gc` of that version."
+  []
+  (or (c/get config :jobs-retention)
+      (ct/duration {:days 7})))
+
+(defn get-jobs-user-ttl
+  "How long a user-facing job, and the artifact it owns, is kept before
+  the jobs GC deletes the row and marks the object for the storage GC.
+  Not the same as `:jobs-retention`, which only sweeps terminal internal
+  rows."
+  []
+  (or (c/get config :jobs-user-ttl)
+      (ct/duration {:days 7})))
 
 (defn get
   "A configuration getter. Helps code be more testable."

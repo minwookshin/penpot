@@ -11,7 +11,7 @@
    [app.common.data :as d]
    [app.common.exceptions :as ex]
    [app.common.uuid :as uuid]
-   [app.main.data.auth :refer [is-authenticated?]]
+   [app.main.data.auth :as da :refer [is-authenticated?]]
    [app.main.data.common :as dcm]
    [app.main.data.nitrate :as dnt]
    [app.main.errors :as errors]
@@ -125,13 +125,23 @@
         success-register
         (mf/use-fn
          (fn [data]
-           (reset! register-token (:token data))
-           (reset! current-section :register-validate)))
+           (cond
+             (:invitation-token data)
+             (st/emit! (da/login-from-register
+                        {:invitation-token (:invitation-token data)}))
+
+             (:is-active data)
+             (st/emit! (rt/reload true))
+
+             :else
+             (do
+               (reset! user-email (:email data))
+               (reset! current-section :register-email-sent)))))
 
         register-email-sent
         (mf/use-fn
-         (fn [email]
-           (reset! user-email email)
+         (fn [data]
+           (reset! user-email (if (string? data) data (:email data)))
            (reset! current-section :register-email-sent)))
 
         recovery-email-sent
@@ -167,8 +177,10 @@
           [:div {:class (stl/css :change-section)}
            (tr "auth.register")
            " "
-           [:a {:data-section "register"
-                :on-click set-section}
+           [:button {:type "button"
+                     :class (stl/css :link)
+                     :data-section "register"
+                     :on-click set-section}
             (tr "auth.register-submit")]]]
 
          :register
@@ -181,8 +193,11 @@
           [:div {:class (stl/css :change-section)}
            (tr "auth.already-have-account")
            " "
-           [:a {:data-section "login"
-                :on-click set-section} (tr "auth.login-here")]]
+           [:button {:type "button"
+                     :class (stl/css :link)
+                     :data-section "login"
+                     :on-click set-section}
+            (tr "auth.login-here")]]
           [:div {:class (stl/css :links)}
            [:hr {:class (stl/css :separator)}]
            [:> register/terms-service-privacy-policy*]]]
@@ -355,7 +370,7 @@
      [:span
       (tr "labels.nitrate-not-configured.learn-more")
       " "
-      [:a {:href "https://help.penpot.app/technical-guide/getting-started/"
+      [:a {:href "https://help.penpot.app/technical-guide/getting-started/docker/#update-penpot"
            :target "_blank"
            :rel "noopener noreferrer"}
        (tr "labels.nitrate-not-configured.technical-guide")]]]]
@@ -415,7 +430,10 @@
       [:p {:class (stl/css :desc-text)} (tr "labels.internal-error.desc-message-second")]]
 
      (when (some? report)
-       [:a {:class (stl/css :download-link) :on-click on-download} (tr "labels.download" "report.txt")])
+       [:button {:type "button"
+                 :class (stl/css :download-link)
+                 :on-click on-download}
+        (tr "labels.download" "report.txt")])
 
      [:div {:class (stl/css :buttons-container)}
       [:> button* {:variant "secondary"
@@ -506,11 +524,13 @@
   SSO exchange with the identity provider fails."
   {::mf/private true}
   [{:keys [organization-id team-id profile is-workspace is-dashboard organization-name]}]
-  (let [clean-url
+  (let [clean-token
         (mf/with-memo []
-          (-> (rt/get-current-href)
+          (-> (rt/get-current-token)
               (dom/remove-query-param :sso-error)
               (dom/remove-query-param :organization-id)))
+
+        clean-url (rt/token->url clean-token)
 
         _ (mf/with-effect []
             ;; Consume the marker once: scrub it from the URL bar so a
@@ -527,14 +547,14 @@
 
         on-retry
         (mf/use-fn
-         (mf/deps organization-id team-id clean-url)
+         (mf/deps organization-id team-id clean-token)
          (fn []
            (st/emit! (rt/assign-exception nil))
            (if (or team-id organization-id)
              ;; Retry with team-id and/or organization-id to trigger SSO check
              (st/emit! (dnt/retry-organization-sso {:team-id team-id
                                                     :organization-id organization-id
-                                                    :dest-url clean-url}))
+                                                    :query-string (rt/token->query-string clean-token)}))
              ;; Fallback: just navigate to clean URL
              (st/emit! (rt/nav-raw :uri clean-url)))))]
 
@@ -551,21 +571,25 @@
 (mf/defc exception-section*
   {::mf/private true}
   [{:keys [data] :as props}]
-  (let [type   (get data :type)
-        cause  (get data ::errors/instance)
+  (let [type        (get data :type)
+        cause       (get data ::errors/instance)
+        environment (errors/environment-error? cause)
 
-        report (mf/with-memo [cause]
-                 (when (ex/exception? cause)
-                   (errors/generate-report cause)))
+        report      (mf/with-memo [cause]
+                      (when (ex/exception? cause)
+                        (errors/generate-report cause {:format (if environment :compact :full)})))
 
-        props  (mf/spread-props props {:report report})]
+        props       (mf/spread-props props {:report report})]
 
     (mf/with-effect [report type cause]
       (when (and (ex/exception? cause)
                  (not (contains? #{:not-found :authentication} type)))
-        (errors/submit-report :event-name "exception-page"
+        ;; Environment pages are audit-only: they use the canonical
+        ;; `handled-exception` event instead of `exception-page`.
+        (errors/submit-report :event-name (if environment "handled-exception" "exception-page")
                               :report report
-                              :hint (ex/get-hint cause))))
+                              :hint (ex/get-hint cause)
+                              :cause cause)))
 
     (case type
       :not-found
@@ -596,16 +620,37 @@
 
       [:> internal-error* props])))
 
+(defn screen-kind
+  "Classify the `screen` query param for the exception page.
+
+  The param carries the route name (`?screen=<name>&params`), so the
+  viewer is \"viewer\" and every team dashboard is \"dashboard-*\". Returns
+  `:workspace`, `:dashboard`, `:viewer`, or nil when the screen is not a
+  request-access candidate. Reads the param with `rt/get-query-param`
+  because a repeated param arrives as a vector."
+  [query-params]
+  (let [screen (rt/get-query-param query-params :screen)]
+    (cond
+      (= screen "workspace")
+      :workspace
+
+      (and (string? screen)
+           (str/starts-with? screen "dashboard"))
+      :dashboard
+
+      (= screen "viewer")
+      :viewer)))
+
 (mf/defc exception-page*
   [{:keys [data route] :as props}]
 
   (let [type        (:type data)
-        path        (:path route)
         params      (:query-params route)
 
-        workspace?  (str/includes? path "workspace")
-        dashboard?  (str/includes? path "dashboard")
-        view?       (str/includes? path "view")
+        kind        (screen-kind params)
+        workspace?  (= kind :workspace)
+        dashboard?  (= kind :dashboard)
+        view?       (= kind :viewer)
 
         ;; We store the request access info int this state
         info*       (mf/use-state nil)

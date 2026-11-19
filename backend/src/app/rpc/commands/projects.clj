@@ -15,16 +15,17 @@
    [app.db :as db]
    [app.db.sql :as-alias sql]
    [app.features.logical-deletion :as ldel]
+   [app.jobs :as jobs]
    [app.loggers.audit :as-alias audit]
    [app.loggers.webhooks :as webhooks]
    [app.rpc :as-alias rpc]
    [app.rpc.commands.teams :as teams]
    [app.rpc.doc :as-alias doc]
    [app.rpc.helpers :as rph]
+   [app.rpc.notifications :as ntf]
    [app.rpc.permissions :as perms]
    [app.rpc.quotes :as quotes]
-   [app.util.services :as sv]
-   [app.worker :as wrk]))
+   [app.util.services :as sv]))
 
 ;; --- Check Project Permissions
 
@@ -41,8 +42,13 @@
           ppr.is_admin,
           ppr.can_edit
      from project_profile_rel as ppr
+    inner join project as p on (p.id = ppr.project_id)
     where ppr.project_id = ?
-      and ppr.profile_id = ?")
+      and ppr.profile_id = ?
+      and exists (select 1
+                    from team_profile_rel as tpr
+                   where tpr.team_id = p.team_id
+                     and tpr.profile_id = ppr.profile_id)")
 
 (defn- get-permissions
   [conn profile-id project-id]
@@ -143,7 +149,12 @@
     inner join team as t on (t.id = p2.team_id)
     where p2.id in (select project_id
                      from project_profile_rel as ppr
+                    inner join project as p on (p.id = ppr.project_id)
                     where ppr.profile_id = ?
+                      and exists (select 1
+                                    from team_profile_rel as tpr
+                                   where tpr.team_id = p.team_id
+                                     and tpr.profile_id = ppr.profile_id)
                       and (ppr.can_edit = true or
                            ppr.is_owner = true or
                            ppr.is_admin = true))
@@ -212,8 +223,9 @@
                       ::quotes/profile-id profile-id
                       ::quotes/team-id team-id})
 
-  (let [params (assoc params :profile-id profile-id)]
-    (db/tx-run! cfg create-project params)))
+  (let [params  (assoc params :profile-id profile-id)
+        project (db/tx-run! cfg create-project params)]
+    (rph/with-meta project {::audit/props {:id (:id project)}})))
 
 ;; --- MUTATION: Toggle Project Pin
 
@@ -272,7 +284,7 @@
 ;; --- MUTATION: Delete Project
 
 (defn- delete-project
-  [conn team project-id]
+  [{:keys [::db/conn] :as cfg} team project-id]
   (let [delay   (ldel/get-deletion-delay team)
         project (db/update! conn :project
                             {:deleted-at (ct/in-future delay)}
@@ -284,11 +296,11 @@
                 :code :non-deletable-project
                 :hint "impossible to delete default project"))
 
-    (wrk/submit! {::db/conn conn
-                  ::wrk/task :delete-object
-                  ::wrk/params {:object :project
-                                :deleted-at (:deleted-at project)
-                                :id project-id}})
+    (jobs/submit cfg
+                 {::jobs/name :delete-object
+                  ::jobs/params {:object :project
+                                 :deleted-at (:deleted-at project)
+                                 :id project-id}})
 
     project))
 
@@ -302,12 +314,18 @@
    ::sm/params schema:delete-project
    ::webhooks/event? true
    ::db/transaction true}
-  [{:keys [::db/conn]} {:keys [::rpc/profile-id id] :as params}]
+  [{:keys [::db/conn] :as cfg} {:keys [::rpc/profile-id id] :as params}]
   (check-edition-permissions! conn profile-id id)
   (let [team    (teams/get-team conn
                                 :profile-id profile-id
                                 :project-id id)
-        project (delete-project conn team id)]
+        project (delete-project cfg team id)]
+
+    ;; Deleting the project ends read access for whoever had one of its
+    ;; files open, so the whole team is announced and the watcher
+    ;; re-checks each member against the subscriptions they hold.
+    (ntf/notify-team-permissions-changed cfg (:id team))
+
     (rph/with-meta (rph/wrap)
       {::audit/props {:team-id (:team-id project)
                       :name (:name project)

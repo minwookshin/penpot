@@ -5,67 +5,207 @@
 ;; Copyright (c) KALEIDOS SUBSIDIARY SL
 
 (ns frontend-tests.data.persistence-test
+  "Tests for the file persistence save pipeline (`app.main.data.persistence`):
+  read-only saves, the stalled-save watchdog, the core save pipeline
+  (queueing, failures, recovery), and the transient/terminal failure
+  classification. Retry-episode behavior lives in
+  `frontend-tests.data.persistence-retry-test`, the rollback of a partly
+  rejected save in `frontend-tests.data.persistence-rollback-test`.
+
+  The watchdog and read-only tests are fully async: `mock/with-mocks*`
+  installs the doubles, `^:async` bodies `await` observable effects (never
+  assert straight after a trigger), and completion propagates through
+  promises — test code threads no `done`. The remaining tests still use
+  `mock/with-mocks` with an explicit `done` chain."
   (:require
    [app.common.time :as ct]
+   [app.common.types.shape :as cts]
    [app.common.uuid :as uuid]
    [app.main.data.changes :as dch]
+   [app.main.data.event :as ev]
    [app.main.data.persistence :as dps]
+   [app.main.data.persistence.commits :as pcm]
    [app.main.data.render-wasm :as drw]
+   [app.main.data.workspace :as dw]
+   [app.main.data.workspace.common :as dwc]
    [app.main.errors :as errors]
+   [app.main.refs :as refs]
    [app.main.repo :as rp]
    [app.main.store :as st]
    [app.util.i18n :as i18n]
    [beicon.v2.core :as rx]
    [cljs.test :as t :include-macros true]
+   [frontend-tests.helpers.async :as async]
    [frontend-tests.helpers.mock :as mock]
+   [frontend-tests.helpers.persistence :as thp :refer [local-commit with-persistence]]
+   [okulary.core :as l]
    [potok.v2.core :as ptk]))
 
-(defn- local-commit
-  [file-id]
-  (ptk/data-event ::dch/commit
-                  {:id (uuid/next)
-                   :file-id file-id
-                   :file-revn 0
-                   :file-vern 0
-                   :source :local
-                   :features #{}
-                   :redo-changes [{:type :mod-page :id (uuid/next) :name "Edited"}]
-                   :undo-changes []}))
+(t/deftest reopening-restores-only-the-retained-edits-of-the-loaded-file
+  (doseq [[status cause-type vern restored?]
+          [[:retrying nil 0 true]
+           [:saving nil 0 true]
+           [:error :offline 0 true]
+           [:error :validation 0 false]
+           [:retrying nil 1 false]]]
+    (t/testing (str status " / " cause-type " / version " vern)
+      (let [file-id  (uuid/next)
+            page-id  (uuid/next)
+            shape-id (uuid/next)
+            first-id (uuid/next)
+            next-id  (uuid/next)
+            other-id (uuid/next)
+            shape    (cts/setup-shape {:id shape-id :type :rect :x 0 :y 0})
+            file     {:id file-id
+                      :vern vern
+                      :data {:pages [page-id]
+                             :pages-index {page-id {:id page-id :name "Page"
+                                                    :objects {uuid/zero
+                                                              (cts/setup-shape {:id uuid/zero :type :frame})}}}}}
+            pstate   {:status status
+                      :error {:cause-type cause-type :commit-id first-id}
+                      :queue (into #queue [] [first-id next-id other-id])
+                      :index {first-id {:file-id file-id :file-vern 0
+                                        :commits [{:redo-changes [{:type :add-obj :id shape-id :obj shape
+                                                                   :page-id page-id :parent-id uuid/zero
+                                                                   :frame-id uuid/zero}]}]}
+                              next-id {:file-id file-id :file-vern 0
+                                       :commits [{:redo-changes [(thp/rename page-id shape-id "Retained rectangle")]}]}
+                              other-id {:file-id (uuid/next) :file-vern 0
+                                        :commits [{:redo-changes [(thp/rename page-id shape-id "Another file")]}]}}}
+            state    {:persistence pstate}
+            loaded   (ptk/update (#'dw/bundle-fetched {:file file :file-id file-id :thumbnails {}})
+                                 state)
+            restored (get-in loaded [:files file-id :data :pages-index page-id :objects shape-id])]
+        (t/is (= restored? (some? restored)))
+        (when restored?
+          (t/is (= "Retained rectangle" (:name restored))
+                "queued edits apply in order and exclude other files"))
+        (if (zero? vern)
+          (t/is (identical? pstate (:persistence loaded))
+                "restoring the editor must preserve the save queue")
+          (t/is (= [[] [] (get-in pstate [:index other-id :commits])]
+                   (mapv #(get-in loaded [:persistence :index % :commits]) [first-id next-id other-id]))
+                "the commits made on the replaced version are forgotten"))))))
 
-(t/deftest queued-edits-save-during-temporary-read-only-mode
-  (doseq [read-only-event [(drw/context-lost)
-                           #(assoc-in % [:workspace-global :read-only?] true)
-                           #(assoc % :workspace-global {:read-only? true
-                                                        :preview-id (uuid/next)})]]
-    (let [file-id  (uuid/next)
-          response (rx/subject)
-          errors   (atom [])
-          store    (ptk/store {:state {:permissions {:can-edit true}
-                                       :files {file-id {:id file-id :revn 0}}}
-                               :on-error #(swap! errors conj %)})]
-      (with-redefs [rp/cmd! (mock/stub (fn [_ _] (rx/take 1 response)))]
-        (try
-          (ptk/emit! store (dps/initialize-persistence)
-                     (local-commit file-id)
-                     read-only-event
-                     ::dps/force-persist)
-          (rx/push! response {:revn 1})
-          (t/is (= :saved (get-in @store [:persistence :status])))
-          (t/is (empty? (get-in @store [:persistence :queue])))
+;; Scenario: a file loads again while an edit of it waits in the buffer.
+;; Proves: buffered edits apply too, after the queued ones, and those of
+;; other files do not.
+(t/deftest reopening-restores-the-buffered-edits-after-the-queued-ones
+  (let [file-id   (uuid/next)
+        page-id   (uuid/next)
+        commit-id (uuid/next)
+        file      {:id file-id
+                   :vern 0
+                   :data {:pages [page-id]
+                          :pages-index {page-id {:id page-id :name "Page"
+                                                 :objects {uuid/zero
+                                                           (cts/setup-shape {:id uuid/zero :type :frame})}}}}}
+        pstate    {:status :saving
+                   :queue (into #queue [] [commit-id])
+                   :index {commit-id {:file-id file-id :file-vern 0
+                                      :commits [{:redo-changes [(thp/rename page-id uuid/zero "Queued")]}]}}
+                   :buffer [{:file-id file-id :file-vern 0 :redo-changes [(thp/rename page-id uuid/zero "Buffered")]}
+                            {:file-id (uuid/next) :file-vern 0 :redo-changes [(thp/rename page-id uuid/zero "Another file")]}]}
+        loaded    (ptk/update (#'dw/bundle-fetched {:file file :file-id file-id :thumbnails {}})
+                              {:persistence pstate})]
+    (t/is (= "Buffered"
+             (get-in loaded [:files file-id :data :pages-index page-id :objects uuid/zero :name])))))
 
-          (ptk/emit! store (drw/context-restored)
-                     #(assoc-in % [:workspace-global :read-only?] false)
-                     (local-commit file-id)
-                     ::dps/force-persist)
-          (rx/push! response {:revn 2})
-          (t/is (= :saved (get-in @store [:persistence :status])))
-          (t/is (empty? (get-in @store [:persistence :queue])))
-          (t/is (empty? @errors))
-          (finally
-            (rx/dispose! store)
-            (rx/end! response)))))))
+;; Scenario: a queued edit no longer applies to the data the server sent, so
+;; replaying it throws. Proves: the file still opens, as the server sent it,
+;; and the edits stay queued.
+(t/deftest reopening-with-an-edit-that-no-longer-applies-keeps-the-server-file
+  (let [file-id   (uuid/next)
+        page-id   (uuid/next)
+        commit-id (uuid/next)
+        data      {:pages [page-id]
+                   :pages-index {page-id {:id page-id :name "Page"
+                                          :objects {uuid/zero
+                                                    (cts/setup-shape {:id uuid/zero :type :frame})}}}}
+        file      {:id file-id :vern 0 :data data}
+        pstate    {:status :saving
+                   :queue (into #queue [] [commit-id])
+                   :index {commit-id {:file-id file-id :file-vern 0
+                                      :commits [{:redo-changes [{:type :mod-obj :id uuid/zero :page-id page-id
+                                                                 :operations [{:type :no-longer-supported}]}]}]}}}
+        loaded    (ptk/update (#'dw/bundle-fetched {:file file :file-id file-id :thumbnails {}})
+                              {:persistence pstate})]
+    (t/is (identical? data (get-in loaded [:files file-id :data])))
+    (t/is (identical? pstate (:persistence loaded)))))
 
-(t/deftest historical-preview-cannot-create-local-commits
+(defn- ^:async run-read-only-phases
+  "Drives the read-only save scenario presuming asynchronous APIs: every
+  phase emits its triggers, awaits the transport round-trip, and only
+  then asserts the observed state."
+  [store response requests file-id read-only-event errors]
+  (ptk/emit! store (dps/initialize-persistence)
+             (local-commit file-id)
+             read-only-event
+             ::dps/force-persist)
+  (await (async/await-response requests response {:revn 1}))
+  (t/is (= :saved (get-in @store [:persistence :status])))
+  (t/is (empty? (get-in @store [:persistence :queue])))
+
+  (ptk/emit! store (drw/context-restored)
+             #(assoc-in % [:workspace-global :read-only?] false)
+             (local-commit file-id)
+             ::dps/force-persist)
+  (await (async/await-response requests response {:revn 2}))
+  (t/is (= :saved (get-in @store [:persistence :status])))
+  (t/is (empty? (get-in @store [:persistence :queue])))
+  (t/is (empty? @errors)))
+
+(defn- ^:async check-read-only-save
+  "Saves a queued edit while the file is read-only and verifies that the edit
+  is persisted once the restriction is lifted.
+
+  Scenario: with persistence initialized, queue an edit, switch the file to
+  read-only (`read-only-event`), and force persistence — the edit goes out
+  and is acknowledged. Then restore an editable context, queue another edit
+  and persist again. Both saves land in order with no reported errors.
+  Proves: read-only defers writes without dropping them, and resumption
+  picks up where it left off."
+  [read-only-event]
+  (let [file-id  (uuid/next)
+        response (rx/subject)
+        requests (atom [])
+        errors   (atom [])
+        store    (ptk/store {:state {:permissions {:can-edit true}
+                                     :files {file-id {:id file-id :revn 0}}}
+                             :on-error #(swap! errors conj %)})]
+
+    (mock/with-mocks*
+      {rp/cmd!          (mock/stub (fn [cmd params]
+                                     (let [req (->> response (rx/take 1) (rx/observe-on :async))]
+                                       (swap! requests conj {:cmd cmd :params params :req req})
+                                       req)))
+       st/ongoing-tasks (atom #{})}
+      (try
+        (await (run-read-only-phases store response requests file-id read-only-event errors))
+        (finally
+          (rx/dispose! store)
+          (rx/end! response))))))
+
+;; Variant: the file goes read-only through render context loss.
+(t/deftest ^:async queued-edits-save-after-context-loss
+  (await (check-read-only-save (drw/context-lost))))
+
+;; Variant: the file goes read-only through the workspace flag.
+(t/deftest ^:async queued-edits-save-in-read-only-mode
+  (await (check-read-only-save #(assoc-in % [:workspace-global :read-only?] true))))
+
+;; Variant: the file goes read-only through preview mode.
+(t/deftest ^:async queued-edits-save-in-read-only-preview-mode
+  (await (check-read-only-save #(assoc % :workspace-global {:read-only? true
+                                                            :preview-id (uuid/next)}))))
+
+;; Scenario: the open file is a historical preview (read-only with a preview
+;; id). Attempting a commit there must produce nothing observable: the gate
+;; answers refusals with an empty stream (never nil), so the test observes
+;; termination instead of branching on nil. Previews cannot create local
+;; commits. Proves: the read-only preview gate holds at the watch level.
+(t/deftest ^:async historical-preview-cannot-create-local-commits
   (let [file-id (uuid/next)
         output  (atom [])
         state   {:current-file-id file-id
@@ -73,306 +213,1297 @@
                  :files {file-id {:id file-id :revn 0 :vern 0}}
                  :workspace-global {:read-only? true :preview-id (uuid/next)}}
         event   (dch/commit-changes {:redo-changes [] :undo-changes []})]
-    (when-let [result (ptk/watch event state (rx/empty))]
-      (->> result (rx/subs! #(swap! output conj %))))
+    (await (async/observe (ptk/watch event state (rx/empty))
+                          :on-next #(swap! output conj %)))
     (t/is (empty? @output))))
 
+;; Watchdog: stalled-save detection.
+;;
+;; Production contract under test (`app.main.data.persistence`,
+;; `saving-stall-timeout-ms` = 5 minutes):
+;; - A request unanswered past the deadline reports once as
+;;   `:saving-stalled` (a `handled-exception` audit event) and never
+;;   repeats for the same stall (`:stall-reported`).
+;; - Any completed save resets the clock: a later stall reports again.
+;; - Edits queued behind a stall are preserved; an already failed save is
+;;   not re-reported as a stall.
+;;
+;; Emulation model — the fixture freezes the three inputs the watchdog
+;; reads, so each test scripts time by hand:
+;; - clock (`ct/now`): an atom. The test sets the time; time never flows.
+;; - ticks (`rx/interval`): a subject. Each push runs one watchdog pass.
+;; - network (`rp/cmd!`): answered when the test pushes into `:response`
+;;   (scenario timing stays in test hands); delivery is asynchronous, so
+;;   every phase awaits its effects before asserting them.
+;; - reports (`errors/generate-report`/`submit-report`): recorded into
+;;   atoms for assertions; nothing leaves the test. Thunk reports are
+;;   evaluated through the `generate-report` double, mirroring production
+;;   (granted reports build, suppressed ones never exist here).
+;;
+;; Reading the tests below: every assert block is preceded by quiescence —
+;; `wait-for` on its presence-conditions, or a bare `settle` tick when it
+;; asserts only absence.
 (defn- with-watchdog
+  "Async fixture for the persistence watchdog tests: mocks the clock, timers
+  and RPC transport, and runs `f` with persistence initialized.
+
+  Evaluates to a promise resolving once `f` settles and teardown completes;
+  `await` it from an `^:async` test. The transport answers when the test
+  pushes into `:response` (scenario timing stays in test hands); delivery
+  is asynchronous, so await each effect — via `wait-for` — before asserting
+  it. `f` is awaited (usually an `^:async` fn)."
   [f]
   (let [clock    (atom 0)
         ticks    (rx/subject)
         response (rx/subject)
+        requests (atom [])
         reports  (atom [])
         causes   (atom [])
-        render   errors/generate-report
         file-id  (uuid/next)
         store    (ptk/store {:state {:current-file-id file-id
                                      :permissions {:can-edit true}
                                      :files {file-id {:id file-id :revn 0}}}
                              :on-error #(t/is false (str %))})]
-    (with-redefs [ct/now                 (mock/stub #(ct/inst @clock))
-                  rx/interval            (mock/stub (fn [_] ticks))
-                  rp/cmd!                (mock/stub (fn [_ _] (rx/take 1 response)))
-                  st/state               store
-                  errors/generate-report (fn [cause]
-                                           (swap! causes conj cause)
-                                           (render cause))
-                  errors/submit-report   (fn [& params]
-                                           (swap! reports conj (apply hash-map params)))]
+    (mock/with-mocks*
+      {ct/now                 (mock/stub #(ct/inst @clock))
+       rx/interval            (mock/stub (fn [_] ticks))
+       rp/cmd!                (mock/stub (fn [cmd params]
+                                           (swap! requests conj {:cmd cmd :params params})
+                                           (->> response (rx/take 1) (rx/observe-on :async))))
+       st/state               store
+       errors/generate-report (fn [cause & _]
+                                (swap! causes conj cause)
+                                "report")
+       errors/submit-report   (fn [& params]
+                                ;; Mirrors production: a granted report builds
+                                ;; its payload through `generate-report`, so a
+                                ;; thunk report is evaluated here while a
+                                ;; string report is recorded as it arrives.
+                                (let [m (apply hash-map params)]
+                                  (swap! reports conj m)
+                                  (when (fn? (:report m))
+                                    ((:report m)))))
+       st/ongoing-tasks       (atom #{})}
       (try
         (ptk/emit! store (dps/initialize-persistence))
-        (f {:clock clock :ticks ticks :response response :causes causes
-            :reports reports :store store :file-id file-id})
+        (await (f {:clock clock :ticks ticks :response response :requests requests
+                   :causes causes :reports reports :store store :file-id file-id}))
         (finally
           (rx/dispose! store)
           (rx/end! ticks)
           (rx/end! response))))))
 
-(t/deftest stalled-request-is-reported-once-without-discarding-edits
-  (with-watchdog
-    (fn [{:keys [clock ticks reports causes store file-id]}]
-      (ptk/emit! store (local-commit file-id) ::dps/force-persist)
-      (reset! clock 300000)
-      (rx/push! ticks :tick)
-      (t/is (empty? @reports) "Five minutes must elapse before reporting")
+;; Scenario: persistence sits in a non-terminal status with an empty
+;; queue past the deadline (a status transition racing the queue drain).
+;; The watchdog must stay silent: with nothing queued there is nothing
+;; stalled to report. Proves: no false-positive stall reports on an
+;; empty queue.
+(t/deftest ^:async empty-queue-never-reports-a-stall
+  (await
+   (with-watchdog
+     (^:async fn [{:keys [clock ticks reports store]}]
+       (ptk/emit! store (#'dps/update-status :pending))
+       (reset! clock 300001)
+       (rx/push! ticks :tick)
+       (await (async/settle))
+       (t/is (empty? @reports) "an empty queue is never a stall")))))
 
-      ;; More local edits must not reset the stalled request's clock.
-      (reset! clock 300001)
-      (ptk/emit! store (drw/context-lost)
-                 (local-commit file-id) ::dps/force-persist)
-      (rx/push! ticks :tick)
-      (t/is (= 1 (count @reports)))
-      (t/is (= "handled-exception" (:event-name (first @reports))))
-      (let [data (ex-data (first @causes))]
-        (t/is (= :saving-stalled (:code data)))
-        (t/is (= file-id (:file-id data)))
-        (t/is (true? (:render-context-lost? data))))
+;; Scenario: the network hangs. One save goes out and is never answered.
+;; Five minutes pass with no report (the deadline is exclusive); one second
+;; later, with more edits piled behind the stalled request, the tick reports
+;; the stall exactly once — as `handled-exception`, carrying the file id and
+;; the lost render context — and later ticks repeat nothing while both edits
+;; stay queued. Proves: one report per stall, no lost edits.
+(t/deftest ^:async stalled-request-is-reported-once-without-discarding-edits
+  (await
+   (with-watchdog
+     (^:async fn [{:keys [clock ticks reports causes store file-id]}]
+       ;; Phase 1 — at exactly five minutes the deadline has not elapsed: silence.
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+       (reset! clock 300000)
+       (rx/push! ticks :tick)
+       (await (async/settle))
+       (t/is (empty? @reports) "Five minutes must elapse before reporting")
 
-      (reset! clock 900000)
-      (rx/push! ticks :tick)
-      (t/is (= 1 (count @reports)) "Do not repeat a report for the same stall")
-      (t/is (= :saving (get-in @store [:persistence :status])))
-      (t/is (= 2 (count (get-in @store [:persistence :queue])))))))
+       ;; Phase 2 — one second past the deadline the stall reports exactly once.
+       ;; More local edits must not reset the stalled request's clock.
+       (reset! clock 300001)
+       (ptk/emit! store (drw/context-lost)
+                  (local-commit file-id) ::dps/force-persist)
+       (rx/push! ticks :tick)
+       (await (async/wait-for #(= 1 (count @reports)) "stall report"))
+       (t/is (= 1 (count @reports)))
+       (t/is (= "handled-exception" (:event-name (first @reports))))
+       (let [data (ex-data (first @causes))]
+         (t/is (= :saving-stalled (:code data)))
+         (t/is (= file-id (:file-id data)))
+         (t/is (true? (:render-context-lost? data))))
 
-(t/deftest successful-saves-reset-the-stall-clock-and-allow-a-new-report
-  (with-watchdog
-    (fn [{:keys [clock ticks response reports store file-id]}]
-      (ptk/emit! store (local-commit file-id) ::dps/force-persist
-                 (local-commit file-id) ::dps/force-persist)
-      (reset! clock 290000)
-      (rx/push! response {:revn 1})
-      (reset! clock 300001)
-      (rx/push! ticks :tick)
-      (t/is (empty? @reports) "The queue is making progress")
+       ;; Phase 3 — long after: no repeat, both edits still queued.
+       (reset! clock 900000)
+       (rx/push! ticks :tick)
+       (await (async/settle))
+       (t/is (= 1 (count @reports)) "Do not repeat a report for the same stall")
+       (t/is (= :saving (get-in @store [:persistence :status])))
+       (t/is (= 2 (count (get-in @store [:persistence :queue]))))))))
 
-      (reset! clock 590001)
-      (rx/push! ticks :tick)
-      (t/is (= 1 (count @reports)) "The second request has now stalled")
+;; Scenario: answers arrive, then stop. Two commits share the first request;
+;; awaiting its landing advances the queue and starts the second request, so
+;; the tick finds progress and stays silent. Left hanging past a fresh
+;; deadline it reports once; answering it saves the file and silences the
+;; watchdog; a later hang reports again. Proves: progress resets the clock,
+;; and every new stall earns its own report.
+;;
+;; Note the awaits: a push only schedules delivery, so each tick must
+;; observe the completed save — awaiting after the push is what separates
+;; "answered" from "completed".
+(t/deftest ^:async successful-saves-reset-the-stall-clock-and-allow-a-new-report
+  (await
+   (with-watchdog
+     (^:async fn [{:keys [clock ticks reports response store file-id]}]
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist
+                  (local-commit file-id) ::dps/force-persist)
+       ;; Phase 1 — two commits share the first request; its landing starts the second.
+       (reset! clock 290000)
+       (rx/push! response {:revn 1})
+       (await (async/wait-for-store store #(= 1 (count (get-in @store [:persistence :queue])))
+                                    "first save lands, second request starts"))
+       (reset! clock 300001)
+       (rx/push! ticks :tick)
+       (await (async/settle))
+       (t/is (empty? @reports) "The queue is making progress")
 
-      (rx/push! response {:revn 2})
-      (t/is (= :saved (get-in @store [:persistence :status])))
-      (reset! clock 1000000)
-      (rx/push! ticks :tick)
-      (t/is (= 1 (count @reports)) "A saved file must not be reported")
+       ;; Phase 2 — the second request hangs past its own fresh deadline.
+       (reset! clock 590001)
+       (rx/push! ticks :tick)
+       (await (async/wait-for #(= 1 (count @reports)) "second request stalls"))
+       (t/is (= 1 (count @reports)) "The second request has now stalled")
 
-      (ptk/emit! store (local-commit file-id) ::dps/force-persist)
-      (reset! clock 1300001)
-      (rx/push! ticks :tick)
-      (t/is (= 2 (count @reports)) "A later stall gets its own report"))))
+       (rx/push! response {:revn 2})
+       (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                (empty? (get-in @store [:persistence :queue])))
+                                    "second save lands"))
+       (t/is (= :saved (get-in @store [:persistence :status])))
+       ;; Phase 3 — answering saves the file: the tick stays silent.
+       (reset! clock 1000000)
+       (rx/push! ticks :tick)
+       (t/is (= 1 (count @reports)) "A saved file must not be reported")
 
-(t/deftest pending-edits-are-monitored-without-extending-the-deadline
-  (with-watchdog
-    (fn [{:keys [clock ticks reports store]}]
-      (rx/push! ticks :tick)
-      (t/is (empty? @reports) "An idle file must not be reported")
-      (ptk/emit! store (#'dps/update-status :pending))
-      (reset! clock 300001)
-      (ptk/emit! store (#'dps/update-status :pending))
-      (rx/push! ticks :tick)
-      (t/is (= 1 (count @reports)))
-      (ptk/emit! store (#'dps/update-status :error))
-      (reset! clock 900000)
-      (rx/push! ticks :tick)
-      (t/is (= 1 (count @reports)) "Do not report an already failed save"))))
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+       ;; Phase 4 — a later hang is a new stall with its own report.
+       (reset! clock 1300001)
+       (rx/push! ticks :tick)
+       (await (async/wait-for #(= 2 (count @reports)) "later stall reports again"))
+       (t/is (= 2 (count @reports)) "A later stall gets its own report")))))
 
-(t/deftest reinitializing-persistence-replaces-the-watchdog
-  (let [active-timers (atom 0)
-        ticks         (rx/subject)
-        store         (ptk/store {:state {} :on-error #(t/is false (str %))})]
-    (with-redefs [rx/interval (mock/stub
-                               (fn [_]
-                                 (rx/create
-                                  (fn [subscriber]
-                                    (swap! active-timers inc)
-                                    (let [subscription (.subscribe ticks subscriber)]
-                                      (fn []
-                                        (rx/dispose! subscription)
-                                        (swap! active-timers dec)))))))]
-      (try
-        (ptk/emit! store (dps/initialize-persistence))
-        (t/is (= 1 @active-timers))
-        (ptk/emit! store (dps/initialize-persistence))
-        (t/is (= 1 @active-timers))
-        (finally
-          (rx/dispose! store)
-          (rx/end! ticks))))
-    (t/is (zero? @active-timers))))
+;; Scenario: no network request exists at all — an edit sits `:pending`
+;; locally without being sent. The watchdog still tracks it against the
+;; original deadline (re-marking `:pending` does not push it): an idle
+;; file never reports, an aged pending edit reports once, and once the
+;; save fails outright the watchdog stands down — failures belong to the
+;; save path, never twice. Proves: pending edits are watched without
+;; extending deadlines, and failures are not re-reported as stalls.
+(t/deftest ^:async pending-edits-are-monitored-without-extending-the-deadline
+  (await
+   (with-watchdog
+     (^:async fn [{:keys [clock ticks reports store file-id]}]
+       ;; Phase 1 — idle: nothing queued, nothing reported.
+       (rx/push! ticks :tick)
+       (await (async/settle))
+       (t/is (empty? @reports) "An idle file must not be reported")
+       ;; Phase 2 — a queued (yet unsent) edit ages into one report, and
+       ;; re-marking pending does not extend its deadline.
+       (let [id (uuid/next)]
+         (ptk/emit! store
+                    #(assoc % :persistence {:queue (conj #queue [] id)
+                                            :index {id {:id id :file-id file-id}}})))
+       (ptk/emit! store (#'dps/update-status :pending))
+       (reset! clock 300001)
+       (ptk/emit! store (#'dps/update-status :pending))
+       (rx/push! ticks :tick)
+       (await (async/wait-for #(= 1 (count @reports)) "pending edit ages into a report"))
+       (t/is (= 1 (count @reports)))
+       ;; Phase 3 — an outright failure is not a stall: no second report.
+       (ptk/emit! store (#'dps/update-status :error))
+       (reset! clock 900000)
+       (rx/push! ticks :tick)
+       (await (async/settle))
+       (t/is (= 1 (count @reports)) "Do not report an already failed save")))))
 
-(defn- with-persistence
-  [f]
-  (let [file-id  (uuid/next)
-        response (rx/subject)
-        failures (atom [])
-        requests (atom [])
-        store    (ptk/store {:state {:current-file-id file-id
-                                     :permissions {:can-edit true}
-                                     :files {file-id {:id file-id :revn 0}}}
-                             :on-error #(t/is false (str %))})]
-    (with-redefs [rp/cmd! (mock/stub (fn [cmd params]
-                                       (swap! requests conj [cmd params])
-                                       (rx/take 1 response)))
-                  errors/flash (fn [& {:keys [cause]}]
-                                 (swap! failures conj cause))]
-      (try
-        (ptk/emit! store (dps/initialize-persistence))
-        (f {:file-id file-id :response response :failures failures
-            :requests requests :store store})
-        (finally
-          (rx/dispose! store)
-          (rx/end! response))))))
+;; Scenario: initializing twice must replace the watchdog instead of stacking
+;; it — a single active timer at all times, zero after teardown. Proves:
+;; reinitialization swaps the timer subscription instead of leaking it.
+;; (Fully synchronous bodies need no awaits; the promise shell still
+;; guarantees restore and completion.)
+(t/deftest ^:async reinitializing-persistence-replaces-the-watchdog
+  (await
+   (let [active-timers (atom 0)
+         ticks         (rx/subject)
+         store         (ptk/store {:state {} :on-error #(t/is false (str %))})]
+     (mock/with-mocks*
+       {rx/interval (mock/stub
+                     (fn [_]
+                       (rx/create
+                        (fn [subscriber]
+                          (swap! active-timers inc)
+                          (let [subscription (.subscribe ticks subscriber)]
+                            (fn []
+                              (rx/dispose! subscription)
+                              (swap! active-timers dec)))))))
+        st/ongoing-tasks (atom #{})}
+       (try
+         (ptk/emit! store (dps/initialize-persistence))
+         (t/is (= 1 @active-timers))
+         (ptk/emit! store (dps/initialize-persistence))
+         (t/is (= 1 @active-timers))
+         (finally
+           (rx/dispose! store)
+           (rx/end! ticks)
+           (t/is (zero? @active-timers))))))))
 
-(t/deftest permission-loss-fails-without-discarding-queued-edits
-  (with-persistence
-    (fn [{:keys [file-id requests failures store]}]
-      (ptk/emit! store (local-commit file-id)
-                 #(assoc-in % [:permissions :can-edit] false)
-                 ::dps/force-persist)
-      (t/is (= :error (get-in @store [:persistence :status])))
-      (t/is (= 1 (count (get-in @store [:persistence :queue]))))
-      (t/is (empty? @requests))
-      (t/is (= 1 (count @failures)))
-      (ptk/emit! store (local-commit file-id) ::dps/force-persist
-                 (#'dps/update-status :pending))
-      (t/is (= :error (get-in @store [:persistence :status])))
-      (t/is (= 2 (count (get-in @store [:persistence :queue])))))))
-
-(t/deftest failed-request-retains-the-queue-and-is-not-retried-on-initialization
-  (with-persistence
-    (fn [{:keys [file-id response requests store]}]
-      (ptk/emit! store (local-commit file-id) ::dps/force-persist
-                 (local-commit file-id) ::dps/force-persist)
-      (.error response (ex-info "Connection lost" {:type :network}))
-      (ptk/emit! store (dps/initialize-persistence))
-      (t/is (= :error (get-in @store [:persistence :status])))
-      (t/is (= 2 (count (get-in @store [:persistence :queue]))))
-      (t/is (= 1 (count @requests))))))
-
-(t/deftest save-failures-use-a-translated-warning-except-for-authentication
-  (doseq [cause-type [:network :offline :authentication]]
-    (with-persistence
-      (fn [{:keys [file-id response store]}]
-        (let [notifications (atom [])]
-          (with-redefs [errors/flash (fn [& params]
-                                       (swap! notifications conj (apply hash-map params)))
-                        i18n/tr (mock/stub #(str "translated:" %))]
+;; Scenario: the first send fails transiently and the retry resend hangs
+;; forever inside the `:retrying` episode. Past the 5-minute deadline the
+;; watchdog must still report the stall exactly once — and never repeat
+;; it — while the queued edit is preserved. Proves: the watchdog sees
+;; hung resends; a `:retrying` episode cannot deadlock silently.
+(t/deftest ^:async hung-retry-resend-is-reported-as-a-stall
+  (let [calls   (atom 0)
+        timer-s (rx/subject)]
+    (await
+     (with-watchdog
+       (^:async fn [{:keys [clock ticks reports causes requests requests$ store file-id]}]
+         (await
+          (mock/with-mocks*
+            {rx/timer (mock/stub (fn [_] timer-s))
+             rp/cmd!  (mock/stub (fn [cmd params]
+                                   (swap! requests conj {:cmd cmd :params params})
+                                   (if (= 1 (swap! calls inc))
+                                     (rx/throw (ex-info "offline" {:type :offline}))
+                                     ;; The resend hangs forever: the subject
+                                     ;; is never answered nor failed.
+                                     (rx/subject))))}
+            ;; Phase 1 — first send fails transiently; the episode parks
+            ;; on the hand-fired timer.
             (ptk/emit! store (local-commit file-id) ::dps/force-persist)
-            (.error response (ex-info "Raw transport details" {:type cause-type}))
-            (t/is (= :error (get-in @store [:persistence :status])))
-            (let [data (get-in @store [:persistence :error])]
-              (ptk/handle-error (assoc data ::errors/instance (ex-info "Save failed" data))))
-            (if (= cause-type :authentication)
-              (t/is (empty? @notifications))
-              (t/is (= ["translated:errors.save-failed"]
-                       (mapv :hint @notifications))))))))))
+            (await (async/wait-for-store store #(= :retrying (get-in @store [:persistence :status]))
+                                         "transient failure retries"))
+            (t/is (= 1 (count @requests)))
+            ;; Phase 2 — the timer fires and the resend goes out, hanging.
+            (rx/push! timer-s :tick)
+            (await (async/wait-for #(= 2 (count @requests)) "retry resends" {:signal requests$}))
+            (t/is (= :retrying (get-in @store [:persistence :status])))
+            ;; Phase 3 — past the deadline the watchdog reports the stall
+            ;; once, keeping the queued edit.
+            (reset! clock 300001)
+            (rx/push! ticks :tick)
+            (await (async/wait-for #(= 1 (count @reports)) "hung resend stalls"))
+            (t/is (= 1 (count @reports)))
+            (t/is (= "handled-exception" (:event-name (first @reports))))
+            (t/is (= :saving-stalled (:code (ex-data (first @causes)))))
+            (t/is (= :retrying (get-in @store [:persistence :status])))
+            (t/is (= 1 (count (get-in @store [:persistence :queue]))))
+            ;; Phase 4 — later ticks repeat nothing for the same stall.
+            (reset! clock 900000)
+            (rx/push! ticks :tick)
+            (await (async/settle))
+            (t/is (= 1 (count @reports)) "Do not repeat a report for the same stall")
+            (rx/end! timer-s))))))))
 
-(t/deftest missing-commit-is-an-error-instead-of-skipping-changes
+;; Save pipeline tests.
+;;
+;; Production contract under test (`app.main.data.persistence`):
+;; - Commits queue locally and flush in order; every request carries the
+;;   queued changes exactly once (no resends of active requests, no drops).
+;; - Without edit permission nothing is sent and the failure flashes.
+;; - Transport failures and malformed answers (`nil`, empty, bad revision)
+;;   fail the save but preserve the queue for retry.
+;; - Initialization recovers gracefully: dangling runners error instead of
+;;   skipping, unsent commits are picked up, unknown outcomes are sent again
+;;   under the same commit id.
+;;
+;; Same async pattern as the watchdog tests: triggers stay bare, every
+;; assert block is preceded by `wait-for` on its leading signal (or a bare
+;; `settle` tick when it asserts only absence). The fixture is
+;; `with-persistence` (`frontend-tests.helpers.persistence`).
+
+;; Scenario: edit permission is revoked with an edit queued. The save fails
+;; without sending anything, the queue keeps the edit and the user is
+;; notified once, so `wait-persisted-or-error` still rejects and nothing is
+;; snapshotted from unsaved state. Proves: permission loss fails safe.
+(t/deftest ^:async permission-loss-retains-the-queue-and-notifies-once
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id requests failures store]}]
+       (ptk/emit! store (local-commit file-id)
+                  #(assoc-in % [:permissions :can-edit] false)
+                  ::dps/force-persist)
+       (await (async/wait-for-store store #(and (= :error (get-in @store [:persistence :status]))
+                                                (= 1 (count (get-in @store [:persistence :queue]))))
+                                    "permission loss fails the save"))
+       (t/is (= :error (get-in @store [:persistence :status])))
+       (t/is (= 1 (count (get-in @store [:persistence :queue])))
+             "the undeliverable edit is retained, so waiters keep rejecting")
+       (t/is (empty? @requests))
+       (t/is (= 1 (count @failures)))))))
+
+;; Scenario: the same terminal failure, then the user opens a file again.
+;; Opening a file releases the edit that can never be saved and settles the
+;; editor, instead of leaving it halted until a reload. Proves: the halt does
+;; not outlive the visit that caused it.
+(t/deftest ^:async opening-a-file-again-releases-a-terminal-failure
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id requests failures store]}]
+       (ptk/emit! store (local-commit file-id)
+                  #(assoc-in % [:permissions :can-edit] false)
+                  ::dps/force-persist)
+       (await (async/wait-for-store store #(and (= :error (get-in @store [:persistence :status]))
+                                                (= 1 (count (get-in @store [:persistence :queue]))))
+                                    "the save fails terminally"))
+       ;; Edit rights come back: a team-role change is one of the two real
+       ;; recovery triggers (the other is opening a file, whose event does
+       ;; real work and is not usable as a bare signal here).
+       (ptk/emit! store
+                  #(assoc-in % [:permissions :can-edit] true)
+                  (ptk/data-event :app.main.data.common/change-team-role))
+       (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                (empty? (get-in @store [:persistence :queue])))
+                                    "re-entering the file settles the queue"))
+       (t/is (nil? (get-in @store [:persistence :error]))
+             "the halt is cleared once the user comes back")
+       (t/is (empty? @requests)
+             "the edit that cannot be saved is not replayed on re-entry")
+       (t/is (= 1 (count @failures)) "the user is still notified exactly once")))))
+
+;; Scenario: the user renames a shape and is made a viewer before the save,
+;; so it fails for lost permission; the role event comes again, then edit
+;; rights return. Proves: the edit is kept while the user is a viewer, and
+;; released with edit rights back, the file goes back to the server's data
+;; and the history loses the edit, so the canvas never shows a change the
+;; server does not have.
+(t/deftest ^:async regaining-edit-rights-reverts-the-released-edit
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id requests failures store]}]
+       (let [page-id  (uuid/next)
+             shape-id (uuid/next)
+             commit   (thp/rename-commit file-id page-id shape-id "A" "B")]
+         (ptk/emit! store
+                    (thp/open-file file-id page-id (thp/file-data page-id shape-id "B"))
+                    #(assoc % :workspace-undo {:items [(thp/undo-entry commit)] :index 0})
+                    commit
+                    #(assoc-in % [:permissions :can-edit] false)
+                    ::dps/force-persist)
+         (await (async/wait-for-store store #(= :error (get-in @store [:persistence :status]))
+                                      "lost permission fails the save"))
+
+         (ptk/emit! store (ptk/data-event :app.main.data.common/change-team-role))
+         (await (async/settle))
+         (t/is (= 1 (count (get-in @store [:persistence :queue])))
+               "a viewer keeps the edit")
+         (t/is (= "B" (thp/shape-name store file-id page-id shape-id)))
+         (t/is (= 2 (count @failures))
+               "the count notice shows again over the role change notice")
+
+         (ptk/emit! store
+                    #(assoc-in % [:permissions :can-edit] true)
+                    (ptk/data-event :app.main.data.common/change-team-role))
+         (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                  (empty? (get-in @store [:persistence :queue])))
+                                      "edit rights back release the edit"))
+         (t/is (= "A" (thp/shape-name store file-id page-id shape-id))
+               "the file shows the server's data")
+         (t/is (empty? (get-in @store [:workspace-undo :items]))
+               "the released edit leaves the history")
+         (t/is (empty? @requests) "the released edit is not sent"))))))
+
+;; Answers every save with an unexpected server error, a terminal failure.
+(defn- server-error
+  [_ _]
+  (rp/handle-response {:status 500
+                       :body {:type :server-error :code :unhandled}
+                       :uri "https://penpot.example.com/api/main/methods/update-file"}))
+
+;; Scenario: the user is in the Inspect tab (read-only) when a save fails
+;; terminally, then goes back to Design while the dialog is up. The
+;; workspace stays read-only until the failure is released, and then takes
+;; the mode the user last asked for. Proves: the lock does not lose the
+;; read-only mode the workspace had.
+(t/deftest ^:async a-failed-save-locks-the-workspace-until-it-recovers
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (ptk/emit! store #(assoc-in % [:workspace-global :read-only?] true)
+                  (local-commit file-id)
+                  ::dps/force-persist)
+       (await (async/wait-for-store store #(some? (get-in @store [:workspace-global :persistence-lock]))
+                                    "the failed save locks the workspace"))
+       (t/is (true? (get-in @store [:workspace-global :read-only?])))
+       (t/is (true? (get-in @store [:workspace-global :persistence-lock :read-only?])))
+
+       (ptk/emit! store (dwc/set-workspace-read-only false))
+       (await (async/wait-for-store store #(false? (get-in @store [:workspace-global :persistence-lock :read-only?]))
+                                    "the requested mode is kept for later"))
+       (t/is (true? (get-in @store [:workspace-global :read-only?]))
+             "the workspace stays read-only while saves fail")
+
+       (ptk/emit! store (ptk/data-event :app.main.data.common/change-team-role))
+       (await (async/wait-for-store store #(nil? (get-in @store [:workspace-global :persistence-lock]))
+                                    "recovery lifts the lock"))
+       (t/is (false? (get-in @store [:workspace-global :read-only?]))
+             "the workspace takes the mode the user asked for"))
+     server-error)))
+
+;; Scenario: the user is made a viewer while an edit waits to be saved. The
+;; save fails for lost permission, but the workspace is already read-only
+;; for a viewer: no lock and no dialog, only the failure toast. Proves: a
+;; viewer is never blocked from looking at the file.
+(t/deftest ^:async a-viewer-is-not-locked-by-a-failed-save
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id failures store]}]
+       (ptk/emit! store (local-commit file-id)
+                  #(assoc-in % [:permissions :can-edit] false)
+                  ::dps/force-persist)
+       (await (async/wait-for-store store #(= :error (get-in @store [:persistence :status]))
+                                    "lost permission fails the save"))
+       (await (async/settle))
+       (t/is (nil? (get-in @store [:workspace-global :persistence-lock])))
+       (t/is (nil? (get-in @store [:workspace-global :read-only?])))
+       (t/is (= 1 (count @failures)) "the user is told by the toast")))))
+
+;; Scenario: saves fail, then the WebGL context is lost, then saves recover
+;; before the context comes back. Proves: lifting the save lock does not
+;; unlock a workspace the lost context still holds read-only.
+(t/deftest ^:async a-lost-render-context-outlasts-the-save-lock
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+       (await (async/wait-for-store store #(some? (get-in @store [:workspace-global :persistence-lock]))
+                                    "the failed save locks the workspace"))
+       (ptk/emit! store (drw/context-lost)
+                  (ptk/data-event :app.main.data.common/change-team-role))
+       (await (async/wait-for-store store #(nil? (get-in @store [:workspace-global :persistence-lock]))
+                                    "recovery lifts the save lock"))
+       (t/is (true? (get-in @store [:workspace-global :read-only?]))
+             "the lost context keeps the workspace read-only")
+
+       (ptk/emit! store (drw/context-restored))
+       (await (async/wait-for-store store #(false? (get-in @store [:workspace-global :read-only?]))
+                                    "the restored context brings back the first mode")))
+     server-error)))
+
+;; Scenario: two files have pending edits and the first send fails
+;; terminally. Opening a file again releases the failed file, the other file
+;; still saves, and the editor settles saved instead of staying halted.
+;; Proves: one file that cannot be saved does not block every other file.
+(t/deftest ^:async terminal-failure-does-not-block-other-files
+  (let [files (into [] (repeatedly 2 uuid/next))
+        sends (atom 0)]
+    (await
+     (with-persistence
+       (^:async fn [{:keys [requests requests$ store]}]
+         (ptk/emit! store
+                    #(assoc % :files (into (:files %)
+                                           (map (fn [id] [id {:id id :revn 0}]))
+                                           files))
+                    (local-commit (nth files 0))
+                    (local-commit (nth files 1))
+                    ::dps/force-persist)
+         (await (async/wait-for #(seq @requests) "the first file is sent" {:signal requests$}))
+         (let [failed-file (get-in (second (first @requests)) [:id])]
+           (await (async/wait-for-store store #(and (= :error (get-in @store [:persistence :status]))
+                                                    (not (empty? (get-in @store [:persistence :queue]))))
+                                        "the terminal failure retains the queue"))
+           ;; The user acts again: recovery releases the failed file and drains
+           ;; the rest.
+           (ptk/emit! store (ptk/data-event :app.main.data.common/change-team-role))
+           (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                    (empty? (get-in @store [:persistence :queue])))
+                                        "the released file frees the rest of the queue"))
+           (t/is (= 2 (count @requests))
+                 "the other file was saved after the failed one was released")
+           (t/is (= 1 (count (filter #(= failed-file (get-in (second %) [:id])) @requests)))
+                 "the failed file is sent once, never replayed")))
+       (fn [_ _]
+         ;; Fail the first send terminally and answer the rest inline, so no
+         ;; hot-subject race can swallow the answer.
+         (if (= 1 (swap! sends inc))
+           (rx/throw (ex-info "rejected" {:type :validation :code :invalid-data}))
+           (rx/of {:revn 1})))))))
+
+(defn- check-save-failure-warning
+  "Fails a queued save with `cause-type` and asserts the hint shown to the
+  user; authentication failures have their own UI and must stay silent."
+  [cause-type]
   (with-persistence
-    (fn [{:keys [requests store]}]
-      (let [id (uuid/next)]
-        (ptk/emit! store
-                   #(assoc % :persistence {:queue (conj #queue [] id)
-                                           :index {} :run-id (uuid/next)
-                                           :status :saving})
-                   (dps/initialize-persistence))
-        (t/is (= :error (get-in @store [:persistence :status])))
-        (t/is (= [id] (vec (get-in @store [:persistence :queue]))))
-        (t/is (empty? @requests))))))
+    (^:async fn [{:keys [file-id response store]}]
+      (let [notifications (atom [])]
+        (await
+         (mock/with-mocks*
+           {errors/flash (fn [& params]
+                           (swap! notifications conj (apply hash-map params)))
+            i18n/tr      (mock/stub #(str "translated:" %))}
+           (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+           (.error response (ex-info "Raw transport details" {:type cause-type}))
+           (await (async/wait-for-store store #(= :error (get-in @store [:persistence :status]))
+                                        "failed request errors the save"))
+           (t/is (= :error (get-in @store [:persistence :status])))
+           (let [data (get-in @store [:persistence :error])]
+             (ptk/handle-error (assoc data ::errors/instance (ex-info "Save failed" data))))
+           (if (= cause-type :authentication)
+             (do (await (async/settle))
+                 (t/is (empty? @notifications)))
+             (do (await (async/wait-for #(seq @notifications) "save-failure toast"))
+                 (t/is (= ["translated:errors.save-failed"]
+                          (mapv :hint @notifications)))))))))))
 
-(t/deftest initialization-recovers-an-unsent-commit-with-a-dangling-run-id
+;; Variant: an authentication failure stays silent (own UI flow).
+(t/deftest ^:async authentication-save-failure-shows-no-warning
+  (await (check-save-failure-warning :authentication)))
+
+;; NOTE: the `:network` and `:offline` warning variants lived here while
+;; transport failures went straight to `:error`. Transient failures now
+;; retry instead, so their coverage moved to the retry tests below (and to
+;; the exhaustion test for the terminal toast).
+
+;; The transient/terminal classification is pure: transport failures and
+;; unusable save responses retry with backoff, everything else stays
+;; terminal. Note the wrapped shape: `persistence-failed` records the
+;; original cause under `:cause-type` with `:type :persistence`.
+(t/deftest transient-error-classification
+  (t/is (dps/transient-error? {:type :network}))
+  (t/is (dps/transient-error? {:type :offline}))
+  (t/is (dps/transient-error? {:type :bad-gateway}))
+  (t/is (dps/transient-error? {:type :service-unavailable}))
+  (t/is (dps/transient-error? {:type :persistence :cause-type :network}))
+  (t/is (dps/transient-error? {:type :persistence :cause-type :offline}))
+  (t/is (dps/transient-error? {:type :internal :cause-type :bad-gateway}))
+  (t/is (dps/transient-error? {:type :persistence :cause-type :service-unavailable}))
+  ;; The wrapped shape stays transient with an explicit non-retry code too:
+  ;; the cause-type carries the transport verdict, not the wrapper's code.
+  (t/is (dps/transient-error? {:type :persistence :cause-type :service-unavailable :code :save-failed}))
+  (t/is (dps/transient-error? {:type :persistence :cause-type :bad-gateway :code :save-failed}))
+  (t/is (dps/transient-error? {:type :persistence :code :invalid-save-response}))
+  (t/is (not (dps/transient-error? {:type :authentication})))
+  (t/is (not (dps/transient-error? {:type :validation})))
+  (t/is (not (dps/transient-error? {:type :internal})))
+  (t/is (not (dps/transient-error? {:type :persistence :cause-type :authentication})))
+  (t/is (not (dps/transient-error? {:type :persistence :code :missing-commit})))
+  (t/is (not (dps/transient-error? {:type :persistence :code :save-permission-denied})))
+  (t/is (not (dps/transient-error? {}))))
+
+;; A busy backend refused or rolled back the save, so it is safe to resend:
+;; a rate or concurrency limit, or a database timeout. Any other server
+;; error stays terminal.
+(t/deftest busy-server-classification
+  (t/is (dps/transient-error? {:type :rate-limit}))
+  (t/is (dps/transient-error? {:type :persistence :cause-type :rate-limit :code :rate-limited}))
+  (t/is (dps/transient-error? {:type :server-error :code :statement-timeout}))
+  (t/is (dps/transient-error? {:type :persistence :cause-type :server-error :code :statement-timeout}))
+  (t/is (dps/transient-error? {:type :persistence :cause-type :server-error :code :idle-in-transaction-timeout}))
+  (t/is (not (dps/transient-error? {:type :server-error})))
+  (t/is (not (dps/transient-error? {:type :persistence :cause-type :server-error :code :unhandled})))
+  (t/is (not (dps/transient-error? {:type :persistence :cause-type :validation :code :statement-timeout}))))
+
+;; The transient set is owned by `repo/retryable-types`: every transport
+;; type retryable at the HTTP layer must also be transient for the save
+;; pipeline, in both the direct and the wrapped (`persistence-failed`)
+;; positions. Proves: the two classifications cannot drift apart.
+(t/deftest transient-classification-follows-repo-retryable-types
+  (doseq [transport-type rp/retryable-types]
+    (t/testing (str "transport type " transport-type " is transient in both positions")
+      (t/is (dps/transient-error? {:type transport-type}))
+      (t/is (dps/transient-error? {:type :persistence :cause-type transport-type})))))
+
+;; Scenario: a save fails transiently and the episode parks on its backoff
+;; timer. A waiter started mid-episode must not resolve on the `:retrying`
+;; transition — only the terminal save releases it. Proves: `:retrying` is
+;; non-terminal for waiters.
+(t/deftest waiter-release-rule
+  ;; The waiter release rule is pure: only a failed save or a settled
+  ;; (`nil` / `:saved`) empty queue releases waiters. In particular, the
+  ;; `:retrying` episode — queue non-empty, status non-terminal — never
+  ;; does. Proves: `:retrying` is non-terminal for waiters, a document of
+  ;; intent over the `wait-persisted-or-error` filter.
+  ;;
+  ;; Note: this intentionally avoids scripting the global store atom — it
+  ;; is shared with the whole suite, so any test reading it observes
+  ;; other namespaces' leftovers depending on run order.
+  (t/is (dps/terminal-status? {:status :error :queue [1]}))
+  (t/is (dps/terminal-status? {:status :saved :queue []}))
+  (t/is (dps/terminal-status? {:status nil :queue []}))
+  (t/is (dps/terminal-status? {:status nil :queue nil}))
+  (t/is (not (dps/terminal-status? {:status :retrying :queue [1]})))
+  (t/is (not (dps/terminal-status? {:status :saving :queue [1]})))
+  (t/is (not (dps/terminal-status? {:status :pending :queue [1]})))
+  (t/is (not (dps/terminal-status? {:status :saved :queue [1]})))
+  (t/is (not (dps/terminal-status? {:status :saved :queue [] :buffer [{:id 1}]}))
+        "commits still buffered keep the waiters waiting")
+  (t/is (dps/terminal-status? {:status :error :queue [] :buffer [{:id 1}]})))
+
+;; Scenario: the queue references a commit id with no matching commit
+;; (plus a dangling run id) when persistence initializes. It must error
+;; instead of silently skipping the unknown entry, keeping it queued and
+;; sending nothing. Proves: dangling queue entries fail loudly, never skip.
+(t/deftest ^:async missing-commit-is-an-error-instead-of-skipping-changes
+  (await
+   (with-persistence
+     (^:async fn [{:keys [requests store]}]
+       (let [id (uuid/next)]
+         (ptk/emit! store
+                    #(assoc % :persistence {:queue (conj #queue [] id)
+                                            :index {} :run-id (uuid/next)
+                                            :status :saving})
+                    (dps/initialize-persistence))
+         (await (async/wait-for-store store #(= :error (get-in @store [:persistence :status]))
+                                      "dangling commit errors instead of skipping"))
+         (t/is (= :error (get-in @store [:persistence :status])))
+         (t/is (= [id] (vec (get-in @store [:persistence :queue]))))
+         (t/is (empty? @requests)))))))
+
+;; Scenario: a valid but unsent commit sits queued with a dangling run id
+;; when persistence initializes. It is sent exactly once and, once answered,
+;; the file saves with an empty queue. Proves: unsent commits survive a
+;; stale runner — neither stuck nor duplicated.
+(t/deftest ^:async initialization-recovers-an-unsent-commit-with-a-dangling-run-id
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (let [commit (pcm/queue-entry [@(local-commit file-id)])
+             id     (:id commit)]
+         (ptk/emit! store
+                    #(assoc % :persistence {:queue (conj #queue [] id)
+                                            :index {id commit} :run-id (uuid/next)
+                                            :status :saving})
+                    (dps/initialize-persistence))
+         (await (async/wait-for #(= 1 (count @requests)) "dangling commit is sent" {:signal requests$}))
+         (t/is (= 1 (count @requests)))
+         (rx/push! response {:revn 1})
+         (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                  (empty? (get-in @store [:persistence :queue])))
+                                      "recovered save lands"))
+         (t/is (= :saved (get-in @store [:persistence :status])))
+         (t/is (empty? (get-in @store [:persistence :queue]))))))))
+
+(defn- check-active-request-not-resent
+  "Sends a commit, interrupts the active request with `interrupt` and
+  reinitializes persistence: the pending request must not be sent again."
+  [interrupt]
   (with-persistence
-    (fn [{:keys [file-id response requests store]}]
-      (let [commit (assoc @(local-commit file-id) :changes [])
-            id     (:id commit)]
-        (ptk/emit! store
-                   #(assoc % :persistence {:queue (conj #queue [] id)
-                                           :index {id commit} :run-id (uuid/next)
-                                           :status :saving})
-                   (dps/initialize-persistence))
-        (t/is (= 1 (count @requests)))
-        (rx/push! response {:revn 1})
-        (t/is (= :saved (get-in @store [:persistence :status])))
-        (t/is (empty? (get-in @store [:persistence :queue])))))))
-
-(t/deftest an-active-request-is-never-sent-twice
-  (doseq [interrupt [[(dps/initialize-persistence)]
-                     [(ptk/data-event ::dps/error)]]]
-    (with-persistence
-      (fn [{:keys [file-id response requests store]}]
-        (apply ptk/emit! store (local-commit file-id) ::dps/force-persist interrupt)
-        (ptk/emit! store (dps/initialize-persistence))
-        (t/is (= 1 (count @requests)))
-        (rx/push! response {:revn 1})
-        (t/is (= :saved (get-in @store [:persistence :status])))
-        (t/is (empty? (get-in @store [:persistence :queue])))))))
-
-(t/deftest permission-restoration-resumes-only-unsent-edits
-  (with-persistence
-    (fn [{:keys [file-id response requests store]}]
-      (ptk/emit! store (local-commit file-id) ::dps/force-persist
-                 (local-commit file-id) ::dps/force-persist
-                 #(assoc-in % [:permissions :can-edit] false))
-      (rx/push! response {:revn 1})
-      (t/is (= :error (get-in @store [:persistence :status])))
-      (t/is (= 1 (count (get-in @store [:persistence :queue]))))
-      (ptk/emit! store
-                 #(assoc-in % [:permissions :can-edit] true)
-                 (ptk/data-event :app.main.data.common/change-team-role))
-      (t/is (= 2 (count @requests)))
-      (rx/push! response {:revn 2})
-      (t/is (= :saved (get-in @store [:persistence :status])))
-      (t/is (empty? (get-in @store [:persistence :queue]))))))
-
-(t/deftest recovery-keeps-an-acknowledgment-received-without-a-runner
-  (with-persistence
-    (fn [{:keys [file-id response requests store]}]
-      (ptk/emit! store (local-commit file-id) ::dps/force-persist
-                 (ptk/data-event ::dps/error))
-      (rx/push! response {:revn 1})
-      (t/is (= 1 (count (get-in @store [:persistence :queue]))))
+    (^:async fn [{:keys [file-id response requests requests$ store]}]
+      (apply ptk/emit! store (local-commit file-id) ::dps/force-persist interrupt)
       (ptk/emit! store (dps/initialize-persistence))
-      (t/is (= 1 (count @requests)) "The acknowledged changes must not be sent again")
+      (await (async/wait-for #(= 1 (count @requests)) "only the active request is sent" {:signal requests$}))
+      (t/is (= 1 (count @requests)))
+      (rx/push! response {:revn 1})
+      (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                               (empty? (get-in @store [:persistence :queue])))
+                                   "active request completes"))
       (t/is (= :saved (get-in @store [:persistence :status])))
       (t/is (empty? (get-in @store [:persistence :queue]))))))
 
-(t/deftest recovery-reports-an-unknown-request-outcome-without-replaying-it
-  (with-persistence
-    (fn [{:keys [file-id requests store]}]
-      (let [commit (assoc @(local-commit file-id) ::dps/request-id (uuid/next))
-            id     (:id commit)]
-        (ptk/emit! store
-                   #(assoc % :persistence {:queue (conj #queue [] id)
-                                           :index {id commit} :status :saving})
-                   (dps/initialize-persistence))
-        (t/is (= :error (get-in @store [:persistence :status])))
-        (t/is (= :save-outcome-unknown (get-in @store [:persistence :error :code])))
-        (t/is (= [id] (vec (get-in @store [:persistence :queue]))))
-        (t/is (empty? @requests))))))
+;; Variant: the interrupt is a reinitialization.
+(t/deftest ^:async reinitializing-does-not-resend-an-active-request
+  (await (check-active-request-not-resent [(dps/initialize-persistence)])))
 
-(t/deftest initialization-flushes-buffered-edits-without-duplicating-them
-  (with-persistence
-    (fn [{:keys [file-id response requests store]}]
-      (ptk/emit! store (local-commit file-id)
-                 (dps/initialize-persistence)
-                 ::dps/force-persist)
-      (t/is (= 1 (count @requests)))
-      (t/is (= 1 (count (get-in @store [:persistence :queue]))))
-      (rx/push! response {:revn 1})
-      (t/is (= :saved (get-in @store [:persistence :status]))))))
+;; Variant: the interrupt is a save error event.
+(t/deftest ^:async save-error-does-not-resend-an-active-request
+  (await (check-active-request-not-resent [(ptk/data-event ::dps/error)])))
 
-(t/deftest synchronous-save-results-do-not-leave-a-dangling-runner
-  (with-persistence
-    (fn [{:keys [file-id store]}]
-      (with-redefs [rp/cmd! (mock/stub (fn [_ _] (rx/of {:revn 1})))]
-        (ptk/emit! store (local-commit file-id) ::dps/force-persist)
-        (t/is (= :saved (get-in @store [:persistence :status])))
-        (t/is (empty? (get-in @store [:persistence :queue])))))))
+;; Scenario: permission is lost mid-flight, so the save fails terminally.
+;; Even if the permission comes back, recovery releases the undeliverable
+;; edits instead of replaying them. The backend raises `:not-found` for a
+;; lost edit permission, so a resend would only route the user to the
+;; exception page. Proves: permission loss is treated as permanent, like
+;; every other terminal failure.
+(t/deftest ^:async permission-loss-is-released-not-resumed
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id requests store]}]
+       (ptk/emit! store (local-commit file-id)
+                  #(assoc-in % [:permissions :can-edit] false)
+                  ::dps/force-persist)
+       (await (async/wait-for-store store #(and (= :error (get-in @store [:persistence :status]))
+                                                (= 1 (count (get-in @store [:persistence :queue]))))
+                                    "permission loss fails the save"))
+       ;; Permission comes back and a file is opened again.
+       (ptk/emit! store #(assoc-in % [:permissions :can-edit] true)
+                  (ptk/data-event :app.main.data.common/change-team-role))
+       (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                (empty? (get-in @store [:persistence :queue])))
+                                    "recovery releases the undeliverable edit"))
+       (t/is (empty? @requests)
+             "the undeliverable edit is never replayed, not even once the
+              permission is back")
+       (t/is (not= :error (get-in @store [:persistence :status]))
+             "the editor is not left halted")))))
 
-(t/deftest empty-or-invalid-save-responses-preserve-the-queue-as-failed
-  (doseq [result [(rx/empty) (rx/of nil) (rx/of {:revn -1})]]
-    (with-persistence
-      (fn [{:keys [file-id store]}]
-        (with-redefs [rp/cmd! (mock/stub (fn [_ _] result))]
-          (ptk/emit! store (local-commit file-id) ::dps/force-persist)
-          (t/is (= :error (get-in @store [:persistence :status])))
-          (t/is (= :invalid-save-response (get-in @store [:persistence :error :code])))
-          (t/is (= 1 (count (get-in @store [:persistence :queue])))))))))
+;; Scenario: a terminal failure is waiting, and persistence is re-initialized.
+;; Initialization must not lift the halt: only opening a file does. Otherwise
+;; the edits would be released the moment the workspace view mounts, instead
+;; of when the user acts on them. Proves: the init/recovery split holds.
+(t/deftest ^:async initialization-does-not-lift-a-halt
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response store]}]
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+       (.error response (ex-info "Validation failed" {:type :validation}))
+       (await (async/wait-for-store store #(and (= :error (get-in @store [:persistence :status]))
+                                                (= 1 (count (get-in @store [:persistence :queue]))))
+                                    "the save fails terminally"))
+       (ptk/emit! store (dps/initialize-persistence))
+       (await (async/settle))
+       (t/is (= :error (get-in @store [:persistence :status]))
+             "initialization leaves the halt alone")
+       (t/is (= 1 (count (get-in @store [:persistence :queue])))
+             "and keeps the undeliverable edits queued until the user acts")))))
+
+;; Scenario: the answer arrives but no runner is tracking the request
+;; anymore. The acknowledged commit stays queued instead of being dropped;
+;; on initialization it is settled as saved without resending. Proves: late
+;; acknowledgments are neither lost nor replayed.
+(t/deftest ^:async recovery-keeps-an-acknowledgment-received-without-a-runner
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests store]}]
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist
+                  (ptk/data-event ::dps/error))
+       (rx/push! response {:revn 1})
+       (await (async/wait-for-store store #(= 1 (count (get-in @store [:persistence :queue])))
+                                    "acknowledged commit stays queued"))
+       (t/is (= 1 (count (get-in @store [:persistence :queue]))))
+       (ptk/emit! store (dps/initialize-persistence))
+       (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                (empty? (get-in @store [:persistence :queue])))
+                                    "recovery completes without resending"))
+       (t/is (= 1 (count @requests)) "The acknowledged changes must not be sent again")
+       (t/is (= :saved (get-in @store [:persistence :status])))
+       (t/is (empty? (get-in @store [:persistence :queue])))))))
+
+;; Scenario: a queued commit carries a request id but persistence has no
+;; run id for it when initializing, so its outcome is unknown. It is sent
+;; again under the same commit id and saves. Proves: an unknown outcome is
+;; resent, since changes are idempotent.
+(t/deftest ^:async recovery-sends-again-a-save-with-an-unknown-outcome
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (let [commit (assoc (pcm/queue-entry [@(local-commit file-id)]) ::dps/request-id (uuid/next))
+             id     (:id commit)]
+         (ptk/emit! store
+                    #(assoc % :persistence {:queue (conj #queue [] id)
+                                            :index {id commit} :status :saving})
+                    (dps/initialize-persistence))
+         (await (async/wait-for #(= 1 (count @requests)) "the commit is sent again" {:signal requests$}))
+         (t/is (= id (:commit-id (second (first @requests)))))
+         (rx/push! response {:revn 1})
+         (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                  (empty? (get-in @store [:persistence :queue])))
+                                      "the resent commit saves"))
+         (t/is (= 1 (count @requests))))))))
+
+;; Scenario: an edit is queued before persistence even initializes. On
+;; initialization plus force-persist it is sent exactly once (still queued
+;; until answered); once answered, the file saves. Proves: pre-init buffered
+;; edits flush exactly once, without duplicating.
+(t/deftest ^:async initialization-flushes-buffered-edits-without-duplicating-them
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (ptk/emit! store (local-commit file-id)
+                  (dps/initialize-persistence)
+                  ::dps/force-persist)
+       ;; The predicate reads both the store and the request counter, so it
+       ;; passes the merged signal; the wrapper only provides the store one.
+       (await (async/wait-for #(and (= 1 (count @requests))
+                                    (= 1 (count (get-in @store [:persistence :queue]))))
+                              "buffered edit is sent once"
+                              {:signal (rx/merge requests$ (ptk/input-stream store))}))
+       (t/is (= 1 (count @requests)))
+       (t/is (= 1 (count (get-in @store [:persistence :queue]))))
+       (rx/push! response {:revn 1})
+       (await (async/wait-for-store store #(= :saved (get-in @store [:persistence :status]))
+                                    "buffered edit saves"))
+       (t/is (= :saved (get-in @store [:persistence :status])))))))
+
+;; Scenario: the transport answers synchronously (immediate observable).
+;; The save completes, the queue empties, and no runner is left dangling.
+;; Proves: synchronous transport responses settle cleanly.
+(t/deftest ^:async synchronous-save-results-do-not-leave-a-dangling-runner
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+       (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                (empty? (get-in @store [:persistence :queue])))
+                                    "synchronous save completes"))
+       (t/is (= :saved (get-in @store [:persistence :status])))
+       (t/is (empty? (get-in @store [:persistence :queue]))))
+     (fn [_ _] (rx/of {:revn 1})))))
+
+;; Leave-page guard tests.
+
+;; Scenario: an edit is buffered, then sent, then saved. The leave-page
+;; guard turns on with the buffered edit, stays on while the save is in
+;; flight, and turns off once it lands. Proves: unsaved edits always keep
+;; the browser's leave-page warning on.
+(t/deftest ^:async unsaved-edits-keep-the-leave-page-guard
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store tasks]}]
+       (ptk/emit! store (local-commit file-id))
+       (await (async/wait-for #(contains? @tasks :persistence)
+                              "a buffered edit turns the guard on"))
+       (ptk/emit! store ::dps/force-persist)
+       (await (async/wait-for #(seq @requests) "the edit is sent" {:signal requests$}))
+       (t/is (contains? @tasks :persistence) "the guard stays on while the save is in flight")
+       (rx/push! response {:revn 1})
+       (await (async/wait-for #(not (contains? @tasks :persistence))
+                              "the save turns the guard off"))
+       (t/is (= :saved (get-in @store [:persistence :status])))))))
+
+;; Scenario: a second edit arrives while the first is being saved, and the
+;; first save lands while the second edit is still in the buffer. The queue
+;; is empty at that point, yet the guard stays on until the second edit is
+;; saved. Proves: edits waiting in the buffer keep the leave-page warning on.
+(t/deftest ^:async edits-buffered-during-a-save-keep-the-leave-page-guard
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store tasks]}]
+       (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+       (await (async/wait-for #(= 1 (count @requests)) "the first edit is sent" {:signal requests$}))
+       (ptk/emit! store (local-commit file-id))
+       (rx/push! response {:revn 1})
+       (await (async/wait-for-store store #(empty? (get-in @store [:persistence :queue]))
+                                    "the first save lands"))
+       (await (async/settle))
+       (t/is (contains? @tasks :persistence) "the buffered edit keeps the guard on")
+       (ptk/emit! store ::dps/force-persist)
+       (await (async/wait-for #(= 2 (count @requests)) "the buffered edit is sent" {:signal requests$}))
+       (rx/push! response {:revn 2})
+       (await (async/wait-for #(not (contains? @tasks :persistence))
+                              "the second save turns the guard off"))
+       (t/is (empty? (get-in @store [:persistence :queue])))))))
+
+;; Scenario: a save fails terminally, then recovery releases the edit. The
+;; guard stays on while the failed edit is retained, and turns off once it
+;; is released. Proves: a release that empties the queue also turns the
+;; leave-page warning off.
+(t/deftest ^:async releasing-a-failed-edit-turns-the-leave-page-guard-off
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store tasks]}]
+       (ptk/emit! store (local-commit file-id)
+                  #(assoc-in % [:permissions :can-edit] false)
+                  ::dps/force-persist)
+       (await (async/wait-for-store store #(= :error (get-in @store [:persistence :status]))
+                                    "the save fails terminally"))
+       (await (async/settle))
+       (t/is (contains? @tasks :persistence) "the retained edit keeps the guard on")
+       (ptk/emit! store
+                  #(assoc-in % [:permissions :can-edit] true)
+                  (ptk/data-event :app.main.data.common/change-team-role))
+       (await (async/wait-for-store store #(empty? (get-in @store [:persistence :queue]))
+                                    "recovery releases the edit"))
+       (await (async/wait-for #(not (contains? @tasks :persistence))
+                              "the release turns the guard off"))
+       (t/is (= :saved (get-in @store [:persistence :status])))))))
+
+;; Scenario: an edit waits in the 3 s buffer and the user switches tabs or
+;; windows. Proves: leaving sends the buffered edit at once, well before
+;; the buffer would (the bounded `wait-for` gives up long before 3 s).
+(t/deftest ^:async leaving-the-tab-sends-buffered-edits-at-once
+  (let [leave-s (rx/subject)]
+    (await
+     (mock/with-mocks*
+       {dps/leave-signals (fn [] leave-s)}
+       (await
+        (with-persistence
+          (^:async fn [{:keys [file-id requests requests$ store]}]
+            (ptk/emit! store (local-commit file-id))
+            (await (async/settle))
+            (t/is (empty? @requests) "the edit waits in the buffer")
+            (rx/push! leave-s :hidden)
+            (await (async/wait-for #(= 1 (count @requests))
+                                   "leaving sends the edit at once" {:signal requests$}))
+            (t/is (= 1 (count @requests))))))))))
+
+;; Scenario: nothing is buffered when the user leaves. Proves: a leave
+;; signal alone sends nothing.
+(t/deftest ^:async leaving-with-nothing-buffered-sends-nothing
+  (let [leave-s (rx/subject)]
+    (await
+     (mock/with-mocks*
+       {dps/leave-signals (fn [] leave-s)}
+       (await
+        (with-persistence
+          (^:async fn [{:keys [requests store]}]
+            (rx/push! leave-s :hidden)
+            (await (async/settle))
+            (t/is (empty? @requests))
+            (t/is (nil? (get-in @store [:persistence :status]))))))))))
+
+(defn- wait-files-saved
+  "Emits into `store` an event that runs `force-persist-files-and-wait` for
+  `file-ids` and then flips `done`."
+  [store file-ids timeout-ms done]
+  (ptk/emit! store
+             (ptk/reify ::wait-files-saved
+               ptk/WatchEvent
+               (watch [_ _ _]
+                 (rx/concat
+                  (dps/force-persist-files-and-wait file-ids timeout-ms)
+                  (rx/of (ptk/reify ::files-saved
+                           ptk/EffectEvent
+                           (effect [_ _ _] (reset! done true)))))))))
+
+;; Scenario: an edit waits in the buffer when an export asks for its file
+;; to be saved. Proves: the wait sends the edit and only ends once the save
+;; lands.
+(t/deftest ^:async waiting-for-a-file-sends-and-waits-for-its-edits
+  (let [done (atom false)]
+    (await
+     (with-persistence
+       (^:async fn [{:keys [file-id response requests requests$ store]}]
+         (await
+          (mock/with-mocks*
+            {refs/persistence (l/derived :persistence store)}
+            (ptk/emit! store (local-commit file-id))
+            (wait-files-saved store #{file-id} 60000 done)
+            (await (async/wait-for #(= 1 (count @requests)) "the edit is sent at once" {:signal requests$}))
+            (await (async/settle))
+            (t/is (false? @done) "the wait holds while the save is in flight")
+            (rx/push! response {:revn 1})
+            (await (async/wait-for #(true? @done) "the landed save ends the wait"))
+            (t/is (not (dps/unsaved-changes? @store #{file-id}))))))))))
+
+;; Scenario: a save of one file hangs while another file is exported.
+;; Proves: the wait only covers the exported files.
+(t/deftest ^:async waiting-for-a-file-ignores-other-files
+  (let [done (atom false)]
+    (await
+     (with-persistence
+       (^:async fn [{:keys [file-id requests requests$ store]}]
+         (await
+          (mock/with-mocks*
+            {refs/persistence (l/derived :persistence store)}
+            (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+            (await (async/wait-for #(= 1 (count @requests)) "the other file's save hangs" {:signal requests$}))
+            (wait-files-saved store #{(uuid/next)} 60000 done)
+            (await (async/wait-for #(true? @done) "the wait ends at once")))))))))
+
+;; Scenario: the file's save hangs past the wait. Proves: the wait gives up
+;; without raising, and the file still reports unsaved changes.
+(t/deftest ^:async waiting-for-a-file-gives-up-after-the-timeout
+  (let [done (atom false)]
+    (await
+     (with-persistence
+       (^:async fn [{:keys [file-id requests store]}]
+         (await
+          (mock/with-mocks*
+            {refs/persistence (l/derived :persistence store)}
+            (ptk/emit! store (local-commit file-id))
+            (wait-files-saved store #{file-id} 1 done)
+            (await (async/wait-for #(true? @done) "the wait times out"))
+            (t/is (= 1 (count @requests)))
+            (t/is (dps/unsaved-changes? @store #{file-id})))))))))
+
+(defn- save-failed-events
+  "Starts collecting the `save-failed` audit events that `store` processes."
+  [store]
+  (let [events (atom [])]
+    (->> (ptk/input-stream store)
+         (rx/filter #(= ::ev/event (ptk/type %)))
+         (rx/map deref)
+         (rx/filter #(= "save-failed" (::ev/name %)))
+         (rx/subs! #(swap! events conj %)))
+    events))
+
+;; Scenario: the backend rejects a save as invalid data. Proves: the user's
+;; failure toast comes with one `save-failed` audit event that records why.
+(t/deftest ^:async a-failed-save-emits-one-save-failed-event
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (let [events (save-failed-events store)]
+         (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+         (await (async/wait-for-store store #(= :error (get-in @store [:persistence :status]))
+                                      "the save fails"))
+         (await (async/wait-for #(seq @events) "the event is emitted"))
+         (await (async/settle))
+         (t/is (= 1 (count @events)))
+         (t/is (= {:cause-type :validation
+                   :code :referential-integrity
+                   :retrying false
+                   :queued-commits 1}
+                  (select-keys (first @events)
+                               [:cause-type :code :retrying :queued-commits])))))
+     (fn [_ _]
+       (rx/throw (ex-info "invalid" {:type :validation :code :referential-integrity}))))))
+
+;; Buffered commits.
+
+;; Scenario: an edit waits in the buffer for the next flush, then a flush
+;; moves it to the queue. Proves: buffered edits are visible in the store
+;; until they are queued, so a rollback can reach them.
+(t/deftest ^:async buffered-commits-stay-in-the-store-until-queued
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (let [commit (local-commit file-id)]
+         (ptk/emit! store commit)
+         (await (async/wait-for-store store #(seq (get-in @store [:persistence :buffer]))
+                                      "the edit is buffered"))
+         (t/is (= [(:id @commit)] (mapv :id (get-in @store [:persistence :buffer]))))
+         (t/is (empty? (get-in @store [:persistence :queue])))
+         (ptk/emit! store ::dps/force-persist)
+         (await (async/wait-for #(seq @requests) "the flush sends the edit" {:signal requests$}))
+         (t/is (empty? (get-in @store [:persistence :buffer])))
+         (t/is (= [(:id @commit)]
+                  (->> (get-in @store [:persistence :queue])
+                       (mapcat #(get-in @store [:persistence :index % :commits]))
+                       (mapv :id))))
+         (rx/push! response {:revn 1})
+         (await (async/wait-for-store store #(= :saved (get-in @store [:persistence :status]))
+                                      "the save lands")))))))
+
+;; Scenario: an edit waits in the buffer when another user's change to the
+;; same attribute arrives. The server will apply the remote change first and
+;; the buffered edit after it, so the local file must end the same way.
+;; Proves: a remote commit is applied under buffered edits too.
+(t/deftest ^:async a-remote-commit-goes-under-buffered-edits
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (let [page-id  (uuid/next)
+             shape-id (uuid/next)
+             local    (thp/rename-commit file-id page-id shape-id "Original" "Local")]
+         (ptk/emit! store (thp/open-file file-id page-id (thp/file-data page-id shape-id "Local")))
+         (ptk/emit! store local)
+         (await (async/wait-for-store store #(seq (get-in @store [:persistence :buffer]))
+                                      "the local edit is buffered"))
+         (ptk/emit! store (thp/remote-commit file-id 1 [(thp/rename page-id shape-id "Remote")]))
+         (await (async/settle))
+         (t/is (= "Local" (thp/shape-name store file-id page-id shape-id))))))))
+
+;; Scenario: a library edit waits to be saved when a peer's change to this
+;; file arrives, and both files have a shape with the same id. Proves: a
+;; remote commit goes under the pending commits of its own file only.
+(t/deftest ^:async a-remote-commit-ignores-the-pending-commits-of-other-files
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id store]}]
+       (let [lib-id   (uuid/next)
+             page-id  (uuid/next)
+             shape-id (uuid/next)]
+         (ptk/emit! store (thp/open-file-with-library file-id lib-id page-id
+                                                      (thp/file-data page-id shape-id "A")
+                                                      (thp/file-data page-id shape-id "Y")))
+         (ptk/emit! store (thp/rename-commit lib-id page-id shape-id "X" "Y"))
+         (await (async/wait-for-store store #(seq (get-in @store [:persistence :buffer]))
+                                      "the library edit is buffered"))
+         (ptk/emit! store (thp/remote-commit file-id 1 [(thp/set-attr page-id shape-id :opacity 0.3)]))
+         (await (async/settle))
+         (t/is (= 0.3 (thp/shape-attr store file-id page-id shape-id :opacity)))
+         (t/is (= "A" (thp/shape-name store file-id page-id shape-id))
+               "the library edit is not replayed on this file"))))))
+
+;; Changes the server stored before a save.
+
+(def ^:private repair-session-id
+  #uuid "a11c0de5-0000-4000-8000-000000000001")
+
+(defn- add-child-commit
+  "A local commit of `file-id` that adds `shape` as the last child of the
+  root of `page-id`."
+  [file-id page-id {:keys [id] :as shape}]
+  (ptk/data-event ::dch/commit
+                  {:id (uuid/next)
+                   :file-id file-id
+                   :file-revn 0
+                   :file-vern 0
+                   :source :local
+                   :features #{}
+                   :undo-group (uuid/next)
+                   :redo-changes [{:type :add-obj :id id :page-id page-id
+                                   :parent-id uuid/zero :frame-id uuid/zero :obj shape}]
+                   :undo-changes [{:type :del-obj :id id :page-id page-id}]}))
+
+(defn- set-root-children
+  "A change that sets the children of the root of `page-id`."
+  [page-id ids]
+  {:type :mod-obj :id uuid/zero :page-id page-id
+   :operations [{:type :set :attr :shapes :val ids}]})
+
+(defn- lagged-row
+  "A row of a save answer's `:lagged`: a change stored at `revn` by
+  `session-id`."
+  [file-id revn session-id changes]
+  {:id (uuid/next) :file-id file-id :revn revn :session-id session-id :changes changes})
+
+(defn- root-children
+  [store file-id page-id]
+  (thp/shape-attr store file-id page-id uuid/zero :shapes))
+
+(defn- open-with-new-child
+  "Opens a page whose root holds `shape-id` and the new child `child`, as
+  the local data does once the user adds it."
+  [store file-id session-id page-id shape-id child]
+  (ptk/emit! store
+             (thp/open-file file-id page-id
+                            (thp/add-shape (thp/file-data page-id shape-id "S") page-id child))
+             #(assoc % :session-id session-id)))
+
+;; Scenario: the user adds a child to a page with old damage. The server
+;; repairs the page first, storing a repair that sets the root's children
+;; without the new child, then stores the user's change, which adds it. The
+;; save answer reaches the tab before the repair's message. Proves: the
+;; saved commit stays pending until the repair arrives, so the repair goes
+;; under it and the tab ends as the server does.
+(t/deftest ^:async a-repair-answered-before-its-message-goes-under-the-saved-commit
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (let [session-id (uuid/next)
+             page-id    (uuid/next)
+             shape-id   (uuid/next)
+             child      (cts/setup-shape {:id (uuid/next) :type :rect :name "Rectangle"
+                                          :parent-id uuid/zero :frame-id uuid/zero})
+             commit     (add-child-commit file-id page-id child)
+             repair     [(set-root-children page-id [shape-id])]]
+         (open-with-new-child store file-id session-id page-id shape-id child)
+         (ptk/emit! store commit ::dps/force-persist)
+         (await (async/wait-for #(= 1 (count @requests)) "the new child is sent" {:signal requests$}))
+         (rx/push! response {:revn 0
+                             :lagged [(lagged-row file-id 1 repair-session-id repair)
+                                      (lagged-row file-id 2 session-id (:redo-changes @commit))]})
+         (await (async/wait-for-store store #(get-in @store [:persistence :index (:id @commit) ::dps/awaiting])
+                                      "the saved commit waits for the repair"))
+         (t/is (= [(:id @commit)] (vec (get-in @store [:persistence :queue]))))
+
+         (ptk/emit! store (thp/remote-commit file-id 1 repair))
+         (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                  (empty? (get-in @store [:persistence :queue])))
+                                      "the saved commit is acknowledged once the repair arrives"))
+         (t/is (= [shape-id (:id child)] (root-children store file-id page-id))
+               "the repair goes under the new child, as on the server"))))))
+
+;; Scenario: the repair's message reaches the tab before the save answer.
+;; Proves: the answer does not wait for a change the tab already applied.
+(t/deftest ^:async a-save-answer-does-not-wait-for-changes-already-received
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (let [session-id (uuid/next)
+             page-id    (uuid/next)
+             shape-id   (uuid/next)
+             child      (cts/setup-shape {:id (uuid/next) :type :rect :name "Rectangle"
+                                          :parent-id uuid/zero :frame-id uuid/zero})
+             commit     (add-child-commit file-id page-id child)
+             repair     [(set-root-children page-id [shape-id])]]
+         (open-with-new-child store file-id session-id page-id shape-id child)
+         (ptk/emit! store commit ::dps/force-persist)
+         (await (async/wait-for #(= 1 (count @requests)) "the new child is sent" {:signal requests$}))
+         (ptk/emit! store (thp/remote-commit file-id 1 repair))
+         (rx/push! response {:revn 0
+                             :lagged [(lagged-row file-id 1 repair-session-id repair)
+                                      (lagged-row file-id 2 session-id (:redo-changes @commit))]})
+         (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                  (empty? (get-in @store [:persistence :queue])))
+                                      "the save lands at once"))
+         (t/is (= [shape-id (:id child)] (root-children store file-id page-id))))))))
+
+;; Scenario: the save answer lists a repair whose message never reaches the
+;; tab. Proves: the wait is bounded; the saved commit is acknowledged and
+;; the file reloads to get the server's data.
+(t/deftest ^:async a-change-that-never-arrives-reloads-the-file
+  (let [reloads   (atom 0)
+        timeout-s (rx/subject)
+        original  (get-method ptk/resolve ::dw/reload-current-file)]
+    (-add-method ptk/resolve ::dw/reload-current-file
+                 (fn [_ _]
+                   (swap! reloads inc)
+                   (ptk/data-event ::reloaded {})))
+    (try
+      (await
+       (with-persistence
+         (^:async fn [{:keys [file-id response requests requests$ store]}]
+           (await
+            (mock/with-mocks*
+              {rx/timer (mock/stub (fn [ms]
+                                     (if (= ms @#'dps/unseen-changes-timeout-ms)
+                                       timeout-s
+                                       (rx/subject))))}
+              (let [session-id (uuid/next)
+                    page-id    (uuid/next)
+                    shape-id   (uuid/next)
+                    child      (cts/setup-shape {:id (uuid/next) :type :rect :name "Rectangle"
+                                                 :parent-id uuid/zero :frame-id uuid/zero})
+                    commit     (add-child-commit file-id page-id child)]
+                (open-with-new-child store file-id session-id page-id shape-id child)
+                (ptk/emit! store commit ::dps/force-persist)
+                (await (async/wait-for #(= 1 (count @requests)) "the new child is sent" {:signal requests$}))
+                (rx/push! response {:revn 0
+                                    :lagged [(lagged-row file-id 1 repair-session-id
+                                                         [(set-root-children page-id [shape-id])])
+                                             (lagged-row file-id 2 session-id (:redo-changes @commit))]})
+                (await (async/wait-for-store store #(get-in @store [:persistence :index (:id @commit) ::dps/awaiting])
+                                             "the saved commit waits for the repair"))
+                (t/is (zero? @reloads))
+                (rx/push! timeout-s :tick)
+                (await (async/wait-for #(= 1 @reloads) "the file reloads"))
+                (t/is (empty? (get-in @store [:persistence :queue]))
+                      "the saved commit is acknowledged")))))))
+      (finally
+        (-add-method ptk/resolve ::dw/reload-current-file original)))))
+
+;; Commit boundaries.
+
+;; Scenario: two edits are buffered and saved together. The request carries
+;; one group per edit, each with its commit id and its own changes, so the
+;; backend can accept or reject them one by one. Proves: merging a buffer
+;; for one request keeps the boundaries between commits.
+(t/deftest ^:async a-save-sends-each-commit-as-its-own-group
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (let [commit1 (local-commit file-id)
+             commit2 (local-commit file-id)]
+         (ptk/emit! store commit1 commit2 ::dps/force-persist)
+         (await (async/wait-for #(= 1 (count @requests)) "both edits go in one save" {:signal requests$}))
+         (let [[_ params] (first @requests)]
+           (t/is (not (contains? params :changes)))
+           (t/is (= [{:commit-id (:id @commit1) :changes (:redo-changes @commit1)}
+                     {:commit-id (:id @commit2) :changes (:redo-changes @commit2)}]
+                    (:changes-with-metadata params))))
+         (rx/push! response {:revn 1})
+         (await (async/wait-for-store store #(= :saved (get-in @store [:persistence :status]))
+                                      "the save lands")))))))
+
+;; Scenario: a save is in flight while a later edit waits in the buffer, and
+;; something waits for the edits to be saved (as a library sync does before
+;; marking the library synced). The save lands and the queue empties, so the
+;; status turns :saved. Proves: the waiter is released only once the
+;; buffered edit is saved too.
+(t/deftest ^:async waiting-for-the-save-covers-the-buffered-edits
+  (await
+   (with-persistence
+     (^:async fn [{:keys [file-id response requests requests$ store]}]
+       (let [released? #(dps/terminal-status? (:persistence @store))]
+         (ptk/emit! store (local-commit file-id) ::dps/force-persist)
+         (await (async/wait-for #(= 1 (count @requests)) "the first edit is sent" {:signal requests$}))
+         (ptk/emit! store (local-commit file-id))
+         (await (async/wait-for-store store #(seq (get-in @store [:persistence :buffer]))
+                                      "the second edit waits in the buffer"))
+         (rx/push! response {:revn 1})
+         (await (async/wait-for-store store #(and (= :saved (get-in @store [:persistence :status]))
+                                                  (empty? (get-in @store [:persistence :queue])))
+                                      "the first save lands"))
+         (t/is (seq (get-in @store [:persistence :buffer])))
+         (t/is (not (released?)) "the buffered edit is not saved yet")
+         (ptk/emit! store ::dps/force-persist)
+         (await (async/wait-for #(= 2 (count @requests)) "the buffered edit is sent" {:signal requests$}))
+         (rx/push! response {:revn 2})
+         (await (async/wait-for released? "the waiters are released")))))))

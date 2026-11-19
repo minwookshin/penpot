@@ -19,6 +19,8 @@ import type {
   Page,
   Path,
   Penpot,
+  PenpotLocation,
+  PenpotMgmt,
   Rectangle,
   Shape,
   SvgRaw,
@@ -36,21 +38,38 @@ import { createPluginManager } from '../plugin-manager.js';
 
 export const validEvents = [
   'finish',
+  'logout',
+  'workspacechange',
   'pagechange',
   'filechange',
   'selectionchange',
   'themechange',
   'shapechange',
   'contentsave',
+  'contentrollback',
 ] as const;
 
 export function createApi(
   plugin: Awaited<ReturnType<typeof createPluginManager>>,
 ) {
-  const checkPermission = (permission: Permissions) => {
+  const workspaceUnavailable = () =>
+    plugin.manifest.scope === 'global' &&
+    plugin.context.management?.workspace.status !== 'ready';
+
+  const requireWorkspace = () => {
+    if (workspaceUnavailable()) {
+      throw new Error(
+        'No workspace is ready. Use penpotMgmt.openFile() first.',
+      );
+    }
+  };
+
+  const checkPermission = (permission: Permissions, workspace = true) => {
     if (!plugin.manifest.permissions.includes(permission)) {
       throw new Error(`Permission ${permission} is not granted`);
     }
+    if (workspace && /^(content|library|comment):/.test(permission))
+      requireWorkspace();
   };
 
   const penpot: Penpot = {
@@ -162,7 +181,7 @@ export function createApi(
       z.function().parse(callback);
 
       // To suscribe to events needs the read permission
-      checkPermission('content:read');
+      checkPermission('content:read', false);
 
       return plugin.registerListener(type, callback, props);
     },
@@ -178,18 +197,18 @@ export function createApi(
     },
 
     get root(): Shape | null {
-      checkPermission('content:read');
-      return plugin.context.root;
+      checkPermission('content:read', false);
+      return workspaceUnavailable() ? null : plugin.context.root;
     },
 
     get currentFile(): File | null {
-      checkPermission('content:read');
-      return plugin.context.currentFile;
+      checkPermission('content:read', false);
+      return workspaceUnavailable() ? null : plugin.context.currentFile;
     },
 
     get currentPage(): Page | null {
-      checkPermission('content:read');
-      return plugin.context.currentPage;
+      checkPermission('content:read', false);
+      return workspaceUnavailable() ? null : plugin.context.currentPage;
     },
 
     get selection(): Shape[] {
@@ -203,10 +222,12 @@ export function createApi(
     },
 
     get viewport(): Viewport {
+      requireWorkspace();
       return plugin.context.viewport;
     },
 
     get history(): HistoryContext {
+      requireWorkspace();
       return plugin.context.history;
     },
 
@@ -246,6 +267,11 @@ export function createApi(
 
     get theme(): Theme {
       return plugin.context.theme;
+    },
+
+    get location(): PenpotLocation {
+      checkPermission('content:read', false);
+      return plugin.context.location;
     },
 
     get localStorage(): LocalStorage {
@@ -393,9 +419,59 @@ export function createApi(
       checkPermission('content:read');
       return plugin.context.waitForLayoutUpdate(timeout);
     },
+
+    waitForSave(timeout?: number): Promise<void> {
+      checkPermission('content:read');
+      return plugin.context.waitForSave(timeout);
+    },
+  };
+
+  const penpotMgmt: PenpotMgmt = {
+    get workspace() {
+      checkPermission('content:read', false);
+      return plugin.context.management!.workspace;
+    },
+    listTeams() {
+      checkPermission('manage:teams', false);
+      return plugin.context.management!.listTeams();
+    },
+    createTeam(options) {
+      checkPermission('manage:teams', false);
+      return plugin.context.management!.createTeam(options);
+    },
+    listProjects(options) {
+      checkPermission('content:read', false);
+      return plugin.context.management!.listProjects(options);
+    },
+    listDeletedProjects(options) {
+      checkPermission('content:read', false);
+      return plugin.context.management!.listDeletedProjects(options);
+    },
+    listDeletedFiles(options) {
+      checkPermission('content:read', false);
+      return plugin.context.management!.listDeletedFiles(options);
+    },
+    getFile(fileId) {
+      checkPermission('content:read', false);
+      return plugin.context.management!.getFile(fileId);
+    },
+    openFile(fileId, options) {
+      checkPermission('content:read', false);
+      return plugin.context.management!.openFile(fileId, options);
+    },
+    on(type, callback) {
+      z.literal('workspacechange').parse(type);
+      z.function().parse(callback);
+      checkPermission('content:read', false);
+      return plugin.registerListener(type, callback);
+    },
+    off(listenerId) {
+      plugin.destroyListener(listenerId);
+    },
   };
 
   return {
     penpot,
+    penpotMgmt,
   };
 }

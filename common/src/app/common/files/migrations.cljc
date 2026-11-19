@@ -14,6 +14,7 @@
    [app.common.files.defaults :as cfd]
    [app.common.files.helpers :as cfh]
    [app.common.files.tokens :as cfo]
+   [app.common.files.variant :as cfv]
    [app.common.geom.matrix :as gmt]
    [app.common.geom.point :as gpt]
    [app.common.geom.rect :as grc]
@@ -21,21 +22,26 @@
    [app.common.geom.shapes.text :as gsht]
    [app.common.logging :as l]
    [app.common.math :as mth]
+   [app.common.path-names :as cpn]
    [app.common.schema :as sm]
    [app.common.svg :as csvg]
    [app.common.types.color :as types.color]
    [app.common.types.component :as ctk]
+   [app.common.types.components-list :as ctkl]
    [app.common.types.container :as ctn]
    [app.common.types.file :as ctf]
    [app.common.types.fills :as types.fills]
    [app.common.types.path :as path]
    [app.common.types.path.segment :as path.segment]
    [app.common.types.shape :as cts]
+   [app.common.types.shape-tree :as ctt]
    [app.common.types.shape.interactions :as ctsi]
    [app.common.types.shape.shadow :as ctss]
    [app.common.types.shape.text :as ctst]
    [app.common.types.text :as types.text]
+   [app.common.types.token :as cto]
    [app.common.types.tokens-lib :as ctob]
+   [app.common.types.variant :as ctv]
    [app.common.uuid :as uuid]
    [clojure.set :as set]
    [cuerdas.core :as str]))
@@ -83,7 +89,9 @@
 
     (-> file
         (assoc :data data)
-        (update :migrations set/union diff)
+        ;; `:migrations` is an ordered set everywhere; keep it that way
+        ;; even if a caller hands a plain set.
+        (update :migrations #(into (d/ordered-set) (set/union % diff)))
         (vary-meta assoc ::migrated (not-empty diff)))))
 
 (defn generate-migrations-from-version
@@ -221,9 +229,14 @@
   [data _]
   (letfn [(fix-line-paths [shape]
             (if (= (:type shape) :path)
-              (let [{:keys [width height]} (grc/points->rect (:points shape))]
-                (if (or (mth/almost-zero? width) (mth/almost-zero? height))
-                  (let [selrect (path.segment/content->selrect (:content shape))
+              ;; A path with missing or empty points has no rect; rebuild
+              ;; its geometry from the content as for line-like paths.
+              (let [{:keys [width height] :as rect} (grc/points->rect (:points shape))]
+                (if (or (nil? rect) (mth/almost-zero? width) (mth/almost-zero? height))
+                  ;; Content whose points are not numbers gives no rect
+                  ;; either; fall back to the empty rect.
+                  (let [selrect (or (path.segment/content->selrect (:content shape))
+                                    (grc/make-rect))
                         points (grc/rect->points selrect)
                         transform (gmt/matrix)
                         transform-inv (gmt/matrix)]
@@ -700,17 +713,6 @@
               object))
           (update-container [container]
             (d/update-when container :objects d/update-vals update-object))]
-    (-> data
-        (update :pages-index d/update-vals update-container)
-        (d/update-when :components d/update-vals update-container))))
-
-(defmethod migrate-data "legacy-36"
-  [data _]
-  (letfn [(update-container [container]
-            (d/update-when container :objects (fn [objects]
-                                                (if (contains? objects nil)
-                                                  (dissoc objects nil)
-                                                  objects))))]
     (-> data
         (update :pages-index d/update-vals update-container)
         (d/update-when :components d/update-vals update-container))))
@@ -1332,6 +1334,16 @@
   (let [decode-segments
         (sm/decoder path/schema:segments sm/json-transformer)
 
+        ;; Old files may have segments with missing coordinates, which
+        ;; the binary path data can not store; drop them.
+        valid-segment?
+        (fn [{:keys [command params]}]
+          (case command
+            :close-path true
+            (:move-to :line-to) (and (number? (:x params)) (number? (:y params)))
+            :curve-to (every? #(number? (get params %)) [:x :y :c1x :c1y :c2x :c2y])
+            false))
+
         update-object
         (fn [object]
           (if (or (cfh/bool-shape? object)
@@ -1345,9 +1357,10 @@
                             (path/content [])
 
                             :else
-                            (-> content
-                                (decode-segments)
-                                (path/content)))]
+                            (->> content
+                                 (decode-segments)
+                                 (filterv valid-segment?)
+                                 (path/content)))]
               (assoc object :content content))
             object))
 
@@ -1806,21 +1819,6 @@
                     {})]
     (cfcp/sync-component-id-with-ref-shape data libraries)))
 
-(defmethod migrate-data "0021-fix-shape-svg-attrs"
-  [data _]
-  (some-> cfeat/*new* (swap! conj "fdata/shape-data-type"))
-  (letfn [(update-object [object]
-            (-> object
-                (d/update-when :svg-attrs csvg/attrs->props)
-                (d/update-when :svg-viewbox grc/make-rect)))
-
-          (update-container [container]
-            (d/update-when container :objects d/update-vals update-object))]
-
-    (-> data
-        (update :pages-index d/update-vals update-container)
-        (d/update-when :components d/update-vals update-container))))
-
 ;; Re-run the 0019 and 0020 fixers after normalizing :component-root.
 ;; Migrations 0019 and 0020 missed shapes with an explicit :component-root
 ;; false because subcopy-head? expects nil. Normalize first, then re-run.
@@ -2006,6 +2004,519 @@
            (cfo/make-tokens-status-from-lib tokens-lib))
     data))
 
+(defmethod migrate-data "0028-normalize-constrained-values"
+  ;; Existing files can contain values outside the limits now shared by the UI
+  ;; and file schemas. Normalize them before checking the migrated file.
+  [data _]
+  (letfn [(clamp-minimum [value minimum]
+            (if (number? value)
+              (max value minimum)
+              value))
+
+          (positive-or-default [value default]
+            (if (and (number? value) (not (pos? value)))
+              default
+              value))
+
+          (clamp-attrs [value attrs]
+            (reduce #(d/update-when %1 %2 clamp-minimum 0) value attrs))
+
+          (repair-vector [value repair-item]
+            (if (vector? value)
+              (mapv repair-item value)
+              value))
+
+          (repair-grid-params [params type]
+            (cond
+              (= type :square)
+              (d/update-when params :size clamp-minimum 0.01)
+
+              (#{:row :column} type)
+              (d/update-when params :size clamp-minimum 1)
+
+              :else
+              params))
+
+          (repair-grid [grid]
+            (d/update-when grid :params repair-grid-params (:type grid)))
+
+          (repair-default-grids [grids]
+            (-> grids
+                (d/update-when :square repair-grid-params :square)
+                (d/update-when :row repair-grid-params :row)
+                (d/update-when :column repair-grid-params :column)))
+
+          (repair-grid-track [track]
+            (d/update-when track :value clamp-minimum 0))
+
+          (repair-export [export]
+            (d/update-when export :scale positive-or-default 1))
+
+          (repair-stroke [stroke]
+            (clamp-attrs stroke [:stroke-width
+                                 :stroke-width-top
+                                 :stroke-width-right
+                                 :stroke-width-bottom
+                                 :stroke-width-left]))
+
+          (repair-shadow [shadow]
+            (d/update-when shadow :blur clamp-minimum 0))
+
+          (repair-blur [blur]
+            (d/update-when blur :value clamp-minimum 0))
+
+          (repair-shape [shape]
+            (-> shape
+                (clamp-attrs [:r1 :r2 :r3 :r4
+                              :layout-item-min-w :layout-item-max-w
+                              :layout-item-min-h :layout-item-max-h])
+                (d/update-when :layout-gap clamp-attrs [:row-gap :column-gap])
+                (d/update-when :layout-padding clamp-attrs [:p1 :p2 :p3 :p4])
+                (d/update-when :layout-grid-rows repair-vector repair-grid-track)
+                (d/update-when :layout-grid-columns repair-vector repair-grid-track)
+                (d/update-when :strokes repair-vector repair-stroke)
+                (d/update-when :shadow repair-vector repair-shadow)
+                (d/update-when :blur repair-blur)
+                (d/update-when :background-blur repair-blur)
+                (d/update-when :exports repair-vector repair-export)
+                (d/update-when :grids repair-vector repair-grid)))
+
+          (truncate-property-text [value]
+            (if (and (string? value)
+                     (> (count value) ctv/property-max-length))
+              (subs value 0 ctv/property-max-length)
+              value))
+
+          (repair-variant-property [property]
+            (-> property
+                (d/update-when :name truncate-property-text)
+                (d/update-when :value truncate-property-text)))
+
+          (repair-container [container]
+            (-> container
+                (d/update-when :objects d/update-vals repair-shape)
+                (d/update-when :variant-properties repair-vector repair-variant-property)))
+
+          (repair-page [page]
+            (-> page
+                (repair-container)
+                (d/update-when :default-grids repair-default-grids)))]
+
+    (-> data
+        (update :pages-index d/update-vals repair-page)
+        (d/update-when :components d/update-vals repair-container))))
+
+(defmethod migrate-data "0029-move-background-blur-out-of-blur"
+  ;; Before background blur got its own attribute, `:blur` accepted a
+  ;; `:background-blur` type, so the editor and the plugin API saved those maps
+  ;; under `:blur`. Once the shape schema was tightened, such files fail
+  ;; validation; move the map to the `:background-blur` attribute. When the
+  ;; shape already has a `:background-blur`, keep it and drop the mis-typed one.
+  [data _]
+  (letfn [(repair-shape [shape]
+            (if (= :background-blur (get-in shape [:blur :type]))
+              (if (contains? shape :background-blur)
+                (dissoc shape :blur)
+                (-> shape
+                    (dissoc :blur)
+                    (assoc :background-blur (:blur shape))))
+              shape))
+
+          (repair-container [container]
+            (d/update-when container :objects d/update-vals repair-shape))]
+
+    (-> data
+        (update :pages-index d/update-vals repair-container)
+        (d/update-when :components d/update-vals repair-container))))
+
+(defmethod migrate-data "0030-remove-stroke-per-side-attr"
+  ;; Individual stroke widths shipped with a `:stroke-per-side` boolean on every
+  ;; stroke, telling the renderer and the CSS generator whether the four side
+  ;; widths were meaningful. Comparing the sides answers that on its own, so
+  ;; the attribute was dropped from the closed stroke schema and the toggle
+  ;; became ephemeral editor state. Files written while it was still persisted
+  ;; fail validation with an `:malli.core/extra-key` error; drop the attribute
+  ;; and keep the side widths, which hold the real design data.
+  [data _]
+  (letfn [(repair-shape [shape]
+            (d/update-when shape :strokes d/update-vals #(dissoc % :stroke-per-side)))
+
+          (repair-container [container]
+            (d/update-when container :objects d/update-vals repair-shape))]
+
+    (-> data
+        (update :pages-index d/update-vals repair-container)
+        (d/update-when :components d/update-vals repair-container))))
+
+(defmethod migrate-data "0031-migrate-stroke-width-token-attr"
+  ;; Stroke width tokens used to be applied to the single `:stroke-width` token
+  ;; attribute, replaced by the four per-side attributes. The editor reads only
+  ;; the new keys, so a file written before the change keeps the token on
+  ;; `:stroke-width` and the token looks unapplied even though its value is
+  ;; still set. Copy the legacy reference to every side (matching how applying
+  ;; the token resolves all sides) and drop the old key. A side that already
+  ;; carries a reference wins over the recycled global one.
+  [data _]
+  (letfn [(repair-shape [shape]
+            (let [applied (:applied-tokens shape)
+                  token   (:stroke-width applied)]
+              (if (some? token)
+                (update shape :applied-tokens
+                        (fn [applied]
+                          (-> (zipmap cto/per-side-stroke-width-keys (repeat token))
+                              (merge applied)
+                              (dissoc :stroke-width))))
+                shape)))
+
+          (repair-container [container]
+            (d/update-when container :objects d/update-vals repair-shape))]
+
+    (-> data
+        (update :pages-index d/update-vals repair-container)
+        (d/update-when :components d/update-vals repair-container))))
+
+;; A shape can point to an existing parent that does not list it in its
+;; `:shapes`. Such shapes are unreachable from the root, and operations
+;; that walk the tree through `:shapes` miss them; e.g. deleting a variant
+;; also deleted its container, which looked empty, and left the other
+;; variants pointing to a deleted parent. Add them back to their parent.
+(defmethod migrate-data "0032-fix-children-not-in-parent"
+  [data _]
+  (letfn [(get-unlisted-children [objects]
+            ;; Returns a {parent-id -> [child-id]} map
+            (let [listed (reduce-kv (fn [result id shape]
+                                      (if-let [shapes (not-empty (:shapes shape))]
+                                        (assoc result id (set shapes))
+                                        result))
+                                    {}
+                                    objects)]
+              (reduce-kv (fn [result id shape]
+                           (let [parent-id (:parent-id shape)]
+                             (if (and (not (cfh/root? shape))
+                                      (contains? objects parent-id)
+                                      (not (contains? (get listed parent-id) id)))
+                               (update result parent-id (fnil conj []) id)
+                               result)))
+                         {}
+                         objects)))
+
+          (fix-objects [objects]
+            (reduce-kv (fn [objects parent-id child-ids]
+                         (update-in objects [parent-id :shapes] (fnil into []) child-ids))
+                       objects
+                       (get-unlisted-children objects)))
+
+          (update-container [container]
+            (d/update-when container :objects fix-objects))]
+
+    (-> data
+        (update :pages-index d/update-vals update-container)
+        (d/update-when :components d/update-vals update-container))))
+
+(defn- repair-shape-children
+  [objects shape]
+  (if-let [shapes (:shapes shape)]
+    (let [shapes' (into []
+                        (comp (keep uuid/coerce)
+                              (filter #(contains? objects %))
+                              (distinct))
+                        shapes)]
+      (if (and (vector? shapes) (= shapes shapes'))
+        shape
+        (assoc shape :shapes shapes')))
+    shape))
+
+(defn- repair-container-children
+  [container]
+  (d/update-when container :objects
+                 (fn [objects]
+                   ;; Only assoc the shapes that change, so an ObjectsMap is
+                   ;; not marked as modified when nothing is repaired.
+                   (reduce-kv (fn [result id shape]
+                                (let [shape' (repair-shape-children objects shape)]
+                                  (if (identical? shape shape')
+                                    result
+                                    (assoc result id shape'))))
+                              objects
+                              objects))))
+
+(defmethod migrate-data "0033-normalize-main-instance-names-v2"
+  [data _]
+  ;; In penpot shape names always have "/" characters normalized with one space between and after,
+  ;; to form paths. But this is not enforced and may be places that still admit names like
+  ;; "Group/Name" or "Group   /   Name". With normal shapes this is not a problem. But for main
+  ;; instances, the name of the root shape must match exactly the path+name of the component.
+  ;; Here we normalize the names of all main instances, and a new file integrity validation has
+  ;; been added to enforce this from now on.
+  ;; Main instances in variants are a special case because they need to match the variant name.
+  ;; Old files may also list in :shapes child ids stored as strings, nil, or ids that point to no
+  ;; shape. They fail the shape schema and the uuid assert of get-shape, so the container is
+  ;; repaired first (see `repair-container-children`). That repair is the reason for the `-v2`:
+  ;; files that already applied the original migration need to run it again to get it.
+  (letfn [(update-shape [container shape-id]
+            (let [shape     (ctn/get-shape container shape-id)
+                  shape'    (cond
+                              ;; Variant container must have a normalized name
+                              (ctk/is-variant-container? shape)
+                              (let [name       (:name shape)
+                                    clean-name (cpn/clean-path name)
+                                    clean-name (if (str/blank? clean-name)
+                                                 "(empty)" ;; this may occur if the name contains only separators
+                                                 clean-name)]
+                                (if (= name clean-name)
+                                  shape
+                                  (assoc shape :name clean-name)))
+
+                              ;; Main instance inside a variant must have the same name as the container
+                              (ctk/main-instance? shape)
+                              (if (ctk/is-variant? shape)
+                                (let [variant-container (ctn/get-shape container (:parent-id shape))]
+                                  (if (or (= (:name shape) (:name variant-container))
+                                          (nil? variant-container))
+                                    shape
+                                    (assoc shape :name (:name variant-container))))
+
+                                ;; Other main instances must have the same name as the path+name of the component
+                                (let [component     (ctkl/get-component data (:component-id shape) true)
+                                      expected-name (when component
+                                                      (cpn/merge-path-item (:path component) (:name component)))]
+                                  (if (or (= expected-name (:name shape))
+                                          (nil? expected-name))
+                                    shape
+                                    (assoc shape :name expected-name))))
+
+                              ;; Any other shape does not need processing
+                              :else shape)]
+
+              ;; Only assoc the shape when the normalization changed it, so an
+              ;; ObjectsMap is not marked as modified, and the page is not
+              ;; rewritten, when there is nothing to normalize.
+              (reduce update-shape
+                      (if (identical? shape shape')
+                        container
+                        (ctt/set-shape container shape'))
+                      (:shapes shape'))))
+
+          (update-container
+            [container]
+            (let [container (repair-container-children container)
+                  root      (ctn/get-container-root container)]
+              (if root
+                (update-shape container (:id root))
+                container)))]
+
+    (-> data
+        (update :pages-index d/update-vals update-container)
+        (d/update-when :components d/update-vals update-container))))
+
+(defmethod migrate-data "0034-fix-path-content-offset"
+  [data _]
+  ;; A path stores its geometry twice: the box (:selrect and :points) and the
+  ;; drawing (:content), and the box is always derived from the drawing. Some
+  ;; files have component copies whose drawing and box were moved apart, so
+  ;; the drawing renders away from where the sidebar, the layouts and the
+  ;; syncs place the shape. We move the content back onto the box. A path whose drawing
+  ;; has another size than its box is not a displaced drawing, and is left as
+  ;; it is.
+  (let [tolerance 0.1]
+    (letfn [(fix-path [shape]
+              (when (and (cfh/path-shape? shape)
+                         (some? (:selrect shape))
+                         (some? (path.segment/content->selrect (:content shape))))
+                (let [selrect  (:selrect shape)
+                      derived  (:selrect (path/update-geometry shape))
+                      offset   (gpt/subtract (grc/rect->center selrect)
+                                             (grc/rect->center derived))]
+                  (when (and (mth/close? (:width selrect) (:width derived) tolerance)
+                             (mth/close? (:height selrect) (:height derived) tolerance)
+                             (or (> (abs (:x offset)) tolerance)
+                                 (> (abs (:y offset)) tolerance)))
+                    (update shape :content path/move-content offset)))))
+
+            (fix-objects [objects]
+              (reduce-kv (fn [objects id shape]
+                           (if-let [shape (fix-path shape)]
+                             (assoc objects id shape)
+                             objects))
+                         objects
+                         objects))
+
+            (update-container [container]
+              (d/update-when container :objects fix-objects))]
+
+      (-> data
+          (update :pages-index d/update-vals update-container)
+          (d/update-when :components d/update-vals update-container)))))
+
+(defmethod migrate-data "0035-fix-dangling-children"
+  [data _]
+  ;; A shape may list a child id that does not exist in the objects map of
+  ;; the page or component that owns it (a dangling reference). Such a
+  ;; reference is invalid: any operation that walks the shape tree through
+  ;; the children lists trips on it, and the file cannot be migrated nor
+  ;; opened. Here we remove the dangling ids from the children lists,
+  ;; keeping every shape that really exists.
+  (letfn [(fix-shape [container-id objects shape]
+            (d/update-when shape :shapes
+                           (fn [shapes]
+                             (let [shapes' (filterv #(contains? objects %) shapes)]
+                               (when (not= shapes shapes')
+                                 (l/trc :hint "fix dangling children"
+                                        :container (str container-id)
+                                        :shape-id (str (:id shape))
+                                        :removed (remove #(contains? objects %) shapes)))
+                               shapes'))))
+
+          (fix-objects [container-id objects]
+            (d/update-vals objects (partial fix-shape container-id objects)))
+
+          (update-container [container]
+            (d/update-when container :objects #(fix-objects (:id container) %)))]
+
+    (-> data
+        (update :pages-index d/update-vals update-container)
+        (d/update-when :components d/update-vals update-container))))
+
+(defmethod migrate-data "0037-fix-shape-svg-attrs-and-defs"
+  ;; Stored svg attribute keys are kebab-case (issue #11947): the v3 reader
+  ;; already outputs kebab and birth normalizes any outside spelling, so
+  ;; export/import converges to the same state. Old birth and the cleaner
+  ;; era stored camelCase React prop names instead, which the reader
+  ;; kebab-ized on import beyond repair. Convert with the same birth
+  ;; transforms: `:svg-attrs` and `:svg-defs` node attrs go through
+  ;; the whitelist+kebab transform (unknown attrs drop, same as birth),
+  ;; while svg-raw `:content` attrs are kebab-ized spelling-only (unknown
+  ;; keys kept: the sidebar reads keys outside the whitelist). Kebab
+  ;; input passes through unchanged, so re-running is safe. This replaces
+  ;; "0021-fix-shape-svg-attrs" and "0035-fix-shape-svg-attrs-and-defs"
+  ;; (ids withdrawn from `available-migrations` below): files that
+  ;; recorded either migrate again through this one. 0035 was withdrawn
+  ;; because a client that loaded a file before 0035 ran could still save
+  ;; camelCase keys into it afterwards (#13107).
+  ;; Node tags in defs and svg-raw content are stored as keywords; files
+  ;; that hold them as strings get them converted here, since the closed
+  ;; node schemas reject strings. `:svg-transform` held as a plain map
+  ;; becomes a matrix, because the svg defs renderer multiplies it as one.
+  ;; Non-lowercase XML ids stay lossy: the reader lowercases them before
+  ;; anything runs.
+  [data _]
+  (some-> cfeat/*new* (swap! conj "fdata/shape-data-type"))
+  (letfn [(migrate-defs [defs]
+            (if (map? defs)
+              (d/mapm (fn [_ node] (csvg/normalize-def-node node)) defs)
+              defs))
+
+          (migrate-shape [shape]
+            (-> shape
+                (d/update-when :svg-attrs
+                               (fn [attrs]
+                                 (if (map? attrs)
+                                   (csvg/attrs->kebab-props attrs)
+                                   attrs)))
+                (d/update-when :svg-defs migrate-defs)
+                (d/update-when :svg-viewbox grc/make-rect)
+                (d/update-when :svg-transform gmt/coerce)
+                (cond-> (= :svg-raw (:type shape))
+                  (d/update-when :content csvg/kebabize-content-node))))
+
+          (migrate-container [container]
+            (d/update-when container :objects d/update-vals migrate-shape))]
+
+    (-> data
+        (update :pages-index d/update-vals migrate-container)
+        (d/update-when :components d/update-vals migrate-container))))
+
+(defmethod migrate-data "0036-clear-nil-keys-in-objects"
+  [data _]
+  ;; Soft-delete can leave a nil key in `:objects` (gsh/move on a missing
+  ;; main, then index-by :id). That fails the file schema on duplicate-file
+  ;; (#12336). "legacy-36" did the same cleanup but its id was withdrawn
+  ;; from `available-migrations` below: files that recorded it migrate
+  ;; again through this one.
+  (letfn [(update-container [container]
+            (d/update-when container :objects
+                           (fn [objects]
+                             (if (contains? objects nil)
+                               (do
+                                 (l/trc :hint "clear nil key in objects"
+                                        :container-id (:id container))
+                                 (dissoc objects nil))
+                               objects))))]
+    (-> data
+        (update :pages-index d/update-vals update-container)
+        (d/update-when :components d/update-vals update-container))))
+
+;; Property names and values used to accept `,` and `=`. The formula
+;; editor treats those as separators, and a later edit strips them.
+;; Files saved before that strip can also hold two identical names, two
+;; identical value combinations, or a label that was not saved with the
+;; values. Rewrite the text in place and refresh the label.
+(defn- variant-container-entries
+  [data]
+  (concat
+   (for [page  (vals (:pages-index data))
+         shape (vals (:objects page))
+         :when (ctk/is-variant-container? shape)]
+     {:objects   (:objects page)
+      :container shape})
+   (for [component (vals (:components data))
+         shape     (vals (:objects component))
+         :when     (ctk/is-variant-container? shape)]
+     {:objects   (:objects component)
+      :container shape})))
+
+(defmethod migrate-data "0038-sanitize-variant-property-text"
+  [data _]
+  (let [entries  (variant-container-entries data)
+        used-ids (into #{}
+                       (comp (mapcat (fn [{:keys [objects container]}]
+                                       (cfv/qualifying-variant-members data objects container)))
+                             (map :component-id))
+                       entries)
+        data     (reduce (fn [data {:keys [objects container]}]
+                           (cfv/sanitize-variant-container data objects container))
+                         data
+                         entries)]
+    (->> (vals (:components data))
+         (filter ctk/is-variant?)
+         (remove #(contains? used-ids (:id %)))
+         (reduce cfv/sanitize-variant-component data))))
+
+;; The board name and each main's layer name are already normalized.
+;; The library entry could still carry the previous path. Point every
+;; member of the board at that board name.
+(defmethod migrate-data "0039-align-variant-component-names"
+  [data _]
+  (letfn [(align-container [data objects container]
+            (let [board-name         (or (:name container) "")
+                  [path item-name]   (cpn/split-group-name board-name)]
+              (reduce (fn [data child-id]
+                        (let [child     (get objects child-id)
+                              component (when child
+                                          (get-in data [:components (:component-id child)]))]
+                          (if (and (ctk/is-variant? child)
+                                   (= (:id container) (:variant-id child))
+                                   (some? component)
+                                   (= (:id container) (:variant-id component))
+                                   (not= board-name
+                                         (cpn/merge-path-item (:path component) (:name component))))
+                            (update-in data [:components (:id component)]
+                                       assoc :path path :name item-name)
+                            data)))
+                      data
+                      (:shapes container))))
+
+          (containers-in [objects]
+            (filter ctk/is-variant-container? (vals objects)))]
+
+    (reduce (fn [data objects]
+              (reduce #(align-container %1 objects %2)
+                      data
+                      (containers-in objects)))
+            data
+            (concat (map :objects (vals (:pages-index data)))
+                    (map :objects (vals (:components data)))))))
+
 (def available-migrations
   (into (d/ordered-set)
         ["legacy-2"
@@ -2033,7 +2544,6 @@
          "legacy-32"
          "legacy-33"
          "legacy-34"
-         "legacy-36"
          "legacy-37"
          "legacy-38"
          "legacy-39"
@@ -2084,10 +2594,21 @@
          "0018-remove-unneeded-objects-from-components"
          "0019-fix-missing-swap-slots"
          "0020-sync-component-id-with-near-main"
-         "0021-fix-shape-svg-attrs"
          "0022-normalize-component-root-and-resync"
          "0023-repair-token-themes-with-inexistent-sets"
          "0024b-fix-stroke-cap-placement"
          "0025-repair-empty-text-content"
          "0026-fix-svg-raw-shapes-uuids"
-         "0027-separate-tokens-status"]))
+         "0027-separate-tokens-status"
+         "0028-normalize-constrained-values"
+         "0029-move-background-blur-out-of-blur"
+         "0030-remove-stroke-per-side-attr"
+         "0031-migrate-stroke-width-token-attr"
+         "0032-fix-children-not-in-parent"
+         "0033-normalize-main-instance-names-v2"
+         "0034-fix-path-content-offset"
+         "0035-fix-dangling-children"
+         "0036-clear-nil-keys-in-objects"
+         "0037-fix-shape-svg-attrs-and-defs"
+         "0038-sanitize-variant-property-text"
+         "0039-align-variant-component-names"]))

@@ -8,7 +8,6 @@
   (:require
    ["@penpot/ua-parser" :as ua]
    [app.common.data :as d]
-   [app.common.data.macros :as dm]
    [app.common.json :as json]
    [app.common.logging :as l]
    [app.common.math :as math]
@@ -316,14 +315,14 @@
                   0)))
 
           (add-libraries-counters [state files]
-            (reduce (fn [state library-id]
-                      (let [data (dm/get-in files [library-id :data])]
-                        (-> state
-                            (update :total-components + (count (:components data)))
-                            (update :total-colors + (count (:colors data)))
-                            (update :total-typographies + (count (:typographies data))))))
-                    state
-                    (refs/select-libraries files file-id)))]
+            (reduce-kv (fn [state _ library]
+                         (let [data (:data library)]
+                           (-> state
+                               (update :total-components + (count (:components data)))
+                               (update :total-colors + (count (:colors data)))
+                               (update :total-typographies + (count (:typographies data))))))
+                       state
+                       (refs/select-libraries files file-id)))]
 
     (ptk/reify ::snapshot-performance-info
       ptk/UpdateEvent
@@ -359,6 +358,23 @@
            (rx/map deref)
            (rx/map snapshot-performance-info)))))
 
+(defn fetch-environment-data
+  "Fetches the backend environment data (deployment type and enabled
+  flags). On RPC failure, falls back to telemetry so event collection is
+  not silently dropped; the backend rejects events if truly disabled."
+  []
+  (->> (rp/cmd! :get-environment-data)
+       (rx/catch (fn [cause]
+                   (l/debug :hint "unable to fetch backend environment data, proceeding with event collection"
+                            :cause cause)
+                   (rx/of {:flags #{:telemetry}})))))
+
+(defn events-enabled?
+  "Returns true when the environment flags enable frontend event collection."
+  [flags]
+  (or (contains? flags :audit-log)
+      (contains? flags :telemetry)))
+
 (defn initialize
   []
   (ptk/reify ::initialize
@@ -378,16 +394,14 @@
 
         (l/debug :hint "event instrumentation initialized")
 
-        ;; Fetch backend flags and only start event collection if
-        ;; :audit-log or :telemetry is enabled. On RPC failure, proceed
-        ;; with event collection anyway (backend will reject if truly disabled).
-        (->> (rp/cmd! :get-enabled-flags)
-             (rx/catch (fn [cause]
-                         (l/debug :hint "unable to fetch backend flags, proceeding with event collection" :cause cause)
-                         (rx/of #{:telemetry})))
+        ;; Fetch the backend environment data and only start event
+        ;; collection if :audit-log or :telemetry is enabled. On RPC
+        ;; failure, proceed with event collection anyway (backend will
+        ;; reject if truly disabled).
+        (->> (fetch-environment-data)
+             (rx/map :flags)
              (rx/mapcat (fn [flags]
-                          (if (or (contains? flags :audit-log)
-                                  (contains? flags :telemetry))
+                          (if (events-enabled? flags)
                             (do
                               (l/debug :hint "event collection enabled" :flags (str/join " " (map name flags)))
                               (rx/of true))
